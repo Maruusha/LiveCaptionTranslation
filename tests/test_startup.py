@@ -100,7 +100,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
     window.close()
 
 
-def test_refresh_button_reloads_devices_and_confirms_refresh() -> None:
+def test_refresh_button_reloads_devices_and_writes_log(caplog) -> None:
     create_application(["live-caption-translation-test"])
     first_device = microphone_fixture()[0]
     second_device = AudioDevice(
@@ -122,12 +122,84 @@ def test_refresh_button_reloads_devices_and_confirms_refresh() -> None:
     window = MainWindow(device_provider=changing_device_provider)
     assert window.microphone_selector.count() == 1
 
-    window.refresh_devices_button.click()
+    with caplog.at_level("INFO"):
+        window.refresh_devices_button.click()
 
     assert provider_calls == 2
     assert window.microphone_selector.count() == 2
-    assert "Refreshed at" in window.device_status.text()
-    assert window.statusBar().currentMessage() == "Microphone list refreshed"
+    assert window.device_status.text() == "Found 2 connected microphones."
+    assert window.statusBar().currentMessage() == "Ready"
+    assert "Microphone list refreshed: 2 connected device(s)" in caplog.text
+
+    window.close()
+
+
+def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
+    create_application(["live-caption-translation-test"])
+    connected_names = {"Test Microphone"}
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def connected_device_provider() -> list[AudioDevice]:
+        return microphone_fixture() if connected_names else []
+
+    def monitor_factory(device_indices, level_callback, warning_callback):
+        monitor = FakeMicrophoneMonitor(
+            device_indices,
+            level_callback,
+            warning_callback,
+        )
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=connected_device_provider,
+        monitor_factory=monitor_factory,
+        connected_name_provider=lambda: connected_names,
+    )
+    window.start_stop_button.click()
+    assert monitors[0].started
+
+    connected_names.clear()
+    window._handle_connected_microphones_changed()
+
+    assert monitors[0].stopped
+    assert window.start_stop_button.text() == "Start microphone"
+    assert not window.start_stop_button.isEnabled()
+    assert window.statusBar().currentMessage() == "Microphone disconnected"
+    assert "was disconnected" in window.device_status.text()
+
+    window.close()
+
+
+def test_idle_device_change_refreshes_automatically() -> None:
+    create_application(["live-caption-translation-test"])
+    devices = microphone_fixture()
+    provider_calls = 0
+
+    def changing_device_provider() -> list[AudioDevice]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return devices[:provider_calls]
+
+    devices.append(
+        AudioDevice(
+            index=20,
+            name="USB Microphone",
+            host_api="Windows WASAPI",
+            max_input_channels=1,
+            default_sample_rate=48_000.0,
+        )
+    )
+    window = MainWindow(
+        device_provider=changing_device_provider,
+        connected_name_provider=lambda: {device.name for device in devices},
+    )
+    assert window.microphone_selector.count() == 1
+
+    window._handle_connected_microphones_changed()
+
+    assert window.microphone_selector.count() == 2
+    assert window.device_status.text() == "Found 2 connected microphones."
 
     window.close()
 

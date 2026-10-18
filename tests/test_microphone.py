@@ -18,6 +18,7 @@ def test_monitor_starts_reports_level_and_stops(monkeypatch) -> None:
     class FakeInputStream:
         def __init__(self, **settings) -> None:
             self.settings = settings
+            self.samplerate = 48_000.0
             self.started = False
             self.stopped = False
             self.closed = False
@@ -50,11 +51,13 @@ def test_monitor_starts_reports_level_and_stops(monkeypatch) -> None:
     )
     assert levels == [100.0]
     assert warnings == ["input overflow"]
-
     monitor.stop()
     assert stream.stopped
     assert stream.closed
     assert not monitor.is_running
+    assert monitor.audio_buffer.stats.queued_frames == 0
+    assert monitor.processing_worker.stats.input_frames == 1
+    assert monitor.processed_audio_buffer.stats.queued_seconds > 0
 
 
 def test_monitor_falls_back_to_another_backend(monkeypatch) -> None:
@@ -63,6 +66,7 @@ def test_monitor_falls_back_to_another_backend(monkeypatch) -> None:
     class FakeInputStream:
         def __init__(self, **settings) -> None:
             self.settings = settings
+            self.samplerate = 48_000.0
 
         def start(self) -> None:
             device_index = self.settings["device"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -15,7 +16,11 @@ if __package__ in {None, ""}:
 from PySide6.QtWidgets import QApplication
 
 from app import APP_NAME, APP_VERSION
+from app.core.log_setup import configure_logging
 from app.ui.main_window import MainWindow
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_application(arguments: Sequence[str] | None = None) -> QApplication:
@@ -33,10 +38,14 @@ def create_application(arguments: Sequence[str] | None = None) -> QApplication:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     """Open the main window and run the desktop application."""
+    log_file = configure_logging()
+    logger.info("Application starting; log file: %s", log_file)
     application = create_application(arguments)
     window = MainWindow()
     window.show()
-    return application.exec()
+    exit_code = application.exec()
+    logger.info("Application stopped with exit code %s", exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":

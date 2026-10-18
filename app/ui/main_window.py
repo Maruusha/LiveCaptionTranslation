@@ -1,9 +1,11 @@
 """Main desktop window for the application shell."""
 
 from collections.abc import Callable
+import logging
 
-from PySide6.QtCore import QTime, Qt, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent, QFont
+from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -31,6 +33,8 @@ MonitorFactory = Callable[
     MicrophoneLevelMonitor,
 ]
 
+logger = logging.getLogger(__name__)
+
 
 class MainWindow(QMainWindow):
     """Application shell with local microphone discovery and level monitoring."""
@@ -42,15 +46,26 @@ class MainWindow(QMainWindow):
         self,
         device_provider: Callable[[], list[AudioDevice]] | None = None,
         monitor_factory: MonitorFactory | None = None,
+        connected_name_provider: Callable[[], set[str]] | None = None,
     ) -> None:
         super().__init__()
         self._device_provider = device_provider or list_input_devices
         self._refresh_device_provider = device_provider or refresh_input_devices
         self._monitor_factory = monitor_factory or MicrophoneLevelMonitor
+        self._connected_name_provider = (
+            connected_name_provider or self._qt_connected_microphone_names
+        )
         self._microphone_monitor: MicrophoneLevelMonitor | None = None
+        self._active_microphone_name: str | None = None
+        self._device_refresh_pending = False
 
         self.microphone_level_received.connect(self._set_microphone_level)
         self.microphone_warning_received.connect(self._show_microphone_warning)
+
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.audioInputsChanged.connect(
+            self._handle_connected_microphones_changed
+        )
 
         self.setObjectName("mainWindow")
         self.setWindowTitle(APP_NAME)
@@ -128,6 +143,7 @@ class MainWindow(QMainWindow):
         try:
             devices = (provider or self._device_provider)()
         except DeviceDiscoveryError as error:
+            logger.exception("Microphone discovery failed")
             self.microphone_selector.addItem("Microphone check failed")
             self.microphone_selector.setEnabled(False)
             self.start_stop_button.setEnabled(False)
@@ -136,6 +152,7 @@ class MainWindow(QMainWindow):
             return
 
         if not devices:
+            logger.info("Microphone list refreshed: no connected microphones")
             self.microphone_selector.addItem("No microphones found")
             self.microphone_selector.setEnabled(False)
             self.start_stop_button.setEnabled(False)
@@ -151,15 +168,14 @@ class MainWindow(QMainWindow):
         self.microphone_selector.setEnabled(True)
         self.start_stop_button.setEnabled(True)
         noun = "microphone" if len(devices) == 1 else "microphones"
+        self.device_status.setText(f"Found {len(devices)} connected {noun}.")
+        self.statusBar().showMessage("Ready")
         if refreshed:
-            refresh_time = QTime.currentTime().toString("HH:mm:ss")
-            self.device_status.setText(
-                f"Refreshed at {refresh_time}. Found {len(devices)} connected {noun}."
+            logger.info(
+                "Microphone list refreshed: %d connected device(s): %s",
+                len(devices),
+                ", ".join(device.name for device in devices),
             )
-            self.statusBar().showMessage("Microphone list refreshed")
-        else:
-            self.device_status.setText(f"Found {len(devices)} connected {noun}.")
-            self.statusBar().showMessage("Ready")
 
     def refresh_connected_microphones(self) -> None:
         """Restart device discovery and rebuild the visible microphone list."""
@@ -204,6 +220,7 @@ class MainWindow(QMainWindow):
             return
 
         self._microphone_monitor = monitor
+        self._active_microphone_name = selected_device.name
         self.microphone_selector.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setText("Stop microphone")
@@ -215,6 +232,7 @@ class MainWindow(QMainWindow):
     def _stop_microphone(self, show_ready: bool = True) -> None:
         monitor = self._microphone_monitor
         self._microphone_monitor = None
+        self._active_microphone_name = None
 
         if monitor is not None:
             try:
@@ -233,11 +251,51 @@ class MainWindow(QMainWindow):
             self.device_status.setText("Microphone stopped. Audio was not saved.")
             self.statusBar().showMessage("Ready")
 
+        if self._device_refresh_pending and show_ready:
+            self._device_refresh_pending = False
+            self.refresh_connected_microphones()
+
     def _set_microphone_level(self, level: float) -> None:
         self.input_level.setValue(int(round(level)))
 
     def _show_microphone_warning(self, warning: str) -> None:
         self.statusBar().showMessage(f"Microphone warning: {warning}")
+
+    @staticmethod
+    def _qt_connected_microphone_names() -> set[str]:
+        return {device.description() for device in QMediaDevices.audioInputs()}
+
+    @staticmethod
+    def _normalized_device_name(name: str) -> str:
+        return " ".join(name.casefold().split())
+
+    def _handle_connected_microphones_changed(self) -> None:
+        """React to microphone connection changes reported by Windows and Qt."""
+        active_name = self._active_microphone_name
+        if active_name is None:
+            self.refresh_connected_microphones()
+            return
+
+        connected_names = {
+            self._normalized_device_name(name)
+            for name in self._connected_name_provider()
+        }
+        if self._normalized_device_name(active_name) not in connected_names:
+            disconnected_name = active_name
+            logger.warning("Active microphone disconnected: %s", disconnected_name)
+            self._stop_microphone(show_ready=False)
+            self.refresh_connected_microphones()
+            self.device_status.setText(
+                f"{disconnected_name} was disconnected. Microphone capture stopped."
+            )
+            self.statusBar().showMessage("Microphone disconnected")
+            return
+
+        self._device_refresh_pending = True
+        logger.info("Audio devices changed while microphone capture is active")
+        self.statusBar().showMessage(
+            "Audio devices changed; the list will refresh after capture stops"
+        )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Always release the audio device before the window closes."""
