@@ -714,10 +714,10 @@ Keep everything needed for development inside this project folder whenever possi
 Git is supplied by GitHub Desktop and is not currently available through the normal command search path. When Git is needed, use this executable directly:
 
 ```text
-C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.3\resources\app\git\cmd\git.exe
+C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe
 ```
 
-This is a machine-specific development path. Do not build it into the application or assume another computer uses the same GitHub Desktop version.
+This is a machine-specific development path. GitHub Desktop updates can change the `app-*` version folder, so locate the newest installed copy if this path stops working. Do not build it into the application or assume another computer uses the same GitHub Desktop version.
 
 ## 13. Error Handling
 
