@@ -1,0 +1,17 @@
+# Project-local Python environments
+.venv/
+.conda/
+
+# Project-local package and model caches
+.cache/
+models/
+
+# Downloaded native libraries and helper binaries
+vendor/
+tools/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+

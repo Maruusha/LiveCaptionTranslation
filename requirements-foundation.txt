@@ -1,0 +1,4 @@
+# Stage 0 foundation only. AI/audio packages will be added in later stages.
+PySide6==6.12.0
+pytest==9.1.1
+
