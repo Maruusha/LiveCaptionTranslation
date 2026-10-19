@@ -63,6 +63,7 @@ def test_vad_worker_builds_a_read_only_completed_speech_segment() -> None:
         warning_callback=lambda _warning: None,
         segment_callback=segments.append,
         detector_factory=lambda: lambda _samples: next(results),
+        min_segment_seconds=0.0,
     )
     worker.start()
     worker.stop()
@@ -89,6 +90,7 @@ def test_vad_worker_splits_a_long_speech_segment_at_the_memory_limit() -> None:
         segment_callback=segments.append,
         detector_factory=lambda: lambda _samples: next(results),
         max_segment_seconds=1_024 / 16_000,
+        min_segment_seconds=0.0,
     )
     worker.start()
     worker.stop()
@@ -97,3 +99,24 @@ def test_vad_worker_splits_a_long_speech_segment_at_the_memory_limit() -> None:
     assert segments[0].forced_split
     assert not segments[1].forced_split
     assert worker.stats.completed_segments == 2
+
+
+def test_vad_worker_filters_a_very_short_non_speech_segment() -> None:
+    source = BoundedAudioFrameQueue(max_seconds=2.0)
+    source.put(np.ones(1_024, dtype=np.float32), sample_rate=16_000)
+    segments: list[SpeechSegment] = []
+    results = iter(({"start": 100}, {"end": 2_000}))
+
+    worker = VoiceActivityWorker(
+        source_queue=source,
+        event_callback=lambda _event: None,
+        warning_callback=lambda _warning: None,
+        segment_callback=segments.append,
+        detector_factory=lambda: lambda _samples: next(results),
+    )
+    worker.start()
+    worker.stop()
+
+    assert segments == []
+    assert worker.stats.completed_segments == 0
+    assert worker.stats.filtered_short_segments == 1

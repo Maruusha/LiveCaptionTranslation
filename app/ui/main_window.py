@@ -28,7 +28,7 @@ from app.audio.devices import (
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
 from app.core.performance import PerformanceReport, format_mebibytes
 from app.speech.recognition import RecognitionResult
-from app.speech.vad import VoiceActivityStats
+from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
 
 
 MonitorFactory = Callable[
@@ -36,9 +36,9 @@ MonitorFactory = Callable[
         int | tuple[int, ...],
         Callable[[float], None],
         Callable[[str], None],
-        Callable[[object], None],
-        Callable[[object], None],
-        Callable[[object], None],
+        Callable[[SpeechEvent], None],
+        Callable[[SpeechSegment], None],
+        Callable[[RecognitionResult], None],
     ],
     MicrophoneLevelMonitor,
 ]
@@ -348,8 +348,8 @@ class MainWindow(QMainWindow):
         self._performance_timer.stop()
         if monitor is not None:
             self._show_performance_report(
-                getattr(monitor, "performance_report", None),
-                getattr(monitor, "voice_activity_stats", None),
+                monitor.performance_report,
+                monitor.voice_activity_stats,
             )
 
         self.input_level.setValue(0)
@@ -418,8 +418,8 @@ class MainWindow(QMainWindow):
         if monitor is None:
             return
         self._show_performance_report(
-            getattr(monitor, "performance_report", None),
-            getattr(monitor, "voice_activity_stats", None),
+            monitor.performance_report,
+            monitor.voice_activity_stats,
         )
 
     def _show_performance_report(
@@ -445,7 +445,8 @@ class MainWindow(QMainWindow):
                 f"Load: {vad_stats.model_load_seconds:.2f}s\n"
                 f"Speech starts: {vad_stats.speech_starts}  |  "
                 f"Completed turns: {vad_stats.speech_ends}  |  "
-                f"Audio chunks: {vad_stats.completed_segments}"
+                f"Audio chunks: {vad_stats.completed_segments}  |  "
+                f"Short events ignored: {vad_stats.filtered_short_segments}"
             )
         self.performance_summary.setText(summary)
 
@@ -480,6 +481,7 @@ class MainWindow(QMainWindow):
             disconnected_name = active_name
             logger.warning("Active microphone disconnected: %s", disconnected_name)
             self._stop_microphone(show_ready=False)
+            self._device_refresh_pending = False
             self.refresh_connected_microphones()
             self.device_status.setText(
                 f"{disconnected_name} was disconnected. Microphone capture stopped."

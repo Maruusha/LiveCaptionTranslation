@@ -90,7 +90,7 @@ class AudioProcessingWorker:
     def _run(self) -> None:
         resampler: soxr.ResampleStream | None = None
         input_sample_rate: int | None = None
-        last_frame: AudioFrame | None = None
+        last_capture_time: float | None = None
 
         try:
             while True:
@@ -102,19 +102,19 @@ class AudioProcessingWorker:
                     continue
 
                 if frame.sample_rate != input_sample_rate:
-                    if resampler is not None and last_frame is not None:
+                    if resampler is not None and last_capture_time is not None:
                         self._emit_output(
                             resampler.resample_chunk(
                                 np.empty(0, dtype=np.float32),
                                 last=True,
                             ),
-                            last_frame.captured_at,
+                            last_capture_time,
                         )
                     input_sample_rate = frame.sample_rate
                     resampler = self._create_resampler(input_sample_rate)
 
                 self._record_input(frame)
-                last_frame = frame
+                last_capture_time = frame.captured_at
                 if resampler is None:
                     self._emit_output(frame.samples, frame.captured_at)
                 else:
@@ -123,18 +123,21 @@ class AudioProcessingWorker:
                         frame.captured_at,
                     )
 
-            if resampler is not None and last_frame is not None:
+            if resampler is not None and last_capture_time is not None:
                 self._emit_output(
                     resampler.resample_chunk(
                         np.empty(0, dtype=np.float32),
                         last=True,
                     ),
-                    last_frame.captured_at,
+                    last_capture_time,
                 )
         except Exception as error:
             self._warning_callback(f"Audio processing stopped: {error}")
 
-    def _create_resampler(self, input_sample_rate: int):
+    def _create_resampler(
+        self,
+        input_sample_rate: int,
+    ) -> soxr.ResampleStream | None:
         if input_sample_rate == self.output_sample_rate:
             return None
         return soxr.ResampleStream(

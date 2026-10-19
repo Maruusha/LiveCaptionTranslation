@@ -52,6 +52,7 @@ class FakeMicrophoneMonitor:
             speech_starts=2,
             speech_ends=2,
             completed_segments=2,
+            filtered_short_segments=1,
         )
 
     def start(self) -> None:

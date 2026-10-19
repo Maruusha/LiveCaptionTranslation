@@ -89,53 +89,51 @@ def list_input_devices() -> list[AudioDevice]:
         host_apis = sd.query_hostapis()
         default_input_index = _default_input_device_index()
 
-        input_entries: list[dict[str, object]] = []
+        input_devices: list[AudioDevice] = []
         for index, raw_device in enumerate(raw_devices):
             input_channels = int(raw_device["max_input_channels"])
             if input_channels <= 0:
                 continue
 
             host_api_index = int(raw_device["hostapi"])
-            host_api_name = _clean_device_name(host_apis[host_api_index]["name"])
-            input_entries.append(
-                {
-                    "index": index,
-                    "name": _clean_device_name(raw_device["name"]),
-                    "host_api": host_api_name,
-                    "max_input_channels": input_channels,
-                    "default_sample_rate": float(raw_device["default_samplerate"]),
-                }
+            input_devices.append(
+                AudioDevice(
+                    index=index,
+                    name=_clean_device_name(raw_device["name"]),
+                    host_api=_clean_device_name(host_apis[host_api_index]["name"]),
+                    max_input_channels=input_channels,
+                    default_sample_rate=float(raw_device["default_samplerate"]),
+                )
             )
 
-        active_entries = [
-            entry
-            for entry in input_entries
-            if _normalized_name(str(entry["host_api"])) == "windows wasapi"
+        active_devices = [
+            device
+            for device in input_devices
+            if _normalized_name(device.host_api) == "windows wasapi"
         ]
 
         devices: list[AudioDevice] = []
-        for active_entry in active_entries:
-            active_name = str(active_entry["name"])
-            matching_entries = [
-                entry
-                for entry in input_entries
-                if _matches_active_endpoint(active_name, str(entry["name"]))
+        for active_device in active_devices:
+            matching_devices = [
+                device
+                for device in input_devices
+                if _matches_active_endpoint(active_device.name, device.name)
             ]
-            matching_entries.sort(
-                key=lambda entry: (
-                    _backend_priority(str(entry["host_api"])),
-                    int(entry["index"]),
+            matching_devices.sort(
+                key=lambda device: (
+                    _backend_priority(device.host_api),
+                    device.index,
                 )
             )
-            candidate_indices = tuple(int(entry["index"]) for entry in matching_entries)
+            candidate_indices = tuple(device.index for device in matching_devices)
 
             devices.append(
                 AudioDevice(
-                    index=int(active_entry["index"]),
-                    name=active_name,
-                    host_api=str(active_entry["host_api"]),
-                    max_input_channels=int(active_entry["max_input_channels"]),
-                    default_sample_rate=float(active_entry["default_sample_rate"]),
+                    index=active_device.index,
+                    name=active_device.name,
+                    host_api=active_device.host_api,
+                    max_input_channels=active_device.max_input_channels,
+                    default_sample_rate=active_device.default_sample_rate,
                     is_default=default_input_index in candidate_indices,
                     candidate_indices=candidate_indices,
                 )

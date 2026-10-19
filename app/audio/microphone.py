@@ -136,13 +136,6 @@ class MicrophoneLevelMonitor:
         if self.is_running:
             return
 
-        self._performance_start = take_process_snapshot()
-        self.last_performance_report = None
-        self.processing_worker.start()
-        if self.recognition_worker is not None:
-            self.recognition_worker.start()
-        if self.voice_activity_worker is not None:
-            self.voice_activity_worker.start()
         last_error: Exception | None = None
         for device_index in self.device_indices:
             stream: sd.InputStream | None = None
@@ -173,14 +166,15 @@ class MicrophoneLevelMonitor:
                 device_index,
                 self._active_sample_rate,
             )
+            self._performance_start = take_process_snapshot()
+            self.last_performance_report = None
+            if self.recognition_worker is not None:
+                self.recognition_worker.start()
+            if self.voice_activity_worker is not None:
+                self.voice_activity_worker.start()
+            self.processing_worker.start()
             return
 
-        self.processing_worker.stop()
-        if self.voice_activity_worker is not None:
-            self.voice_activity_worker.stop()
-        if self.recognition_worker is not None:
-            self.recognition_worker.stop()
-        self._performance_start = None
         raise MicrophoneCaptureError(
             "The selected microphone could not be started through any available "
             "Windows audio backend. Check its connection, Windows microphone "
@@ -201,8 +195,10 @@ class MicrophoneLevelMonitor:
             stream.stop()
         except Exception as error:
             stop_error = error
-        finally:
+        try:
             stream.close()
+        except Exception as error:
+            stop_error = stop_error or error
 
         try:
             self.processing_worker.stop()
@@ -281,7 +277,8 @@ class MicrophoneLevelMonitor:
             logger.info(
                 "Voice activity summary: model load=%.3fs, audio=%.3fs, "
                 "windows=%d, average inference=%.3fms, real-time use=%.2f%%, "
-                "speech starts=%d, speech ends=%d, completed segments=%d",
+                "speech starts=%d, speech ends=%d, completed segments=%d, "
+                "short segments ignored=%d",
                 vad_stats.model_load_seconds,
                 vad_stats.processed_audio_seconds,
                 vad_stats.processed_windows,
@@ -290,6 +287,7 @@ class MicrophoneLevelMonitor:
                 vad_stats.speech_starts,
                 vad_stats.speech_ends,
                 vad_stats.completed_segments,
+                vad_stats.filtered_short_segments,
             )
         recognition_stats = self.recognition_stats
         if recognition_stats is not None:

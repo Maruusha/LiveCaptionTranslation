@@ -7,4 +7,5 @@ torch==2.14.1
 onnxruntime==1.31.0
 silero-vad==6.2.3
 faster-whisper==1.2.1
+av==16.0.1
 

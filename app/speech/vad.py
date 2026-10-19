@@ -17,6 +17,7 @@ from app.core.queues import BoundedAudioFrameQueue
 VAD_SAMPLE_RATE = 16_000
 VAD_WINDOW_SAMPLES = 512
 DEFAULT_MAX_SEGMENT_SECONDS = 30.0
+DEFAULT_MIN_SEGMENT_SECONDS = 0.2
 
 
 class VoiceActivityError(RuntimeError):
@@ -60,6 +61,7 @@ class VoiceActivityStats:
     speech_starts: int
     speech_ends: int
     completed_segments: int
+    filtered_short_segments: int
 
     @property
     def average_inference_milliseconds(self) -> float:
@@ -110,9 +112,12 @@ class VoiceActivityWorker:
         segment_callback: Callable[[SpeechSegment], None] | None = None,
         detector_factory: Callable[[], StreamingDetector] = create_silero_detector,
         max_segment_seconds: float = DEFAULT_MAX_SEGMENT_SECONDS,
+        min_segment_seconds: float = DEFAULT_MIN_SEGMENT_SECONDS,
     ) -> None:
         if max_segment_seconds <= 0.0:
             raise ValueError("max_segment_seconds must be greater than zero.")
+        if min_segment_seconds < 0.0:
+            raise ValueError("min_segment_seconds cannot be negative.")
         self.source_queue = source_queue
         self._event_callback = event_callback
         self._warning_callback = warning_callback
@@ -122,6 +127,7 @@ class VoiceActivityWorker:
             VAD_WINDOW_SAMPLES,
             int(round(max_segment_seconds * VAD_SAMPLE_RATE)),
         )
+        self._min_segment_samples = int(round(min_segment_seconds * VAD_SAMPLE_RATE))
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._stats_lock = Lock()
@@ -131,6 +137,7 @@ class VoiceActivityWorker:
         self._speech_starts = 0
         self._speech_ends = 0
         self._completed_segments = 0
+        self._filtered_short_segments = 0
 
     @property
     def is_running(self) -> bool:
@@ -150,6 +157,7 @@ class VoiceActivityWorker:
                 speech_starts=self._speech_starts,
                 speech_ends=self._speech_ends,
                 completed_segments=self._completed_segments,
+                filtered_short_segments=self._filtered_short_segments,
             )
 
     def start(self) -> None:
@@ -163,6 +171,7 @@ class VoiceActivityWorker:
             self._speech_starts = 0
             self._speech_ends = 0
             self._completed_segments = 0
+            self._filtered_short_segments = 0
         self._thread = Thread(
             target=self._run,
             name="voice-activity-worker",
@@ -277,7 +286,6 @@ class VoiceActivityWorker:
             if speech_active:
                 if pending.size:
                     segment_parts.append(pending.copy())
-                    segment_sample_count += pending.size
                     total_samples += pending.size
                 with self._stats_lock:
                     self._speech_ends += 1
@@ -317,6 +325,10 @@ class VoiceActivityWorker:
         samples = np.concatenate(parts)
         wanted_samples = min(samples.size, end_sample - start_sample)
         if wanted_samples <= 0:
+            return
+        if not forced_split and wanted_samples < self._min_segment_samples:
+            with self._stats_lock:
+                self._filtered_short_segments += 1
             return
         owned_samples = np.ascontiguousarray(samples[:wanted_samples], dtype=np.float32)
         owned_samples.setflags(write=False)

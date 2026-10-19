@@ -82,7 +82,11 @@ def test_monitor_falls_back_to_another_backend(monkeypatch) -> None:
 
     monkeypatch.setattr(microphone.sd, "InputStream", FakeInputStream)
 
-    monitor = microphone.MicrophoneLevelMonitor((12, 17), lambda _level: None, lambda _warning: None)
+    monitor = microphone.MicrophoneLevelMonitor(
+        (12, 17),
+        lambda _level: None,
+        lambda _warning: None,
+    )
     monitor.start()
 
     assert attempted_indices == [12, 17]

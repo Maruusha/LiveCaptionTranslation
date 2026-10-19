@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import sys
 import logging
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
