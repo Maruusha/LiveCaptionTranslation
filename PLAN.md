@@ -76,6 +76,8 @@ The exact model sizes should be configurable so the app can work on both slower 
 
 ## 4. Audio Sources
 
+The main window will use one clear radio-button choice for the active source: **Microphone** or **Computer audio**. Only one source can be active at a time. Keep **Computer audio** disabled or hidden until WASAPI loopback capture is implemented and tested.
+
 ### Microphone
 
 The user can select any microphone detected by Windows.
@@ -553,6 +555,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Handle start, stop, and device disconnection.
 - Measure CPU and memory use before continuing.
 
+**Current verification:** When microphone capture stops, the diagnostic log records its duration, average process CPU use, memory before and after capture, process peak memory, processed audio duration, and queue drops. The final 30-minute live-microphone stability run is still required before Stage 1 is considered complete.
+
 **Finished when:** Microphone audio runs for at least 30 minutes without growing memory, freezing, or losing the selected device unexpectedly.
 
 ### Stage 2 — Voice activity detection
@@ -562,6 +566,14 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Test quiet voices, background noise, music, and short phrases.
 - Tune speech padding and silence duration without cutting words.
 - Measure VAD delay and CPU use.
+
+**Current implementation:** The project-local `.venv/` contains `silero-vad 6.2.3`, CPU-only `torch 2.14.1`, and `onnxruntime 1.31.0`. The model is bundled with the installed Silero package, so starting VAD does not download anything. The live 16 kHz audio queue now feeds a background ONNX VAD worker, and the interface shows speech or silence when it receives boundary events. Initial settings are a `0.5` speech threshold, `400 ms` minimum silence, `100 ms` speech padding, and a `200 ms` minimum completed segment. The short-segment filter reduces clicks and brief music tones becoming caption jobs; its count appears in the simple Performance view and diagnostic log. Completed speech turns become temporary, read-only in-memory audio chunks for the later recognition stage; they are not saved to disk and are split at 30 seconds to keep memory bounded. The Performance view and diagnostic log also report model load time, processed VAD audio, average inference time per window, speech boundary counts, and completed chunk counts.
+
+**Automated evaluation on 2026-10-19:** A repeatable local command, `.venv\Scripts\python.exe -m app.diagnostics.vad_evaluation`, runs the production VAD against a project-local 60-second speech sample plus deterministic quiet-speech, strong-noise, music-tone, background-noise, and short-phrase variants. Normal and quiet speech each produced 10 useful segments. The noisy variant produced 12 useful segments and one ignored short event, so strong noise can still split one speaker turn more often. Background noise produced no speech. A music tone triggered one 164 ms boundary pair, which the 200 ms filter correctly prevented from becoming a speech chunk. The short phrase remained detected. Average inference time was about `0.17 ms` per 32 ms window, or about `0.53%` of real time, after model load. All 30 automated tests passed. These generated cases are useful regression tests but do not replace testing real French and English voices through the selected microphone.
+
+**Live-device check on 2026-10-19:** A 20-second run processed 19.936 seconds of Realtek microphone input across 623 VAD windows with no processing warnings or false speech events. The working Realtek backend returned exact silence during the test. A separate Razer headset backend check returned only a very small background-level signal. This confirms device fallback and silent-input handling, but it does not count as a spoken-voice accuracy test. Repeat after confirming that the chosen microphone is unmuted and receiving audible input.
+
+**Remaining before completion:** Speak real French and English at normal and quiet levels, play real music/background sound near the microphone, check whether starts or word endings are cut, and record visible end-to-end boundary delay and live CPU/RAM use. Stage 2 is not complete until those live checks pass.
 
 **Finished when:** Speech boundaries are reliable enough to create useful audio chunks and silence does not cause constant false speech events.
 
@@ -574,6 +586,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Prevent duplicate captions.
 - Test French, English, accents, names, and mixed-language speech.
 - Measure recognition delay, queue size, CPU, and RAM.
+
+**Current implementation:** `faster-whisper 1.2.1` is installed inside the project `.venv/`. PyAV is pinned to `16.0.1` because the released faster-whisper decoder is not compatible with PyAV 19 yet. The multilingual `Systran/faster-whisper-small` model is pinned to revision `2ec96c5472da50d38d40c0cfe0602af2e94b4c8a` and stored under `models/speech/faster-whisper-small/` (about 486 MB). It loads from that local path with networking disabled, using CPU INT8 and four CPU threads. Completed VAD chunks now enter a bounded eight-item background recognition queue and produce a final French or English caption in the simple interface. Queue overload creates a visible skipped-caption result instead of silently losing work. A real offline smoke test loaded the model and processed silence successfully. Rolling preview captions, stable chat bubbles, language controls, real French/English accuracy tests, and full performance measurements remain unfinished.
 
 **Finished when:** A user can speak French or English and receive readable local captions without an internet connection or an ever-growing processing delay.
 
@@ -685,6 +699,8 @@ The target delay for the balanced mode should be about one to three seconds on a
 
 These are user-selected presets in the first releases. Automatic PC inspection and automatic model selection remain distant-future work. The application should show its current delay and warn the user when processing cannot keep up with incoming audio.
 
+The first performance view uses simple live text statistics: capture duration, average process CPU use, current memory, memory change, and process peak memory. A selectable graph view and more detailed historical metrics are deferred until the basic audio and caption pipeline is stable.
+
 ## 12. Privacy and Storage
 
 - Process audio locally.
@@ -714,12 +730,22 @@ Keep everything needed for development inside this project folder whenever possi
 Git is supplied by GitHub Desktop and is not currently available through the normal command search path. When Git is needed, use this executable directly:
 
 ```text
-C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.3\resources\app\git\cmd\git.exe
+C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe
 ```
 
-This is a machine-specific development path. Do not build it into the application or assume another computer uses the same GitHub Desktop version.
+This is a machine-specific development path. GitHub Desktop updates can change the `app-*` version folder, so locate the newest installed copy if this path stops working. Do not build it into the application or assume another computer uses the same GitHub Desktop version.
 
 ## 13. Error Handling
+
+### Local diagnostic logs
+
+- Write runtime logs to the terminal and `logs/application.log`.
+- Rotate `application.log` when it reaches 2 MB.
+- Keep four log files in total: the current file plus three backups named `application.log.1`, `application.log.2`, and `application.log.3`.
+- The four files use about 8 MB at most in normal operation. When rotating, delete the oldest backup.
+- Keep the `logs/` folder out of Git.
+- Log operational information such as application startup and shutdown, device refresh or disconnection, audio queue drops, processing warnings, and errors.
+- Do not put raw audio, caption or conversation text, voice signatures, access tokens, or other sensitive data in diagnostic logs.
 
 Show simple messages for common problems:
 
@@ -794,12 +820,13 @@ The following items are intentionally outside the near-term roadmap. Keep them d
 - Add user-managed database backup and restore controls.
 - Add an advanced model manager with updates, rollback, and multiple installed versions.
 - Offer a portable build in addition to the normal installer.
-- Add an advanced diagnostics screen for long-session performance and queue history.
+- Add performance graphs and an advanced diagnostics screen for detailed metrics and long-session queue history.
 - Support macOS and Linux.
 - Add more languages.
 - Add terminology lists for names, games, or technical subjects.
 - Automatically inspect the user's PC and select different speech-recognition, translation, and speaker-detection models based on its CPU, RAM, and GPU.
 - Provide simple hardware profiles such as **Low Power**, **Balanced**, and **High Accuracy**.
+- Adapt the maximum in-memory speech-chunk length to available RAM and the selected recognition model. Keep the fixed 30-second limit until this is implemented, always enforce a safe upper bound, and never discard later audio merely because one chunk reached that bound.
 - Allow an advanced user to override the automatic model choices.
 - Do not implement this during the first releases. Initially, provide a small set of manual quality choices and document their hardware requirements.
 - In the distant future, add French ↔ Vietnamese recognition and translation after the French ↔ English application is stable. At that time, add the `vi` language code, a `models/translation/fr-vi/` model folder, Vietnamese interface choices, suitable direct or fallback translation models, font checks, and Vietnamese-specific accuracy, punctuation, and mixed-language tests. It should reuse the existing audio capture, VAD, speaker detection, chat, history, pause/resume, and database design. Do not include Vietnamese models, user-interface work, or language-specific testing in near-term releases.
