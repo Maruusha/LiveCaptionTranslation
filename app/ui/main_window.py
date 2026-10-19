@@ -3,8 +3,8 @@
 from collections.abc import Callable
 import logging
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCloseEvent, QFont
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QFont, QStandardItemModel
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
     QComboBox,
@@ -26,10 +26,17 @@ from app.audio.devices import (
     refresh_input_devices,
 )
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
+from app.core.performance import PerformanceReport, format_mebibytes
+from app.speech.vad import VoiceActivityStats
 
 
 MonitorFactory = Callable[
-    [int | tuple[int, ...], Callable[[float], None], Callable[[str], None]],
+    [
+        int | tuple[int, ...],
+        Callable[[float], None],
+        Callable[[str], None],
+        Callable[[object], None],
+    ],
     MicrophoneLevelMonitor,
 ]
 
@@ -41,6 +48,7 @@ class MainWindow(QMainWindow):
 
     microphone_level_received = Signal(float)
     microphone_warning_received = Signal(str)
+    speech_event_received = Signal(object)
 
     def __init__(
         self,
@@ -61,6 +69,7 @@ class MainWindow(QMainWindow):
 
         self.microphone_level_received.connect(self._set_microphone_level)
         self.microphone_warning_received.connect(self._show_microphone_warning)
+        self.speech_event_received.connect(self._show_speech_event)
 
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(
@@ -106,6 +115,9 @@ class MainWindow(QMainWindow):
         self.input_level.setValue(0)
         self.input_level.setFormat("Input level: %p%")
 
+        self.speech_status = QLabel("Speech detection: stopped")
+        self.speech_status.setObjectName("speechDetectionStatus")
+
         self.start_stop_button = QPushButton("Start microphone")
         self.start_stop_button.setObjectName("startStopMicrophoneButton")
         self.start_stop_button.clicked.connect(self.toggle_microphone)
@@ -115,8 +127,42 @@ class MainWindow(QMainWindow):
         microphone_layout.addLayout(selector_layout)
         microphone_layout.addWidget(self.device_status)
         microphone_layout.addWidget(self.input_level)
+        microphone_layout.addWidget(self.speech_status)
         microphone_layout.addWidget(self.start_stop_button)
         microphone_group.setLayout(microphone_layout)
+
+        self.performance_view_selector = QComboBox()
+        self.performance_view_selector.setObjectName("performanceViewSelector")
+        self.performance_view_selector.addItem("Simple stats")
+        self.performance_view_selector.addItem(
+            "Graphs and detailed metrics (planned)"
+        )
+        performance_model = self.performance_view_selector.model()
+        if isinstance(performance_model, QStandardItemModel):
+            planned_item = performance_model.item(1)
+            if planned_item is not None:
+                planned_item.setEnabled(False)
+
+        self.performance_summary = QLabel("No capture measured yet.")
+        self.performance_summary.setObjectName("performanceSummary")
+        self.performance_summary.setWordWrap(True)
+
+        performance_selector_layout = QHBoxLayout()
+        performance_selector_layout.addWidget(QLabel("View:"))
+        performance_selector_layout.addWidget(
+            self.performance_view_selector,
+            stretch=1,
+        )
+
+        performance_group = QGroupBox("Performance")
+        performance_layout = QVBoxLayout()
+        performance_layout.addLayout(performance_selector_layout)
+        performance_layout.addWidget(self.performance_summary)
+        performance_group.setLayout(performance_layout)
+
+        self._performance_timer = QTimer(self)
+        self._performance_timer.setInterval(1_000)
+        self._performance_timer.timeout.connect(self._update_performance_stats)
 
         layout = QVBoxLayout()
         layout.addStretch()
@@ -124,6 +170,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(message)
         layout.addSpacing(16)
         layout.addWidget(microphone_group)
+        layout.addWidget(performance_group)
         layout.addStretch()
 
         content = QWidget()
@@ -209,6 +256,7 @@ class MainWindow(QMainWindow):
             selected_device.input_indices,
             self.microphone_level_received.emit,
             self.microphone_warning_received.emit,
+            self.speech_event_received.emit,
         )
 
         try:
@@ -228,6 +276,10 @@ class MainWindow(QMainWindow):
             f"Listening to {self.microphone_selector.currentText()}. Audio is not saved."
         )
         self.statusBar().showMessage("Microphone active")
+        self.speech_status.setText("Speech detection: listening…")
+        self.performance_summary.setText("Measuring performance…")
+        self._performance_timer.start()
+        self._update_performance_stats()
 
     def _stop_microphone(self, show_ready: bool = True) -> None:
         monitor = self._microphone_monitor
@@ -242,7 +294,15 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Microphone stop warning")
                 show_ready = False
 
+        self._performance_timer.stop()
+        if monitor is not None:
+            self._show_performance_report(
+                getattr(monitor, "performance_report", None),
+                getattr(monitor, "voice_activity_stats", None),
+            )
+
         self.input_level.setValue(0)
+        self.speech_status.setText("Speech detection: stopped")
         self.microphone_selector.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.start_stop_button.setText("Start microphone")
@@ -260,6 +320,51 @@ class MainWindow(QMainWindow):
 
     def _show_microphone_warning(self, warning: str) -> None:
         self.statusBar().showMessage(f"Microphone warning: {warning}")
+
+    def _show_speech_event(self, event: object) -> None:
+        kind = getattr(event, "kind", None)
+        audio_seconds = float(getattr(event, "audio_seconds", 0.0))
+        if kind == "speech_start":
+            self.speech_status.setText("Speech detection: speech")
+            logger.info("Speech started at %.3fs", audio_seconds)
+        elif kind == "speech_end":
+            self.speech_status.setText("Speech detection: silence")
+            logger.info("Speech ended at %.3fs", audio_seconds)
+
+    def _update_performance_stats(self) -> None:
+        monitor = self._microphone_monitor
+        if monitor is None:
+            return
+        self._show_performance_report(
+            getattr(monitor, "performance_report", None),
+            getattr(monitor, "voice_activity_stats", None),
+        )
+
+    def _show_performance_report(
+        self,
+        report: PerformanceReport | None,
+        vad_stats: VoiceActivityStats | None = None,
+    ) -> None:
+        if report is None:
+            return
+
+        minutes, seconds = divmod(int(report.elapsed_seconds), 60)
+        summary = (
+            f"Duration: {minutes:02d}:{seconds:02d}  |  "
+            f"Average CPU: {report.average_cpu_percent:.1f}%\n"
+            f"Memory: {format_mebibytes(report.memory_end_bytes)}  |  "
+            f"Change: {format_mebibytes(report.memory_change_bytes)}  |  "
+            f"Process peak: {format_mebibytes(report.peak_memory_bytes)}"
+        )
+        if vad_stats is not None:
+            summary += (
+                f"\nVAD audio: {vad_stats.processed_audio_seconds:.1f}s  |  "
+                f"Detection: {vad_stats.average_inference_milliseconds:.2f} ms/window  |  "
+                f"Load: {vad_stats.model_load_seconds:.2f}s\n"
+                f"Speech starts: {vad_stats.speech_starts}  |  "
+                f"Completed turns: {vad_stats.speech_ends}"
+            )
+        self.performance_summary.setText(summary)
 
     @staticmethod
     def _qt_connected_microphone_names() -> set[str]:

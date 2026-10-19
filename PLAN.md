@@ -553,6 +553,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Handle start, stop, and device disconnection.
 - Measure CPU and memory use before continuing.
 
+**Current verification:** When microphone capture stops, the diagnostic log records its duration, average process CPU use, memory before and after capture, process peak memory, processed audio duration, and queue drops. The final 30-minute live-microphone stability run is still required before Stage 1 is considered complete.
+
 **Finished when:** Microphone audio runs for at least 30 minutes without growing memory, freezing, or losing the selected device unexpectedly.
 
 ### Stage 2 — Voice activity detection
@@ -562,6 +564,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Test quiet voices, background noise, music, and short phrases.
 - Tune speech padding and silence duration without cutting words.
 - Measure VAD delay and CPU use.
+
+**Current implementation:** The project-local `.venv/` contains `silero-vad 6.2.3`, CPU-only `torch 2.14.1`, and `onnxruntime 1.31.0`. The model is bundled with the installed Silero package, so starting VAD does not download anything. The live 16 kHz audio queue now feeds a background ONNX VAD worker, and the interface shows speech or silence when it receives boundary events. Initial settings are a `0.5` speech threshold, `400 ms` minimum silence, and `100 ms` speech padding. The simple Performance view and diagnostic log report model load time, processed VAD audio, average inference time per window, and speech boundary counts. A synthetic 10.24-second silence check produced no false speech events. Quiet voice, real background noise, music, short-phrase, end-to-end delay, and live CPU tests are still required before Stage 2 is complete.
 
 **Finished when:** Speech boundaries are reliable enough to create useful audio chunks and silence does not cause constant false speech events.
 
@@ -685,6 +689,8 @@ The target delay for the balanced mode should be about one to three seconds on a
 
 These are user-selected presets in the first releases. Automatic PC inspection and automatic model selection remain distant-future work. The application should show its current delay and warn the user when processing cannot keep up with incoming audio.
 
+The first performance view uses simple live text statistics: capture duration, average process CPU use, current memory, memory change, and process peak memory. A selectable graph view and more detailed historical metrics are deferred until the basic audio and caption pipeline is stable.
+
 ## 12. Privacy and Storage
 
 - Process audio locally.
@@ -720,6 +726,16 @@ C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.e
 This is a machine-specific development path. GitHub Desktop updates can change the `app-*` version folder, so locate the newest installed copy if this path stops working. Do not build it into the application or assume another computer uses the same GitHub Desktop version.
 
 ## 13. Error Handling
+
+### Local diagnostic logs
+
+- Write runtime logs to the terminal and `logs/application.log`.
+- Rotate `application.log` when it reaches 2 MB.
+- Keep four log files in total: the current file plus three backups named `application.log.1`, `application.log.2`, and `application.log.3`.
+- The four files use about 8 MB at most in normal operation. When rotating, delete the oldest backup.
+- Keep the `logs/` folder out of Git.
+- Log operational information such as application startup and shutdown, device refresh or disconnection, audio queue drops, processing warnings, and errors.
+- Do not put raw audio, caption or conversation text, voice signatures, access tokens, or other sensitive data in diagnostic logs.
 
 Show simple messages for common problems:
 
@@ -794,7 +810,7 @@ The following items are intentionally outside the near-term roadmap. Keep them d
 - Add user-managed database backup and restore controls.
 - Add an advanced model manager with updates, rollback, and multiple installed versions.
 - Offer a portable build in addition to the normal installer.
-- Add an advanced diagnostics screen for long-session performance and queue history.
+- Add performance graphs and an advanced diagnostics screen for detailed metrics and long-session queue history.
 - Support macOS and Linux.
 - Add more languages.
 - Add terminology lists for names, games, or technical subjects.

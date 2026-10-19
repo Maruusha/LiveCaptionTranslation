@@ -11,17 +11,41 @@ from PySide6.QtWidgets import QApplication
 
 from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
+from app.core.performance import PerformanceReport
 from app.main import create_application
+from app.speech.vad import VoiceActivityStats
 from app.ui.main_window import MainWindow
 
 
 class FakeMicrophoneMonitor:
-    def __init__(self, device_index, level_callback, warning_callback) -> None:
+    def __init__(
+        self,
+        device_index,
+        level_callback,
+        warning_callback,
+        speech_event_callback,
+    ) -> None:
         self.device_index = device_index
         self.level_callback = level_callback
         self.warning_callback = warning_callback
         self.started = False
         self.stopped = False
+        self.speech_event_callback = speech_event_callback
+        self.performance_report = PerformanceReport(
+            elapsed_seconds=65.0,
+            average_cpu_percent=2.5,
+            memory_start_bytes=100 * 1024 * 1024,
+            memory_end_bytes=104 * 1024 * 1024,
+            peak_memory_bytes=110 * 1024 * 1024,
+        )
+        self.voice_activity_stats = VoiceActivityStats(
+            model_load_seconds=0.75,
+            processed_windows=100,
+            processed_audio_seconds=3.2,
+            inference_seconds=0.02,
+            speech_starts=2,
+            speech_ends=2,
+        )
 
     def start(self) -> None:
         self.started = True
@@ -61,6 +85,9 @@ def test_main_window_starts_ready() -> None:
     assert window.microphone_selector.count() == 1
     assert window.microphone_selector.currentData().index == 12
     assert "Test Microphone" in window.microphone_selector.currentText()
+    assert window.performance_view_selector.currentText() == "Simple stats"
+    assert not window.performance_view_selector.model().item(1).isEnabled()
+    assert window.performance_summary.text() == "No capture measured yet."
 
     window.close()
 
@@ -69,11 +96,17 @@ def test_microphone_controls_start_update_and_stop() -> None:
     create_application(["live-caption-translation-test"])
     monitors: list[FakeMicrophoneMonitor] = []
 
-    def monitor_factory(device_indices, level_callback, warning_callback):
+    def monitor_factory(
+        device_indices,
+        level_callback,
+        warning_callback,
+        speech_event_callback,
+    ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
             level_callback,
             warning_callback,
+            speech_event_callback,
         )
         monitors.append(monitor)
         return monitor
@@ -96,6 +129,12 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert monitors[0].stopped
     assert window.start_stop_button.text() == "Start microphone"
     assert window.microphone_selector.isEnabled()
+    assert "Duration: 01:05" in window.performance_summary.text()
+    assert "Average CPU: 2.5%" in window.performance_summary.text()
+    assert "Memory: 104.0 MiB" in window.performance_summary.text()
+    assert "VAD audio: 3.2s" in window.performance_summary.text()
+    assert "Speech starts: 2" in window.performance_summary.text()
+    assert "Completed turns: 2" in window.performance_summary.text()
 
     window.close()
 
@@ -142,11 +181,17 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
     def connected_device_provider() -> list[AudioDevice]:
         return microphone_fixture() if connected_names else []
 
-    def monitor_factory(device_indices, level_callback, warning_callback):
+    def monitor_factory(
+        device_indices,
+        level_callback,
+        warning_callback,
+        speech_event_callback,
+    ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
             level_callback,
             warning_callback,
+            speech_event_callback,
         )
         monitors.append(monitor)
         return monitor
