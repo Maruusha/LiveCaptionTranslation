@@ -27,6 +27,7 @@ from app.audio.devices import (
 )
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
 from app.core.performance import PerformanceReport, format_mebibytes
+from app.speech.recognition import RecognitionResult
 from app.speech.vad import VoiceActivityStats
 
 
@@ -35,6 +36,7 @@ MonitorFactory = Callable[
         int | tuple[int, ...],
         Callable[[float], None],
         Callable[[str], None],
+        Callable[[object], None],
         Callable[[object], None],
         Callable[[object], None],
     ],
@@ -51,6 +53,7 @@ class MainWindow(QMainWindow):
     microphone_warning_received = Signal(str)
     speech_event_received = Signal(object)
     speech_segment_received = Signal(object)
+    caption_received = Signal(object)
 
     def __init__(
         self,
@@ -74,6 +77,7 @@ class MainWindow(QMainWindow):
         self.microphone_warning_received.connect(self._show_microphone_warning)
         self.speech_event_received.connect(self._show_speech_event)
         self.speech_segment_received.connect(self._show_speech_segment)
+        self.caption_received.connect(self._show_caption)
 
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(
@@ -126,6 +130,11 @@ class MainWindow(QMainWindow):
         self.speech_turn_status = QLabel("Completed speech chunks: 0")
         self.speech_turn_status.setObjectName("speechTurnStatus")
 
+        self.latest_caption = QLabel("Latest caption: waiting for microphone")
+        self.latest_caption.setObjectName("latestCaption")
+        self.latest_caption.setWordWrap(True)
+        self.latest_caption.setMinimumHeight(54)
+
         self.start_stop_button = QPushButton("Start microphone")
         self.start_stop_button.setObjectName("startStopMicrophoneButton")
         self.start_stop_button.setMinimumHeight(48)
@@ -138,6 +147,7 @@ class MainWindow(QMainWindow):
         microphone_layout.addWidget(self.input_level)
         microphone_layout.addWidget(self.speech_status)
         microphone_layout.addWidget(self.speech_turn_status)
+        microphone_layout.addWidget(self.latest_caption)
         microphone_layout.addWidget(self.start_stop_button)
         microphone_group.setLayout(microphone_layout)
 
@@ -294,6 +304,7 @@ class MainWindow(QMainWindow):
             self.microphone_warning_received.emit,
             self.speech_event_received.emit,
             self.speech_segment_received.emit,
+            self.caption_received.emit,
         )
 
         try:
@@ -316,6 +327,7 @@ class MainWindow(QMainWindow):
         self.speech_status.setText("Speech detection: listening…")
         self._completed_speech_chunks = 0
         self.speech_turn_status.setText("Completed speech chunks: 0")
+        self.latest_caption.setText("Latest caption: listening…")
         self.performance_summary.setText("Measuring performance…")
         self._performance_timer.start()
         self._update_performance_stats()
@@ -383,6 +395,22 @@ class MainWindow(QMainWindow):
             "Temporary speech segment completed: duration=%.3fs, forced split=%s",
             duration_seconds,
             forced_split,
+        )
+
+    def _show_caption(self, result: RecognitionResult) -> None:
+        if result.skipped or result.error:
+            self.latest_caption.setText(result.text)
+            self.statusBar().showMessage("Caption warning")
+            return
+
+        text = result.text or "[no speech recognized]"
+        language = (result.language or "unknown").upper()
+        self.latest_caption.setText(f"Latest caption [{language}]: {text}")
+        logger.info(
+            "Caption completed: language=%s, characters=%d, processing=%.3fs",
+            result.language or "unknown",
+            len(result.text),
+            result.processing_seconds,
         )
 
     def _update_performance_stats(self) -> None:

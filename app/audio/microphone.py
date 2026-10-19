@@ -16,6 +16,12 @@ from app.core.performance import (
     take_process_snapshot,
 )
 from app.core.queues import BoundedAudioFrameQueue
+from app.speech.recognition import (
+    RecognitionError,
+    RecognitionResult,
+    RecognitionStats,
+    RecognitionWorker,
+)
 from app.speech.vad import (
     SpeechEvent,
     SpeechSegment,
@@ -52,6 +58,7 @@ class MicrophoneLevelMonitor:
         warning_callback: Callable[[str], None],
         speech_event_callback: Callable[[SpeechEvent], None] | None = None,
         speech_segment_callback: Callable[[SpeechSegment], None] | None = None,
+        recognition_callback: Callable[[RecognitionResult], None] | None = None,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -64,6 +71,7 @@ class MicrophoneLevelMonitor:
         self.active_device_index: int | None = None
         self._level_callback = level_callback
         self._warning_callback = warning_callback
+        self._speech_segment_callback = speech_segment_callback
         self.audio_buffer = audio_buffer or BoundedAudioFrameQueue(
             max_seconds=5.0,
             max_frames=2_048,
@@ -78,12 +86,20 @@ class MicrophoneLevelMonitor:
             warning_callback=self._warning_callback,
             output_sample_rate=16_000,
         )
+        self.recognition_worker = (
+            RecognitionWorker(
+                result_callback=recognition_callback,
+                warning_callback=self._warning_callback,
+            )
+            if recognition_callback is not None
+            else None
+        )
         self.voice_activity_worker = (
             VoiceActivityWorker(
                 source_queue=self.processed_audio_buffer,
                 event_callback=speech_event_callback,
                 warning_callback=self._warning_callback,
-                segment_callback=speech_segment_callback,
+                segment_callback=self._handle_speech_segment,
             )
             if speech_event_callback is not None
             else None
@@ -110,6 +126,11 @@ class MicrophoneLevelMonitor:
         worker = self.voice_activity_worker
         return worker.stats if worker is not None else None
 
+    @property
+    def recognition_stats(self) -> RecognitionStats | None:
+        worker = self.recognition_worker
+        return worker.stats if worker is not None else None
+
     def start(self) -> None:
         """Open the selected microphone and begin level callbacks."""
         if self.is_running:
@@ -118,6 +139,8 @@ class MicrophoneLevelMonitor:
         self._performance_start = take_process_snapshot()
         self.last_performance_report = None
         self.processing_worker.start()
+        if self.recognition_worker is not None:
+            self.recognition_worker.start()
         if self.voice_activity_worker is not None:
             self.voice_activity_worker.start()
         last_error: Exception | None = None
@@ -155,6 +178,8 @@ class MicrophoneLevelMonitor:
         self.processing_worker.stop()
         if self.voice_activity_worker is not None:
             self.voice_activity_worker.stop()
+        if self.recognition_worker is not None:
+            self.recognition_worker.stop()
         self._performance_start = None
         raise MicrophoneCaptureError(
             "The selected microphone could not be started through any available "
@@ -190,6 +215,12 @@ class MicrophoneLevelMonitor:
             except VoiceActivityError as error:
                 stop_error = stop_error or error
 
+        if self.recognition_worker is not None:
+            try:
+                self.recognition_worker.stop()
+            except RecognitionError as error:
+                stop_error = stop_error or error
+
         self._log_capture_summary()
 
         if stop_error is not None:
@@ -211,6 +242,12 @@ class MicrophoneLevelMonitor:
         samples = np.asarray(input_data, dtype=np.float32)
         mono_samples = samples[:, 0] if samples.ndim == 2 else samples
         self.audio_buffer.put(mono_samples, sample_rate=sample_rate)
+
+    def _handle_speech_segment(self, segment: SpeechSegment) -> None:
+        if self._speech_segment_callback is not None:
+            self._speech_segment_callback(segment)
+        if self.recognition_worker is not None:
+            self.recognition_worker.submit(segment)
 
     def _log_capture_summary(self) -> None:
         start = self._performance_start
@@ -253,6 +290,16 @@ class MicrophoneLevelMonitor:
                 vad_stats.speech_starts,
                 vad_stats.speech_ends,
                 vad_stats.completed_segments,
+            )
+        recognition_stats = self.recognition_stats
+        if recognition_stats is not None:
+            logger.info(
+                "Speech recognition summary: queued=%d, completed=%d, failed=%d, "
+                "processing time=%.3fs",
+                recognition_stats.queued_segments,
+                recognition_stats.completed_segments,
+                recognition_stats.failed_segments,
+                recognition_stats.processing_seconds,
             )
 
 

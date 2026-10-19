@@ -14,6 +14,7 @@ from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
 from app.core.performance import PerformanceReport
 from app.main import create_application
+from app.speech.recognition import RecognitionResult
 from app.speech.vad import VoiceActivityStats
 from app.ui.main_window import MainWindow
 
@@ -26,6 +27,7 @@ class FakeMicrophoneMonitor:
         warning_callback,
         speech_event_callback,
         speech_segment_callback,
+        recognition_callback,
     ) -> None:
         self.device_index = device_index
         self.level_callback = level_callback
@@ -34,6 +36,7 @@ class FakeMicrophoneMonitor:
         self.stopped = False
         self.speech_event_callback = speech_event_callback
         self.speech_segment_callback = speech_segment_callback
+        self.recognition_callback = recognition_callback
         self.performance_report = PerformanceReport(
             elapsed_seconds=65.0,
             average_cpu_percent=2.5,
@@ -111,6 +114,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
         warning_callback,
         speech_event_callback,
         speech_segment_callback,
+        recognition_callback,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -118,6 +122,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
             warning_callback,
             speech_event_callback,
             speech_segment_callback,
+            recognition_callback,
         )
         monitors.append(monitor)
         return monitor
@@ -141,6 +146,18 @@ def test_microphone_controls_start_update_and_stop() -> None:
     )
     assert "Completed speech chunks: 1" in window.speech_turn_status.text()
     assert "Last turn: 1.2s" in window.speech_turn_status.text()
+
+    window.caption_received.emit(
+        RecognitionResult(
+            start_sample=0,
+            end_sample=16_000,
+            text="Bonjour le monde",
+            language="fr",
+            language_probability=0.99,
+            processing_seconds=0.4,
+        )
+    )
+    assert window.latest_caption.text() == "Latest caption [FR]: Bonjour le monde"
 
     window.start_stop_button.click()
     assert monitors[0].stopped
@@ -246,6 +263,7 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
         warning_callback,
         speech_event_callback,
         speech_segment_callback,
+        recognition_callback,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -253,6 +271,7 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
             warning_callback,
             speech_event_callback,
             speech_segment_callback,
+            recognition_callback,
         )
         monitors.append(monitor)
         return monitor

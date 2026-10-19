@@ -76,6 +76,8 @@ The exact model sizes should be configurable so the app can work on both slower 
 
 ## 4. Audio Sources
 
+The main window will use one clear radio-button choice for the active source: **Microphone** or **Computer audio**. Only one source can be active at a time. Keep **Computer audio** disabled or hidden until WASAPI loopback capture is implemented and tested.
+
 ### Microphone
 
 The user can select any microphone detected by Windows.
@@ -567,6 +569,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 
 **Current implementation:** The project-local `.venv/` contains `silero-vad 6.2.3`, CPU-only `torch 2.14.1`, and `onnxruntime 1.31.0`. The model is bundled with the installed Silero package, so starting VAD does not download anything. The live 16 kHz audio queue now feeds a background ONNX VAD worker, and the interface shows speech or silence when it receives boundary events. Initial settings are a `0.5` speech threshold, `400 ms` minimum silence, and `100 ms` speech padding. Completed speech turns become temporary, read-only in-memory audio chunks for the later recognition stage; they are not saved to disk and are split at 30 seconds to keep memory bounded. The simple Performance view and diagnostic log report model load time, processed VAD audio, average inference time per window, speech boundary counts, and completed chunk counts. A synthetic 10.24-second silence check produced no false speech events. Quiet voice, real background noise, music, short-phrase, end-to-end delay, and live CPU tests are still required before Stage 2 is complete.
 
+**Live-device check on 2026-10-19:** A 20-second run processed 19.936 seconds of Realtek microphone input across 623 VAD windows with no processing warnings or false speech events. The working Realtek backend returned exact silence during the test. A separate Razer headset backend check returned only a very small background-level signal. This confirms device fallback and silent-input handling, but it does not count as a spoken-voice accuracy test. Repeat after confirming that the chosen microphone is unmuted and receiving audible input.
+
 **Finished when:** Speech boundaries are reliable enough to create useful audio chunks and silence does not cause constant false speech events.
 
 ### Stage 3 — French and English speech recognition
@@ -578,6 +582,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Prevent duplicate captions.
 - Test French, English, accents, names, and mixed-language speech.
 - Measure recognition delay, queue size, CPU, and RAM.
+
+**Current implementation:** `faster-whisper 1.2.1` is installed inside the project `.venv/`. The multilingual `Systran/faster-whisper-small` model is pinned to revision `2ec96c5472da50d38d40c0cfe0602af2e94b4c8a` and stored under `models/speech/faster-whisper-small/` (about 486 MB). It loads from that local path with networking disabled, using CPU INT8 and four CPU threads. Completed VAD chunks now enter a bounded eight-item background recognition queue and produce a final French or English caption in the simple interface. Queue overload creates a visible skipped-caption result instead of silently losing work. A real offline smoke test loaded the model and processed silence successfully. Rolling preview captions, stable chat bubbles, language controls, real French/English accuracy tests, and full performance measurements remain unfinished.
 
 **Finished when:** A user can speak French or English and receive readable local captions without an internet connection or an ever-growing processing delay.
 
