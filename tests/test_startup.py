@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -24,6 +25,7 @@ class FakeMicrophoneMonitor:
         level_callback,
         warning_callback,
         speech_event_callback,
+        speech_segment_callback,
     ) -> None:
         self.device_index = device_index
         self.level_callback = level_callback
@@ -31,6 +33,7 @@ class FakeMicrophoneMonitor:
         self.started = False
         self.stopped = False
         self.speech_event_callback = speech_event_callback
+        self.speech_segment_callback = speech_segment_callback
         self.performance_report = PerformanceReport(
             elapsed_seconds=65.0,
             average_cpu_percent=2.5,
@@ -45,6 +48,7 @@ class FakeMicrophoneMonitor:
             inference_seconds=0.02,
             speech_starts=2,
             speech_ends=2,
+            completed_segments=2,
         )
 
     def start(self) -> None:
@@ -80,6 +84,10 @@ def test_main_window_starts_ready() -> None:
     window = MainWindow(device_provider=microphone_fixture)
 
     assert window.windowTitle() == APP_NAME
+    assert window.minimumWidth() == 820
+    assert window.minimumHeight() == 440
+    assert window.width() >= 940
+    assert window.height() >= 520
     assert window.statusBar().currentMessage() == "Ready"
     assert window.centralWidget() is not None
     assert window.microphone_selector.count() == 1
@@ -88,6 +96,7 @@ def test_main_window_starts_ready() -> None:
     assert window.performance_view_selector.currentText() == "Simple stats"
     assert not window.performance_view_selector.model().item(1).isEnabled()
     assert window.performance_summary.text() == "No capture measured yet."
+    assert window.start_stop_button.minimumHeight() == 48
 
     window.close()
 
@@ -101,12 +110,14 @@ def test_microphone_controls_start_update_and_stop() -> None:
         level_callback,
         warning_callback,
         speech_event_callback,
+        speech_segment_callback,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
             level_callback,
             warning_callback,
             speech_event_callback,
+            speech_segment_callback,
         )
         monitors.append(monitor)
         return monitor
@@ -125,6 +136,12 @@ def test_microphone_controls_start_update_and_stop() -> None:
     window.microphone_level_received.emit(42.0)
     assert window.input_level.value() == 42
 
+    window.speech_segment_received.emit(
+        SimpleNamespace(duration_seconds=1.25, forced_split=False)
+    )
+    assert "Completed speech chunks: 1" in window.speech_turn_status.text()
+    assert "Last turn: 1.2s" in window.speech_turn_status.text()
+
     window.start_stop_button.click()
     assert monitors[0].stopped
     assert window.start_stop_button.text() == "Start microphone"
@@ -135,6 +152,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert "VAD audio: 3.2s" in window.performance_summary.text()
     assert "Speech starts: 2" in window.performance_summary.text()
     assert "Completed turns: 2" in window.performance_summary.text()
+    assert "Audio chunks: 2" in window.performance_summary.text()
 
     window.close()
 
@@ -173,6 +191,47 @@ def test_refresh_button_reloads_devices_and_writes_log(caplog) -> None:
     window.close()
 
 
+def test_refresh_keeps_the_selected_microphone_when_it_is_still_connected() -> None:
+    create_application(["live-caption-translation-test"])
+    first_device = microphone_fixture()[0]
+    usb_microphone = AudioDevice(
+        index=20,
+        name="USB Microphone",
+        host_api="Windows WASAPI",
+        max_input_channels=1,
+        default_sample_rate=48_000.0,
+    )
+    provider_calls = 0
+
+    def changing_device_provider() -> list[AudioDevice]:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            return [first_device, usb_microphone]
+        return [
+            AudioDevice(
+                index=37,
+                name="USB Microphone",
+                host_api="Windows WASAPI",
+                max_input_channels=1,
+                default_sample_rate=48_000.0,
+            ),
+            first_device,
+        ]
+
+    window = MainWindow(device_provider=changing_device_provider)
+    window.microphone_selector.setCurrentIndex(1)
+    assert window.microphone_selector.currentData().name == "USB Microphone"
+
+    window.refresh_devices_button.click()
+
+    selected_device = window.microphone_selector.currentData()
+    assert selected_device.name == "USB Microphone"
+    assert selected_device.index == 37
+
+    window.close()
+
+
 def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
     create_application(["live-caption-translation-test"])
     connected_names = {"Test Microphone"}
@@ -186,12 +245,14 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
         level_callback,
         warning_callback,
         speech_event_callback,
+        speech_segment_callback,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
             level_callback,
             warning_callback,
             speech_event_callback,
+            speech_segment_callback,
         )
         monitors.append(monitor)
         return monitor

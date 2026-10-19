@@ -36,6 +36,7 @@ MonitorFactory = Callable[
         Callable[[float], None],
         Callable[[str], None],
         Callable[[object], None],
+        Callable[[object], None],
     ],
     MicrophoneLevelMonitor,
 ]
@@ -49,6 +50,7 @@ class MainWindow(QMainWindow):
     microphone_level_received = Signal(float)
     microphone_warning_received = Signal(str)
     speech_event_received = Signal(object)
+    speech_segment_received = Signal(object)
 
     def __init__(
         self,
@@ -66,10 +68,12 @@ class MainWindow(QMainWindow):
         self._microphone_monitor: MicrophoneLevelMonitor | None = None
         self._active_microphone_name: str | None = None
         self._device_refresh_pending = False
+        self._completed_speech_chunks = 0
 
         self.microphone_level_received.connect(self._set_microphone_level)
         self.microphone_warning_received.connect(self._show_microphone_warning)
         self.speech_event_received.connect(self._show_speech_event)
+        self.speech_segment_received.connect(self._show_speech_segment)
 
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(
@@ -78,7 +82,8 @@ class MainWindow(QMainWindow):
 
         self.setObjectName("mainWindow")
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(640, 400)
+        self.setMinimumSize(820, 440)
+        self.resize(940, 520)
 
         title = QLabel(APP_NAME)
         title.setObjectName("applicationTitle")
@@ -118,8 +123,12 @@ class MainWindow(QMainWindow):
         self.speech_status = QLabel("Speech detection: stopped")
         self.speech_status.setObjectName("speechDetectionStatus")
 
+        self.speech_turn_status = QLabel("Completed speech chunks: 0")
+        self.speech_turn_status.setObjectName("speechTurnStatus")
+
         self.start_stop_button = QPushButton("Start microphone")
         self.start_stop_button.setObjectName("startStopMicrophoneButton")
+        self.start_stop_button.setMinimumHeight(48)
         self.start_stop_button.clicked.connect(self.toggle_microphone)
 
         microphone_group = QGroupBox("Microphone")
@@ -128,6 +137,7 @@ class MainWindow(QMainWindow):
         microphone_layout.addWidget(self.device_status)
         microphone_layout.addWidget(self.input_level)
         microphone_layout.addWidget(self.speech_status)
+        microphone_layout.addWidget(self.speech_turn_status)
         microphone_layout.addWidget(self.start_stop_button)
         microphone_group.setLayout(microphone_layout)
 
@@ -158,19 +168,33 @@ class MainWindow(QMainWindow):
         performance_layout = QVBoxLayout()
         performance_layout.addLayout(performance_selector_layout)
         performance_layout.addWidget(self.performance_summary)
+        performance_layout.addStretch()
         performance_group.setLayout(performance_layout)
 
         self._performance_timer = QTimer(self)
         self._performance_timer.setInterval(1_000)
         self._performance_timer.timeout.connect(self._update_performance_stats)
 
+        panels_layout = QHBoxLayout()
+        panels_layout.setSpacing(16)
+        panels_layout.addWidget(
+            microphone_group,
+            stretch=3,
+            alignment=Qt.AlignmentFlag.AlignTop,
+        )
+        panels_layout.addWidget(
+            performance_group,
+            stretch=2,
+            alignment=Qt.AlignmentFlag.AlignTop,
+        )
+
         layout = QVBoxLayout()
-        layout.addStretch()
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(title)
         layout.addWidget(message)
-        layout.addSpacing(16)
-        layout.addWidget(microphone_group)
-        layout.addWidget(performance_group)
+        layout.addSpacing(4)
+        layout.addLayout(panels_layout)
         layout.addStretch()
 
         content = QWidget()
@@ -185,6 +209,12 @@ class MainWindow(QMainWindow):
         refreshed: bool = False,
     ) -> None:
         """Reload microphones and keep audio-driver errors inside the UI."""
+        selected_device = self.microphone_selector.currentData()
+        selected_key = (
+            self._device_selection_key(selected_device)
+            if isinstance(selected_device, AudioDevice)
+            else None
+        )
         self.microphone_selector.clear()
 
         try:
@@ -211,6 +241,12 @@ class MainWindow(QMainWindow):
 
         for device in devices:
             self.microphone_selector.addItem(device.display_name, userData=device)
+
+        if selected_key is not None:
+            for index, device in enumerate(devices):
+                if self._device_selection_key(device) == selected_key:
+                    self.microphone_selector.setCurrentIndex(index)
+                    break
 
         self.microphone_selector.setEnabled(True)
         self.start_stop_button.setEnabled(True)
@@ -257,6 +293,7 @@ class MainWindow(QMainWindow):
             self.microphone_level_received.emit,
             self.microphone_warning_received.emit,
             self.speech_event_received.emit,
+            self.speech_segment_received.emit,
         )
 
         try:
@@ -277,6 +314,8 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage("Microphone active")
         self.speech_status.setText("Speech detection: listening…")
+        self._completed_speech_chunks = 0
+        self.speech_turn_status.setText("Completed speech chunks: 0")
         self.performance_summary.setText("Measuring performance…")
         self._performance_timer.start()
         self._update_performance_stats()
@@ -331,6 +370,21 @@ class MainWindow(QMainWindow):
             self.speech_status.setText("Speech detection: silence")
             logger.info("Speech ended at %.3fs", audio_seconds)
 
+    def _show_speech_segment(self, segment: object) -> None:
+        duration_seconds = float(getattr(segment, "duration_seconds", 0.0))
+        forced_split = bool(getattr(segment, "forced_split", False))
+        self._completed_speech_chunks += 1
+        split_note = " (30-second split)" if forced_split else ""
+        self.speech_turn_status.setText(
+            f"Completed speech chunks: {self._completed_speech_chunks}  |  "
+            f"Last turn: {duration_seconds:.1f}s{split_note}"
+        )
+        logger.info(
+            "Temporary speech segment completed: duration=%.3fs, forced split=%s",
+            duration_seconds,
+            forced_split,
+        )
+
     def _update_performance_stats(self) -> None:
         monitor = self._microphone_monitor
         if monitor is None:
@@ -362,7 +416,8 @@ class MainWindow(QMainWindow):
                 f"Detection: {vad_stats.average_inference_milliseconds:.2f} ms/window  |  "
                 f"Load: {vad_stats.model_load_seconds:.2f}s\n"
                 f"Speech starts: {vad_stats.speech_starts}  |  "
-                f"Completed turns: {vad_stats.speech_ends}"
+                f"Completed turns: {vad_stats.speech_ends}  |  "
+                f"Audio chunks: {vad_stats.completed_segments}"
             )
         self.performance_summary.setText(summary)
 
@@ -373,6 +428,14 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _normalized_device_name(name: str) -> str:
         return " ".join(name.casefold().split())
+
+    @classmethod
+    def _device_selection_key(cls, device: AudioDevice) -> tuple[str, str]:
+        """Identify one logical device even if refresh changes backend indices."""
+        return (
+            cls._normalized_device_name(device.name),
+            cls._normalized_device_name(device.host_api),
+        )
 
     def _handle_connected_microphones_changed(self) -> None:
         """React to microphone connection changes reported by Windows and Qt."""

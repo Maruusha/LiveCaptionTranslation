@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
@@ -15,6 +16,7 @@ from app.core.queues import BoundedAudioFrameQueue
 
 VAD_SAMPLE_RATE = 16_000
 VAD_WINDOW_SAMPLES = 512
+DEFAULT_MAX_SEGMENT_SECONDS = 30.0
 
 
 class VoiceActivityError(RuntimeError):
@@ -34,6 +36,20 @@ class SpeechEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeechSegment:
+    """One completed in-memory speech chunk ready for later recognition."""
+
+    samples: np.ndarray
+    start_sample: int
+    end_sample: int
+    forced_split: bool = False
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.samples.size / VAD_SAMPLE_RATE
+
+
+@dataclass(frozen=True, slots=True)
 class VoiceActivityStats:
     """Small, safe-to-display measurements from the VAD worker."""
 
@@ -43,6 +59,7 @@ class VoiceActivityStats:
     inference_seconds: float
     speech_starts: int
     speech_ends: int
+    completed_segments: int
 
     @property
     def average_inference_milliseconds(self) -> float:
@@ -90,12 +107,21 @@ class VoiceActivityWorker:
         source_queue: BoundedAudioFrameQueue,
         event_callback: Callable[[SpeechEvent], None],
         warning_callback: Callable[[str], None],
+        segment_callback: Callable[[SpeechSegment], None] | None = None,
         detector_factory: Callable[[], StreamingDetector] = create_silero_detector,
+        max_segment_seconds: float = DEFAULT_MAX_SEGMENT_SECONDS,
     ) -> None:
+        if max_segment_seconds <= 0.0:
+            raise ValueError("max_segment_seconds must be greater than zero.")
         self.source_queue = source_queue
         self._event_callback = event_callback
         self._warning_callback = warning_callback
+        self._segment_callback = segment_callback
         self._detector_factory = detector_factory
+        self._max_segment_samples = max(
+            VAD_WINDOW_SAMPLES,
+            int(round(max_segment_seconds * VAD_SAMPLE_RATE)),
+        )
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._stats_lock = Lock()
@@ -104,6 +130,7 @@ class VoiceActivityWorker:
         self._inference_seconds = 0.0
         self._speech_starts = 0
         self._speech_ends = 0
+        self._completed_segments = 0
 
     @property
     def is_running(self) -> bool:
@@ -122,6 +149,7 @@ class VoiceActivityWorker:
                 inference_seconds=self._inference_seconds,
                 speech_starts=self._speech_starts,
                 speech_ends=self._speech_ends,
+                completed_segments=self._completed_segments,
             )
 
     def start(self) -> None:
@@ -134,6 +162,7 @@ class VoiceActivityWorker:
             self._inference_seconds = 0.0
             self._speech_starts = 0
             self._speech_ends = 0
+            self._completed_segments = 0
         self._thread = Thread(
             target=self._run,
             name="voice-activity-worker",
@@ -160,6 +189,10 @@ class VoiceActivityWorker:
             pending = np.empty(0, dtype=np.float32)
             total_samples = 0
             speech_active = False
+            history: deque[tuple[int, np.ndarray]] = deque(maxlen=64)
+            segment_parts: list[np.ndarray] = []
+            segment_start = 0
+            segment_sample_count = 0
 
             while True:
                 frame = self.source_queue.get_nowait()
@@ -183,6 +216,11 @@ class VoiceActivityWorker:
                         dtype=np.float32,
                     )
                     pending = pending[VAD_WINDOW_SAMPLES:]
+                    window_start = total_samples
+                    history.append((window_start, window))
+                    if speech_active:
+                        segment_parts.append(window)
+                        segment_sample_count += window.size
                     inference_started = perf_counter()
                     result = detector(window)
                     inference_seconds = perf_counter() - inference_started
@@ -190,26 +228,104 @@ class VoiceActivityWorker:
                         self._processed_windows += 1
                         self._inference_seconds += inference_seconds
                     total_samples += VAD_WINDOW_SAMPLES
-                    if not result:
-                        continue
-                    if "start" in result:
+                    if result and "start" in result:
                         speech_active = True
+                        segment_start = int(result["start"])
+                        segment_parts = self._history_from(history, segment_start)
+                        segment_sample_count = sum(
+                            part.size for part in segment_parts
+                        )
                         with self._stats_lock:
                             self._speech_starts += 1
                         self._event_callback(
                             SpeechEvent("speech_start", int(result["start"]))
                         )
-                    elif "end" in result:
+                    elif result and "end" in result:
                         speech_active = False
+                        segment_end = int(result["end"])
                         with self._stats_lock:
                             self._speech_ends += 1
                         self._event_callback(
-                            SpeechEvent("speech_end", int(result["end"]))
+                            SpeechEvent("speech_end", segment_end)
                         )
+                        self._emit_segment(
+                            segment_parts,
+                            segment_start,
+                            segment_end,
+                            forced_split=False,
+                        )
+                        segment_parts = []
+                        segment_sample_count = 0
+
+                    while (
+                        speech_active
+                        and segment_sample_count >= self._max_segment_samples
+                    ):
+                        combined = np.concatenate(segment_parts)
+                        split_end = segment_start + self._max_segment_samples
+                        self._emit_segment(
+                            [combined[: self._max_segment_samples]],
+                            segment_start,
+                            split_end,
+                            forced_split=True,
+                        )
+                        remainder = combined[self._max_segment_samples :].copy()
+                        segment_parts = [remainder] if remainder.size else []
+                        segment_sample_count = remainder.size
+                        segment_start = split_end
 
             if speech_active:
+                if pending.size:
+                    segment_parts.append(pending.copy())
+                    segment_sample_count += pending.size
+                    total_samples += pending.size
                 with self._stats_lock:
                     self._speech_ends += 1
                 self._event_callback(SpeechEvent("speech_end", total_samples))
+                self._emit_segment(
+                    segment_parts,
+                    segment_start,
+                    total_samples,
+                    forced_split=False,
+                )
         except Exception as error:
             self._warning_callback(f"Voice activity detection stopped: {error}")
+
+    @staticmethod
+    def _history_from(
+        history: deque[tuple[int, np.ndarray]],
+        start_sample: int,
+    ) -> list[np.ndarray]:
+        parts: list[np.ndarray] = []
+        for part_start, samples in history:
+            part_end = part_start + samples.size
+            if part_end <= start_sample:
+                continue
+            offset = max(0, start_sample - part_start)
+            parts.append(samples[offset:])
+        return parts
+
+    def _emit_segment(
+        self,
+        parts: list[np.ndarray],
+        start_sample: int,
+        end_sample: int,
+        forced_split: bool,
+    ) -> None:
+        if self._segment_callback is None or not parts or end_sample <= start_sample:
+            return
+        samples = np.concatenate(parts)
+        wanted_samples = min(samples.size, end_sample - start_sample)
+        if wanted_samples <= 0:
+            return
+        owned_samples = np.ascontiguousarray(samples[:wanted_samples], dtype=np.float32)
+        owned_samples.setflags(write=False)
+        segment = SpeechSegment(
+            samples=owned_samples,
+            start_sample=start_sample,
+            end_sample=start_sample + owned_samples.size,
+            forced_split=forced_split,
+        )
+        with self._stats_lock:
+            self._completed_segments += 1
+        self._segment_callback(segment)

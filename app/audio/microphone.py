@@ -18,6 +18,7 @@ from app.core.performance import (
 from app.core.queues import BoundedAudioFrameQueue
 from app.speech.vad import (
     SpeechEvent,
+    SpeechSegment,
     VoiceActivityError,
     VoiceActivityStats,
     VoiceActivityWorker,
@@ -50,6 +51,7 @@ class MicrophoneLevelMonitor:
         level_callback: Callable[[float], None],
         warning_callback: Callable[[str], None],
         speech_event_callback: Callable[[SpeechEvent], None] | None = None,
+        speech_segment_callback: Callable[[SpeechSegment], None] | None = None,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -81,6 +83,7 @@ class MicrophoneLevelMonitor:
                 source_queue=self.processed_audio_buffer,
                 event_callback=speech_event_callback,
                 warning_callback=self._warning_callback,
+                segment_callback=speech_segment_callback,
             )
             if speech_event_callback is not None
             else None
@@ -241,7 +244,7 @@ class MicrophoneLevelMonitor:
             logger.info(
                 "Voice activity summary: model load=%.3fs, audio=%.3fs, "
                 "windows=%d, average inference=%.3fms, real-time use=%.2f%%, "
-                "speech starts=%d, speech ends=%d",
+                "speech starts=%d, speech ends=%d, completed segments=%d",
                 vad_stats.model_load_seconds,
                 vad_stats.processed_audio_seconds,
                 vad_stats.processed_windows,
@@ -249,6 +252,7 @@ class MicrophoneLevelMonitor:
                 vad_stats.realtime_percent,
                 vad_stats.speech_starts,
                 vad_stats.speech_ends,
+                vad_stats.completed_segments,
             )
 
 
