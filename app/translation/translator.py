@@ -1,0 +1,271 @@
+"""Bounded local French and English translation using CTranslate2."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread
+from time import perf_counter
+from typing import Protocol
+
+from app.speech.recognition import RecognitionResult
+
+
+MODEL_ROOT = Path(__file__).resolve().parents[2] / "models" / "translation"
+SUPPORTED_LANGUAGES = {"en", "fr"}
+
+
+class TranslationError(RuntimeError):
+    """Raised when the translation worker cannot stop safely."""
+
+
+class TextTranslationModel(Protocol):
+    def translate(self, text: str) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationResult:
+    """One final recognition result and its optional translation."""
+
+    recognition: RecognitionResult
+    translated_text: str | None
+    target_language: str | None
+    processing_seconds: float
+    error: str | None = None
+    skipped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationStats:
+    queued_captions: int
+    completed_captions: int
+    failed_captions: int
+    processing_seconds: float
+
+
+class CTranslate2TranslationModel:
+    """Tokenize and translate with one local OPUS-MT model."""
+
+    def __init__(self, model_directory: Path) -> None:
+        import ctranslate2
+        import sentencepiece
+
+        self._source_tokenizer = sentencepiece.SentencePieceProcessor(
+            model_file=str(model_directory / "source.spm")
+        )
+        self._target_tokenizer = sentencepiece.SentencePieceProcessor(
+            model_file=str(model_directory / "target.spm")
+        )
+        self._translator = ctranslate2.Translator(
+            str(model_directory),
+            device="cpu",
+            compute_type="int8",
+            inter_threads=1,
+            intra_threads=4,
+        )
+
+    def translate(self, text: str) -> str:
+        source_tokens = [
+            *self._source_tokenizer.encode(text, out_type=str),
+            "</s>",
+        ]
+        result = self._translator.translate_batch(
+            [source_tokens],
+            beam_size=1,
+            max_decoding_length=256,
+        )[0]
+        target_tokens = [
+            token
+            for token in result.hypotheses[0]
+            if token not in {"</s>", "<pad>"}
+        ]
+        return self._target_tokenizer.decode(target_tokens).strip()
+
+
+def create_translation_model(
+    source_language: str,
+    target_language: str,
+) -> TextTranslationModel:
+    """Load one translation direction strictly from the project folder."""
+    if {source_language, target_language} != SUPPORTED_LANGUAGES:
+        raise TranslationError(
+            f"Unsupported translation direction: {source_language} to "
+            f"{target_language}."
+        )
+
+    model_directory = (
+        MODEL_ROOT
+        / f"opus-mt-{source_language}-{target_language}-ct2-int8"
+    )
+    required_files = ("config.json", "model.bin", "source.spm", "target.spm")
+    missing_files = [
+        filename
+        for filename in required_files
+        if not (model_directory / filename).is_file()
+    ]
+    if missing_files:
+        raise TranslationError(
+            f"The local {source_language}-to-{target_language} translation "
+            f"model is incomplete in {model_directory}."
+        )
+    return CTranslate2TranslationModel(model_directory)
+
+
+class TranslationWorker:
+    """Translate final captions without blocking recognition or the interface."""
+
+    def __init__(
+        self,
+        result_callback: Callable[[TranslationResult], None],
+        warning_callback: Callable[[str], None],
+        model_factory: Callable[
+            [str, str], TextTranslationModel
+        ] = create_translation_model,
+        max_queued_captions: int = 8,
+    ) -> None:
+        if max_queued_captions <= 0:
+            raise ValueError("max_queued_captions must be greater than zero.")
+        self._result_callback = result_callback
+        self._warning_callback = warning_callback
+        self._model_factory = model_factory
+        self._queue: Queue[RecognitionResult] = Queue(maxsize=max_queued_captions)
+        self._stop_event = Event()
+        self._thread: Thread | None = None
+        self._stats_lock = Lock()
+        self._completed_captions = 0
+        self._failed_captions = 0
+        self._processing_seconds = 0.0
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def stats(self) -> TranslationStats:
+        with self._stats_lock:
+            return TranslationStats(
+                queued_captions=self._queue.qsize(),
+                completed_captions=self._completed_captions,
+                failed_captions=self._failed_captions,
+                processing_seconds=self._processing_seconds,
+            )
+
+    def start(self) -> None:
+        if self.is_running:
+            return
+        self._stop_event.clear()
+        self._thread = Thread(
+            target=self._run,
+            name="caption-translation-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, recognition: RecognitionResult) -> bool:
+        """Queue a final caption, preserving captions that cannot be translated."""
+        if recognition.skipped or recognition.error or not recognition.text.strip():
+            self._result_callback(
+                TranslationResult(recognition, None, None, 0.0)
+            )
+            return False
+
+        source_language = self._normalize_language(recognition.language)
+        if source_language not in SUPPORTED_LANGUAGES:
+            message = "Translation is available only for French and English."
+            with self._stats_lock:
+                self._failed_captions += 1
+            self._result_callback(
+                TranslationResult(
+                    recognition,
+                    None,
+                    None,
+                    0.0,
+                    error=message,
+                )
+            )
+            return False
+
+        try:
+            self._queue.put_nowait(recognition)
+            return True
+        except Full:
+            message = "Translation is behind; one caption was not translated."
+            self._warning_callback(message)
+            with self._stats_lock:
+                self._failed_captions += 1
+            self._result_callback(
+                TranslationResult(
+                    recognition,
+                    None,
+                    None,
+                    0.0,
+                    error=message,
+                    skipped=True,
+                )
+            )
+            return False
+
+    def stop(self, timeout: float = 60.0) -> None:
+        """Finish accepted captions before stopping."""
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            raise TranslationError("Translation did not stop in time.")
+        self._thread = None
+
+    def _run(self) -> None:
+        models: dict[tuple[str, str], TextTranslationModel] = {}
+        while True:
+            try:
+                recognition = self._queue.get(timeout=0.05)
+            except Empty:
+                if self._stop_event.is_set():
+                    break
+                continue
+
+            source_language = self._normalize_language(recognition.language)
+            target_language = "fr" if source_language == "en" else "en"
+            started = perf_counter()
+            try:
+                direction = (source_language, target_language)
+                model = models.get(direction)
+                if model is None:
+                    model = self._model_factory(*direction)
+                    models[direction] = model
+                translated_text = model.translate(recognition.text)
+                if not translated_text:
+                    raise TranslationError("The translation model returned empty text.")
+                processing_seconds = perf_counter() - started
+                result = TranslationResult(
+                    recognition,
+                    translated_text,
+                    target_language,
+                    processing_seconds,
+                )
+                with self._stats_lock:
+                    self._completed_captions += 1
+                    self._processing_seconds += processing_seconds
+            except Exception as error:
+                processing_seconds = perf_counter() - started
+                message = f"Translation failed: {error}"
+                self._warning_callback(message)
+                result = TranslationResult(
+                    recognition,
+                    None,
+                    target_language,
+                    processing_seconds,
+                    error=str(error),
+                )
+                with self._stats_lock:
+                    self._failed_captions += 1
+                    self._processing_seconds += processing_seconds
+            self._result_callback(result)
+
+    @staticmethod
+    def _normalize_language(language: str | None) -> str:
+        return (language or "").casefold().split("-", 1)[0]

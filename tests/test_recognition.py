@@ -20,6 +20,7 @@ def test_recognition_worker_transcribes_a_completed_chunk() -> None:
         def transcribe(self, audio, **options):
             assert audio.size == 1_600
             assert options["beam_size"] == 1
+            assert options["language"] is None
             return iter(
                 [SimpleNamespace(text=" Bonjour "), SimpleNamespace(text="le monde")]
             ), SimpleNamespace(language="fr", language_probability=0.98)
@@ -58,3 +59,27 @@ def test_recognition_queue_reports_visible_overload() -> None:
     assert results[0].skipped
     assert results[0].text == "[caption skipped: processing too slow]"
     assert "behind" in warnings[0]
+
+
+def test_recognition_worker_uses_a_manual_language() -> None:
+    results: list[RecognitionResult] = []
+
+    class FakeModel:
+        def transcribe(self, _audio, **options):
+            assert options["language"] == "fr"
+            return iter([SimpleNamespace(text=" Bonjour")]), SimpleNamespace(
+                language="en",
+                language_probability=0.25,
+            )
+
+    worker = RecognitionWorker(
+        result_callback=results.append,
+        warning_callback=lambda _warning: None,
+        model_factory=FakeModel,
+        language="fr",
+    )
+    worker.start()
+    worker.submit(speech_segment())
+    worker.stop()
+
+    assert results[0].language == "fr"

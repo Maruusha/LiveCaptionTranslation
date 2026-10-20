@@ -27,8 +27,9 @@ from app.audio.devices import (
 )
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
 from app.core.performance import PerformanceReport, format_mebibytes
-from app.speech.recognition import RecognitionResult
+from app.speech.recognition import RecognitionStats
 from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
+from app.translation.translator import TranslationResult, TranslationStats
 
 
 MonitorFactory = Callable[
@@ -38,7 +39,8 @@ MonitorFactory = Callable[
         Callable[[str], None],
         Callable[[SpeechEvent], None],
         Callable[[SpeechSegment], None],
-        Callable[[RecognitionResult], None],
+        Callable[[TranslationResult], None],
+        str | None,
     ],
     MicrophoneLevelMonitor,
 ]
@@ -47,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    """Application shell with local microphone discovery and level monitoring."""
+    """Application shell for local microphone captions and translation."""
 
     microphone_level_received = Signal(float)
     microphone_warning_received = Signal(str)
@@ -133,7 +135,27 @@ class MainWindow(QMainWindow):
         self.latest_caption = QLabel("Latest caption: waiting for microphone")
         self.latest_caption.setObjectName("latestCaption")
         self.latest_caption.setWordWrap(True)
-        self.latest_caption.setMinimumHeight(54)
+        self.latest_caption.setMinimumHeight(76)
+
+        self.language_selector = QComboBox()
+        self.language_selector.setObjectName("speechLanguageSelector")
+        self.language_selector.addItem("Automatic", userData=None)
+        self.language_selector.addItem("French", userData="fr")
+        self.language_selector.addItem("English", userData="en")
+
+        self.caption_view_selector = QComboBox()
+        self.caption_view_selector.setObjectName("captionViewSelector")
+        self.caption_view_selector.addItem("Original and translation", userData="both")
+        self.caption_view_selector.addItem("Original only", userData="original")
+        self.caption_view_selector.addItem("Translation only", userData="translation")
+
+        language_layout = QHBoxLayout()
+        language_layout.addWidget(QLabel("Spoken language:"))
+        language_layout.addWidget(self.language_selector, stretch=1)
+
+        caption_view_layout = QHBoxLayout()
+        caption_view_layout.addWidget(QLabel("Caption view:"))
+        caption_view_layout.addWidget(self.caption_view_selector, stretch=1)
 
         self.start_stop_button = QPushButton("Start microphone")
         self.start_stop_button.setObjectName("startStopMicrophoneButton")
@@ -142,6 +164,8 @@ class MainWindow(QMainWindow):
 
         microphone_group = QGroupBox("Microphone")
         microphone_layout = QVBoxLayout()
+        microphone_layout.addLayout(language_layout)
+        microphone_layout.addLayout(caption_view_layout)
         microphone_layout.addLayout(selector_layout)
         microphone_layout.addWidget(self.device_status)
         microphone_layout.addWidget(self.input_level)
@@ -288,7 +312,7 @@ class MainWindow(QMainWindow):
             self.refresh_devices_button.setEnabled(True)
 
     def toggle_microphone(self) -> None:
-        """Start or stop level-only capture for the selected microphone."""
+        """Start or stop the caption pipeline for the selected microphone."""
         if self._microphone_monitor is not None:
             self._stop_microphone()
             return
@@ -305,6 +329,7 @@ class MainWindow(QMainWindow):
             self.speech_event_received.emit,
             self.speech_segment_received.emit,
             self.caption_received.emit,
+            self.language_selector.currentData(),
         )
 
         try:
@@ -318,6 +343,7 @@ class MainWindow(QMainWindow):
         self._microphone_monitor = monitor
         self._active_microphone_name = selected_device.name
         self.microphone_selector.setEnabled(False)
+        self.language_selector.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setText("Stop microphone")
         self.device_status.setText(
@@ -350,11 +376,14 @@ class MainWindow(QMainWindow):
             self._show_performance_report(
                 monitor.performance_report,
                 monitor.voice_activity_stats,
+                monitor.recognition_stats,
+                monitor.translation_stats,
             )
 
         self.input_level.setValue(0)
         self.speech_status.setText("Speech detection: stopped")
         self.microphone_selector.setEnabled(True)
+        self.language_selector.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.start_stop_button.setText("Start microphone")
 
@@ -397,19 +426,44 @@ class MainWindow(QMainWindow):
             forced_split,
         )
 
-    def _show_caption(self, result: RecognitionResult) -> None:
-        if result.skipped or result.error:
-            self.latest_caption.setText(result.text)
+    def _show_caption(self, result: TranslationResult) -> None:
+        recognition = result.recognition
+        if recognition.skipped or recognition.error:
+            self.latest_caption.setText(recognition.text)
             self.statusBar().showMessage("Caption warning")
             return
 
-        text = result.text or "[no speech recognized]"
-        language = (result.language or "unknown").upper()
-        self.latest_caption.setText(f"Latest caption [{language}]: {text}")
+        original_text = recognition.text or "[no speech recognized]"
+        source_language = (recognition.language or "unknown").upper()
+        original_line = f"Original [{source_language}]: {original_text}"
+        translated_line = None
+        if result.translated_text:
+            target_language = (result.target_language or "unknown").upper()
+            translated_line = (
+                f"Translation [{target_language}]: {result.translated_text}"
+            )
+
+        view = self.caption_view_selector.currentData()
+        if view == "translation" and translated_line is not None:
+            caption = translated_line
+        elif view == "original":
+            caption = original_line
+        elif translated_line is not None:
+            caption = f"{original_line}\n{translated_line}"
+        else:
+            caption = f"{original_line}\nTranslation unavailable"
+        self.latest_caption.setText(caption)
+
+        if result.error:
+            self.statusBar().showMessage("Translation warning")
         logger.info(
-            "Caption completed: language=%s, characters=%d, processing=%.3fs",
-            result.language or "unknown",
-            len(result.text),
+            "Caption completed: source=%s, target=%s, original characters=%d, "
+            "translated characters=%d, recognition=%.3fs, translation=%.3fs",
+            recognition.language or "unknown",
+            result.target_language or "unavailable",
+            len(recognition.text),
+            len(result.translated_text or ""),
+            recognition.processing_seconds,
             result.processing_seconds,
         )
 
@@ -420,12 +474,16 @@ class MainWindow(QMainWindow):
         self._show_performance_report(
             monitor.performance_report,
             monitor.voice_activity_stats,
+            monitor.recognition_stats,
+            monitor.translation_stats,
         )
 
     def _show_performance_report(
         self,
         report: PerformanceReport | None,
         vad_stats: VoiceActivityStats | None = None,
+        recognition_stats: RecognitionStats | None = None,
+        translation_stats: TranslationStats | None = None,
     ) -> None:
         if report is None:
             return
@@ -447,6 +505,19 @@ class MainWindow(QMainWindow):
                 f"Completed turns: {vad_stats.speech_ends}  |  "
                 f"Audio chunks: {vad_stats.completed_segments}  |  "
                 f"Short events ignored: {vad_stats.filtered_short_segments}"
+            )
+        if recognition_stats is not None:
+            summary += (
+                f"\nRecognition: {recognition_stats.completed_segments} completed  |  "
+                f"{recognition_stats.queued_segments} queued  |  "
+                f"{recognition_stats.failed_segments} failed"
+            )
+        if translation_stats is not None:
+            summary += (
+                f"\nTranslation: {translation_stats.completed_captions} completed  |  "
+                f"{translation_stats.queued_captions} queued  |  "
+                f"{translation_stats.failed_captions} failed  |  "
+                f"{translation_stats.processing_seconds:.2f}s total"
             )
         self.performance_summary.setText(summary)
 
