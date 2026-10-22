@@ -178,7 +178,7 @@ class CaptionChatView(QScrollArea):
         self._bubbles.append(bubble)
 
         if was_at_bottom:
-            QTimer.singleShot(0, self._scroll_to_bottom)
+            QTimer.singleShot(0, self.scroll_to_bottom)
         return bubble
 
     def set_display_mode(self, mode: str) -> None:
@@ -196,7 +196,8 @@ class CaptionChatView(QScrollArea):
         self._bubbles.clear()
         self._placeholder.show()
 
-    def _scroll_to_bottom(self) -> None:
+    def scroll_to_bottom(self) -> None:
+        """Move the conversation view to its newest message."""
         scrollbar = self.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 

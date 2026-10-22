@@ -58,3 +58,28 @@ def test_clear_chat_removes_bubbles_and_restores_placeholder() -> None:
     assert chat.messages == ()
     assert not chat._placeholder.isHidden()
 
+
+def test_scroll_to_bottom_moves_to_newest_message() -> None:
+    application = create_application(["live-caption-translation-test"])
+    chat = CaptionChatView()
+    chat.resize(360, 180)
+    chat.show()
+    for index in range(20):
+        chat.add_message(
+            original_text=f"Message {index}",
+            source_language="en",
+            timestamp="10:00",
+        )
+    chat._layout.activate()
+    chat.widget().adjustSize()
+    application.processEvents()
+
+    scrollbar = chat.verticalScrollBar()
+    scrollbar.setValue(0)
+    assert scrollbar.value() < scrollbar.maximum()
+
+    chat.scroll_to_bottom()
+
+    assert scrollbar.value() == scrollbar.maximum()
+    chat.close()
+

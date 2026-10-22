@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -53,6 +54,7 @@ MonitorFactory = Callable[
         Callable[[SpeechSegment], None],
         Callable[[TranslationResult], None],
         str | None,
+        float,
     ],
     MicrophoneLevelMonitor,
 ]
@@ -65,6 +67,7 @@ LoopbackMonitorFactory = Callable[
         Callable[[SpeechSegment], None],
         Callable[[TranslationResult], None],
         str | None,
+        float,
     ],
     LoopbackCaptureMonitor,
 ]
@@ -225,6 +228,39 @@ class MainWindow(QMainWindow):
         caption_view_layout.addWidget(QLabel("Caption view:"))
         caption_view_layout.addWidget(self.caption_view_selector, stretch=1)
 
+        self.speech_chunk_duration_slider = QSlider(
+            Qt.Orientation.Horizontal
+        )
+        self.speech_chunk_duration_slider.setObjectName(
+            "speechChunkDurationSlider"
+        )
+        self.speech_chunk_duration_slider.setRange(5, 60)
+        self.speech_chunk_duration_slider.setSingleStep(5)
+        self.speech_chunk_duration_slider.setPageStep(5)
+        self.speech_chunk_duration_slider.setTickInterval(5)
+        self.speech_chunk_duration_slider.setTickPosition(
+            QSlider.TickPosition.TicksBelow
+        )
+        self.speech_chunk_duration_slider.setValue(30)
+        self.speech_chunk_duration_slider.setToolTip(
+            "Maximum length of uninterrupted speech. Silence can end a chunk earlier."
+        )
+        self.speech_chunk_duration_label = QLabel()
+        self.speech_chunk_duration_label.setObjectName(
+            "speechChunkDurationLabel"
+        )
+        self.speech_chunk_duration_slider.valueChanged.connect(
+            self._update_speech_chunk_duration_label
+        )
+        self._update_speech_chunk_duration_label()
+
+        chunk_duration_layout = QHBoxLayout()
+        chunk_duration_layout.addWidget(self.speech_chunk_duration_label)
+        chunk_duration_layout.addWidget(
+            self.speech_chunk_duration_slider,
+            stretch=1,
+        )
+
         self.start_stop_button = QPushButton("Start microphone")
         self.start_stop_button.setObjectName("startStopMicrophoneButton")
         self.start_stop_button.setMinimumHeight(48)
@@ -235,6 +271,7 @@ class MainWindow(QMainWindow):
         microphone_layout.addLayout(source_layout)
         microphone_layout.addLayout(language_layout)
         microphone_layout.addLayout(caption_view_layout)
+        microphone_layout.addLayout(chunk_duration_layout)
         microphone_layout.addLayout(selector_layout)
         microphone_layout.addWidget(self.device_status)
         microphone_layout.addWidget(self.input_level)
@@ -250,9 +287,13 @@ class MainWindow(QMainWindow):
         self.clear_captions_button = QPushButton("Clear screen")
         self.clear_captions_button.setObjectName("clearCaptionsButton")
         self.clear_captions_button.clicked.connect(self._clear_caption_screen)
+        self.to_bottom_button = QPushButton("To bottom")
+        self.to_bottom_button.setObjectName("toBottomButton")
+        self.to_bottom_button.clicked.connect(self.caption_chat.scroll_to_bottom)
 
         chat_actions = QHBoxLayout()
         chat_actions.addStretch()
+        chat_actions.addWidget(self.to_bottom_button)
         chat_actions.addWidget(self.clear_captions_button)
 
         chat_group = QGroupBox("Live conversation")
@@ -505,6 +546,12 @@ class MainWindow(QMainWindow):
             "Start computer audio" if computer_audio else "Start microphone"
         )
 
+    def _update_speech_chunk_duration_label(self, _value: int | None = None) -> None:
+        seconds = self.speech_chunk_duration_slider.value()
+        self.speech_chunk_duration_label.setText(
+            f"Maximum speech chunk: {seconds} seconds"
+        )
+
     def toggle_microphone(self) -> None:
         """Start or stop the caption pipeline for the selected audio source."""
         if self._microphone_monitor is not None:
@@ -528,6 +575,7 @@ class MainWindow(QMainWindow):
                 self.speech_segment_received.emit,
                 self.caption_received.emit,
                 self.language_selector.currentData(),
+                float(self.speech_chunk_duration_slider.value()),
             )
             selected_name = selected_output.name
             active_source = "computer_audio"
@@ -544,6 +592,7 @@ class MainWindow(QMainWindow):
                 self.speech_segment_received.emit,
                 self.caption_received.emit,
                 self.language_selector.currentData(),
+                float(self.speech_chunk_duration_slider.value()),
             )
             selected_name = selected_device.name
             active_source = "microphone"
@@ -575,6 +624,7 @@ class MainWindow(QMainWindow):
         self.microphone_selector.setEnabled(False)
         self.output_selector.setEnabled(False)
         self.language_selector.setEnabled(False)
+        self.speech_chunk_duration_slider.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setText(
             "Stop computer audio" if computer_audio else "Stop microphone"
@@ -806,6 +856,7 @@ class MainWindow(QMainWindow):
             and isinstance(self.output_selector.currentData(), OutputAudioDevice)
         )
         self.language_selector.setEnabled(True)
+        self.speech_chunk_duration_slider.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.start_stop_button.setEnabled(
             self.output_selector.isEnabled()
@@ -862,7 +913,11 @@ class MainWindow(QMainWindow):
         duration_seconds = float(getattr(segment, "duration_seconds", 0.0))
         forced_split = bool(getattr(segment, "forced_split", False))
         self._completed_speech_chunks += 1
-        split_note = " (30-second split)" if forced_split else ""
+        split_note = (
+            f" ({self.speech_chunk_duration_slider.value()}-second split)"
+            if forced_split
+            else ""
+        )
         self.speech_turn_status.setText(
             f"Completed speech chunks: {self._completed_speech_chunks}  |  "
             f"Last turn: {duration_seconds:.1f}s{split_note}"

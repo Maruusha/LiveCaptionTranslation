@@ -144,6 +144,10 @@ class VoiceActivityWorker:
         return self._thread is not None and self._thread.is_alive()
 
     @property
+    def max_segment_seconds(self) -> float:
+        return self._max_segment_samples / VAD_SAMPLE_RATE
+
+    @property
     def stats(self) -> VoiceActivityStats:
         with self._stats_lock:
             processed_audio_seconds = (
