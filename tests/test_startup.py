@@ -175,6 +175,8 @@ def test_main_window_starts_ready() -> None:
     assert window.to_bottom_button.text() == "To bottom"
     assert window.overlay_toggle_button.text() == "Show overlay"
     assert window.overlay_settings_button.text() == "Overlay settings"
+    assert window.sidebar_toggle_button.text() == "Hide conversations"
+    assert window.sidebar_toggle_button.isChecked()
     assert not window.caption_overlay.isVisible()
     assert window.runtime_state is RuntimeState.IDLE
 
@@ -192,6 +194,13 @@ def test_main_window_starts_ready() -> None:
     assert window.overlay_toggle_button.text() == "Hide overlay"
     window.overlay_toggle_button.click()
     assert not window.caption_overlay.isVisible()
+
+    window.sidebar_toggle_button.click()
+    assert window.conversation_sidebar.isHidden()
+    assert window.sidebar_toggle_button.text() == "Show conversations"
+    window.sidebar_toggle_button.click()
+    assert not window.conversation_sidebar.isHidden()
+    assert window.sidebar_toggle_button.text() == "Hide conversations"
 
     window.close()
 
@@ -223,6 +232,40 @@ def test_overlay_appearance_and_geometry_persist_between_windows() -> None:
     assert restored.caption_overlay.appearance == expected
     assert restored.caption_overlay.size().width() == 640
     assert restored.caption_overlay.size().height() == 190
+    restored.close()
+
+
+def test_main_interface_choices_persist_between_windows() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+    window.resize(1120, 810)
+    window.caption_view_selector.setCurrentIndex(1)
+    window.language_selector.setCurrentIndex(1)
+    window.speech_chunk_duration_slider.setValue(45)
+    window.speech_sensitivity_slider.setValue(8)
+    window.whisper_workers_slider.setValue(2)
+    window.sidebar_toggle_button.setChecked(False)
+    window.close()
+
+    restored = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+
+    assert not settings.value("ui/main_geometry").isEmpty()
+    assert restored.width() >= restored.minimumWidth()
+    assert restored.height() >= restored.minimumHeight()
+    assert restored.caption_view_selector.currentData() == "original"
+    assert restored.language_selector.currentData() == "fr"
+    assert restored.speech_chunk_duration_slider.value() == 45
+    assert restored.speech_sensitivity_slider.value() == 8
+    assert restored.whisper_workers_slider.value() == 2
+    assert restored.conversation_sidebar.isHidden()
+    assert restored.sidebar_toggle_button.text() == "Show conversations"
     restored.close()
 
 

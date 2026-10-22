@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -396,10 +397,18 @@ class MainWindow(QMainWindow):
         self.to_bottom_button = QPushButton("To bottom")
         self.to_bottom_button.setObjectName("toBottomButton")
         self.to_bottom_button.clicked.connect(self.caption_chat.scroll_to_bottom)
+        self.sidebar_toggle_button = QPushButton("Hide conversations")
+        self.sidebar_toggle_button.setObjectName("sidebarToggleButton")
+        self.sidebar_toggle_button.setCheckable(True)
+        self.sidebar_toggle_button.setChecked(True)
+        self.sidebar_toggle_button.toggled.connect(
+            self._set_conversation_sidebar_visible
+        )
 
         chat_actions = QHBoxLayout()
         chat_actions.addWidget(self.overlay_toggle_button)
         chat_actions.addWidget(self.overlay_settings_button)
+        chat_actions.addWidget(self.sidebar_toggle_button)
         chat_actions.addStretch()
         chat_actions.addWidget(self.to_bottom_button)
         chat_actions.addWidget(self.clear_captions_button)
@@ -417,10 +426,15 @@ class MainWindow(QMainWindow):
             self._show_saved_conversation
         )
 
-        conversation_layout = QHBoxLayout()
-        conversation_layout.setSpacing(12)
-        conversation_layout.addWidget(self.conversation_sidebar)
-        conversation_layout.addWidget(self.chat_group, stretch=1)
+        self.conversation_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.conversation_splitter.setObjectName("conversationSplitter")
+        self.conversation_splitter.setChildrenCollapsible(False)
+        self.conversation_splitter.addWidget(self.conversation_sidebar)
+        self.conversation_splitter.addWidget(self.chat_group)
+        self.conversation_splitter.setStretchFactor(0, 0)
+        self.conversation_splitter.setStretchFactor(1, 1)
+        self.conversation_splitter.setSizes([260, 790])
+        self._expanded_sidebar_width = 260
 
         self.performance_view_selector = QComboBox()
         self.performance_view_selector.setObjectName("performanceViewSelector")
@@ -482,12 +496,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(message)
         layout.addSpacing(4)
         layout.addLayout(panels_layout)
-        layout.addLayout(conversation_layout, stretch=1)
+        layout.addWidget(self.conversation_splitter, stretch=1)
 
         content = QWidget()
         content.setLayout(layout)
         self.setCentralWidget(content)
 
+        self._restore_interface_settings()
         self.refresh_microphones()
         self._refresh_conversation_sidebar()
 
@@ -1366,6 +1381,116 @@ class MainWindow(QMainWindow):
     def _handle_overlay_hidden_by_user(self) -> None:
         self.overlay_toggle_button.setChecked(False)
 
+    def _set_conversation_sidebar_visible(self, visible: bool) -> None:
+        if visible:
+            self.conversation_sidebar.show()
+            total_width = max(1, self.conversation_splitter.width())
+            sidebar_width = min(self._expanded_sidebar_width, total_width - 1)
+            self.conversation_splitter.setSizes(
+                [sidebar_width, max(1, total_width - sidebar_width)]
+            )
+            self.sidebar_toggle_button.setText("Hide conversations")
+            return
+
+        sizes = self.conversation_splitter.sizes()
+        if sizes and sizes[0] > 0:
+            self._expanded_sidebar_width = sizes[0]
+        self.conversation_sidebar.hide()
+        self.sidebar_toggle_button.setText("Show conversations")
+
+    @staticmethod
+    def _safe_setting_int(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_setting_bool(value: object, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _restore_interface_settings(self) -> None:
+        geometry = self._interface_settings.value("ui/main_geometry")
+        if hasattr(geometry, "isEmpty") and not geometry.isEmpty():
+            self.restoreGeometry(geometry)
+
+        caption_mode = self._interface_settings.value("ui/caption_view", "both")
+        caption_index = self.caption_view_selector.findData(caption_mode)
+        if caption_index >= 0:
+            self.caption_view_selector.setCurrentIndex(caption_index)
+
+        language = self._interface_settings.value("ui/spoken_language", None)
+        language_index = self.language_selector.findData(language)
+        if language_index >= 0:
+            self.language_selector.setCurrentIndex(language_index)
+
+        self.speech_chunk_duration_slider.setValue(
+            self._safe_setting_int(
+                self._interface_settings.value("ui/max_speech_chunk", 30),
+                30,
+            )
+        )
+        self.speech_sensitivity_slider.setValue(
+            self._safe_setting_int(
+                self._interface_settings.value("ui/speech_sensitivity", 5),
+                5,
+            )
+        )
+        self.whisper_workers_slider.setValue(
+            self._safe_setting_int(
+                self._interface_settings.value("ui/whisper_workers", 1),
+                1,
+            )
+        )
+        self._expanded_sidebar_width = max(
+            230,
+            min(
+                320,
+                self._safe_setting_int(
+                    self._interface_settings.value("ui/sidebar_width", 260),
+                    260,
+                ),
+            ),
+        )
+        sidebar_visible = self._safe_setting_bool(
+            self._interface_settings.value("ui/sidebar_visible", True),
+            True,
+        )
+        self.sidebar_toggle_button.setChecked(sidebar_visible)
+        self._set_conversation_sidebar_visible(sidebar_visible)
+
+    def _save_interface_settings(self) -> None:
+        sizes = self.conversation_splitter.sizes()
+        if self.conversation_sidebar.isVisible() and sizes and sizes[0] > 0:
+            self._expanded_sidebar_width = sizes[0]
+        self._interface_settings.setValue("ui/main_geometry", self.saveGeometry())
+        self._interface_settings.setValue(
+            "ui/caption_view", self.caption_view_selector.currentData()
+        )
+        self._interface_settings.setValue(
+            "ui/spoken_language", self.language_selector.currentData()
+        )
+        self._interface_settings.setValue(
+            "ui/max_speech_chunk", self.speech_chunk_duration_slider.value()
+        )
+        self._interface_settings.setValue(
+            "ui/speech_sensitivity", self.speech_sensitivity_slider.value()
+        )
+        self._interface_settings.setValue(
+            "ui/whisper_workers", self.whisper_workers_slider.value()
+        )
+        self._interface_settings.setValue(
+            "ui/sidebar_width", self._expanded_sidebar_width
+        )
+        self._interface_settings.setValue(
+            "ui/sidebar_visible", self.sidebar_toggle_button.isChecked()
+        )
+        self._save_overlay_settings()
+
     def _clear_caption_screen(self) -> None:
         self.caption_chat.clear_messages()
         self.caption_overlay.clear_message()
@@ -1526,7 +1651,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release audio asynchronously before allowing the window to close."""
         if self._allow_window_close:
-            self._save_overlay_settings()
+            self._save_interface_settings()
             self.caption_overlay.hide()
             super().closeEvent(event)
             return
@@ -1537,7 +1662,7 @@ class MainWindow(QMainWindow):
                 close_after_stop=True,
             )
             return
-        self._save_overlay_settings()
+        self._save_interface_settings()
         self.caption_overlay.hide()
         super().closeEvent(event)
 

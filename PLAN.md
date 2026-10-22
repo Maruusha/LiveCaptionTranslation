@@ -675,9 +675,11 @@ Computer audio is captured at 48 kHz in stereo, downmixed to mono, and sent into
 
 **Current implementation (overlay customization slice, 2026-10-22):** An **Overlay settings** dialog now controls caption font size, text colour, background colour, background opacity, and mouse click-through mode. A resize handle changes the frameless overlay size. Its appearance, size, and screen position are saved locally and restored on the next launch. Invalid saved values are repaired to safe limits, and an overlay restored from a disconnected monitor is moved back onto the primary screen. **Reset defaults** restores the original appearance. When click-through is active, the main window remains the way to hide or configure the overlay.
 
-**Current automated verification:** All 69 tests pass, including overlay formatting, safe appearance limits, click-through flags, settings reset, saved appearance and geometry, window flags, show/hide integration, and live-caption updates.
+**Current implementation (resizable chat layout and saved choices, 2026-10-22):** The conversation sidebar and caption area now use a draggable divider. **Hide conversations** collapses the sidebar to provide more caption space, and **Show conversations** restores it. The application locally remembers the main window geometry, sidebar visibility and width, caption display mode, spoken-language choice, maximum speech-chunk duration, speech sensitivity, and Whisper worker count. Saved numeric values are constrained by the existing safe control ranges when restored.
 
-Automatic Person labels and colours, temporary-to-final bubble replacement, and right alignment for a manually selected `You` remain in later stages. Stage 7 still needs real high-DPI, multiple-monitor, windowed-game, borderless-game, and busy-pipeline responsiveness tests. Saving non-overlay interface choices can be added after their controls have settled.
+**Current automated verification:** All 70 tests pass, including overlay formatting, safe appearance limits, click-through flags, settings reset, saved appearance and geometry, collapsible-sidebar behavior, saved main-interface choices, window flags, show/hide integration, and live-caption updates.
+
+Automatic Person labels and colours, temporary-to-final bubble replacement, and right alignment for a manually selected `You` remain in later stages. Stage 7 still needs real high-DPI, multiple-monitor, windowed-game, borderless-game, and busy-pipeline responsiveness tests.
 
 **Finished when:** Live captions remain readable and the interface stays responsive while audio processing runs in the background.
 
