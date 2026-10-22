@@ -39,6 +39,8 @@ class FakeMicrophoneMonitor:
         caption_callback,
         recognition_language,
         max_segment_seconds,
+        speech_threshold,
+        recognition_workers,
     ) -> None:
         self.device_index = device_index
         self.level_callback = level_callback
@@ -50,6 +52,8 @@ class FakeMicrophoneMonitor:
         self.caption_callback = caption_callback
         self.recognition_language = recognition_language
         self.max_segment_seconds = max_segment_seconds
+        self.speech_threshold = speech_threshold
+        self.recognition_workers = recognition_workers
         self.performance_report = PerformanceReport(
             elapsed_seconds=65.0,
             average_cpu_percent=2.5,
@@ -159,6 +163,12 @@ def test_main_window_starts_ready() -> None:
     assert window.speech_chunk_duration_label.text() == (
         "Maximum speech chunk: 30 seconds"
     )
+    assert window.speech_sensitivity_slider.value() == 5
+    assert window.speech_sensitivity_label.text() == (
+        "Speech sensitivity: 5/9 (Balanced)"
+    )
+    assert window.whisper_workers_slider.value() == 1
+    assert window.whisper_workers_label.text() == "Whisper workers: 1"
     assert window.start_stop_button.minimumHeight() == 48
     assert window.to_bottom_button.text() == "To bottom"
     assert window.runtime_state is RuntimeState.IDLE
@@ -187,6 +197,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
         caption_callback,
         recognition_language,
         max_segment_seconds,
+        speech_threshold,
+        recognition_workers,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -197,6 +209,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
             caption_callback,
             recognition_language,
             max_segment_seconds,
+            speech_threshold,
+            recognition_workers,
         )
         monitors.append(monitor)
         return monitor
@@ -206,6 +220,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
         monitor_factory=monitor_factory,
     )
     window.speech_chunk_duration_slider.setValue(45)
+    window.speech_sensitivity_slider.setValue(7)
+    window.whisper_workers_slider.setValue(2)
     assert window.speech_chunk_duration_label.text() == (
         "Maximum speech chunk: 45 seconds"
     )
@@ -214,11 +230,15 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert monitors[0].device_index == (12,)
     assert monitors[0].recognition_language is None
     assert monitors[0].max_segment_seconds == 45.0
+    assert monitors[0].speech_threshold == 0.35
+    assert monitors[0].recognition_workers == 2
     assert monitors[0].started
     assert window.runtime_state is RuntimeState.LIVE
     assert window.start_stop_button.text() == "Stop microphone"
     assert not window.microphone_selector.isEnabled()
     assert not window.speech_chunk_duration_slider.isEnabled()
+    assert not window.speech_sensitivity_slider.isEnabled()
+    assert not window.whisper_workers_slider.isEnabled()
     assert window._active_history_session_id is not None
     assert window.conversation_sidebar.selected_key() == LIVE_ITEM_KEY
     assert window._history.list_sessions()[0].status == "live"
@@ -264,6 +284,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert window.start_stop_button.text() == "Start microphone"
     assert window.microphone_selector.isEnabled()
     assert window.speech_chunk_duration_slider.isEnabled()
+    assert window.speech_sensitivity_slider.isEnabled()
+    assert window.whisper_workers_slider.isEnabled()
     assert window._active_history_session_id is None
     assert window._history.list_sessions()[0].status == "completed"
     assert "Duration: 01:05" in window.performance_summary.text()
@@ -438,6 +460,8 @@ def test_computer_audio_source_uses_the_loopback_pipeline() -> None:
         caption_callback,
         recognition_language,
         max_segment_seconds,
+        speech_threshold,
+        recognition_workers,
     ):
         monitor = FakeMicrophoneMonitor(
             output_device,
@@ -448,6 +472,8 @@ def test_computer_audio_source_uses_the_loopback_pipeline() -> None:
             caption_callback,
             recognition_language,
             max_segment_seconds,
+            speech_threshold,
+            recognition_workers,
         )
         monitors.append(monitor)
         return monitor
@@ -669,6 +695,8 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
         caption_callback,
         recognition_language,
         max_segment_seconds,
+        speech_threshold,
+        recognition_workers,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -679,6 +707,8 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
             caption_callback,
             recognition_language,
             max_segment_seconds,
+            speech_threshold,
+            recognition_workers,
         )
         monitors.append(monitor)
         return monitor

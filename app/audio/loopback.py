@@ -82,6 +82,8 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
         caption_callback: Callable[[TranslationResult], None] | None = None,
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
+        speech_threshold: float = 0.5,
+        recognition_workers: int = 1,
     ) -> None:
         super().__init__(
             0,
@@ -92,6 +94,8 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
             caption_callback,
             recognition_language,
             max_segment_seconds,
+            speech_threshold,
+            recognition_workers,
         )
         self.output_device = output_device
         self._capture_stop = Event()

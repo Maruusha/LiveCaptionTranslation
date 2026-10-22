@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from threading import Event
 
 import numpy as np
 
@@ -56,8 +57,11 @@ def test_recognition_queue_reports_visible_overload() -> None:
     assert worker.submit(speech_segment())
     assert not worker.submit(speech_segment(start=2_000))
 
-    assert results[0].skipped
-    assert results[0].text == "[caption skipped: processing too slow]"
+    # The overload result waits behind the older caption to preserve time order.
+    assert results == []
+    assert worker.cancel_pending() == 1
+    assert results[1].skipped
+    assert results[1].text == "[caption skipped: processing too slow]"
     assert "behind" in warnings[0]
 
 
@@ -101,3 +105,45 @@ def test_recognition_worker_uses_a_manual_language() -> None:
     worker.stop()
 
     assert results[0].language == "fr"
+
+
+def test_two_recognition_workers_keep_results_in_audio_order() -> None:
+    results: list[RecognitionResult] = []
+    release_first = Event()
+    second_completed = Event()
+
+    class FakeModel:
+        def transcribe(self, audio, **_options):
+            marker = int(audio[0])
+            if marker == 1:
+                release_first.wait(timeout=1.0)
+                text = "First"
+            else:
+                text = "Second"
+                second_completed.set()
+            return iter([SimpleNamespace(text=text)]), SimpleNamespace(
+                language="en",
+                language_probability=0.99,
+            )
+
+    first_samples = np.ones(1_600, dtype=np.float32)
+    second_samples = np.full(1_600, 2.0, dtype=np.float32)
+    worker = RecognitionWorker(
+        result_callback=results.append,
+        warning_callback=lambda _warning: None,
+        model_factory=FakeModel,
+        worker_count=2,
+    )
+    worker.start()
+    worker.submit(SpeechSegment(first_samples, 0, 1_600))
+    worker.submit(SpeechSegment(second_samples, 2_000, 3_600))
+
+    assert second_completed.wait(timeout=1.0)
+    assert results == []
+    release_first.set()
+    worker.stop()
+
+    assert [result.text for result in results] == ["First", "Second"]
+    assert worker.stats.completed_segments == 2
+    assert worker.worker_count == 2
+    assert worker.cpu_threads_per_worker == 2

@@ -67,6 +67,8 @@ class MicrophoneLevelMonitor:
         caption_callback: Callable[[TranslationResult], None] | None = None,
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
+        speech_threshold: float = 0.5,
+        recognition_workers: int = 1,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -100,6 +102,7 @@ class MicrophoneLevelMonitor:
                 result_callback=self._handle_recognition_result,
                 warning_callback=self._warning_callback,
                 language=recognition_language,
+                worker_count=recognition_workers,
             )
             if caption_callback is not None
             else None
@@ -119,6 +122,7 @@ class MicrophoneLevelMonitor:
                 warning_callback=self._warning_callback,
                 segment_callback=self._handle_speech_segment,
                 max_segment_seconds=max_segment_seconds,
+                speech_threshold=speech_threshold,
             )
             if speech_event_callback is not None
             else None

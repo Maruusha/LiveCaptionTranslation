@@ -53,7 +53,7 @@ class RecognitionStats:
     processing_seconds: float
 
 
-def create_faster_whisper_model() -> WhisperLikeModel:
+def create_faster_whisper_model(cpu_threads: int = 4) -> WhisperLikeModel:
     """Load the multilingual small model strictly from the project folder."""
     if not (MODEL_DIRECTORY / "model.bin").is_file():
         raise RecognitionError(
@@ -67,7 +67,7 @@ def create_faster_whisper_model() -> WhisperLikeModel:
         str(MODEL_DIRECTORY),
         device="cpu",
         compute_type="int8",
-        cpu_threads=4,
+        cpu_threads=cpu_threads,
         local_files_only=True,
     )
 
@@ -79,42 +79,54 @@ class RecognitionWorker:
         self,
         result_callback: Callable[[RecognitionResult], None],
         warning_callback: Callable[[str], None],
-        model_factory: Callable[[], WhisperLikeModel] = create_faster_whisper_model,
+        model_factory: Callable[[], WhisperLikeModel] | None = None,
         max_queued_segments: int = 8,
         language: str | None = None,
+        worker_count: int = 1,
     ) -> None:
         if max_queued_segments <= 0:
             raise ValueError("max_queued_segments must be greater than zero.")
         if language not in {None, "en", "fr"}:
             raise ValueError("language must be None, 'en', or 'fr'.")
+        if worker_count not in {1, 2}:
+            raise ValueError("worker_count must be one or two.")
         self._result_callback = result_callback
         self._warning_callback = warning_callback
-        self._model_factory = model_factory
+        self.worker_count = worker_count
+        self.cpu_threads_per_worker = max(1, 4 // worker_count)
+        self._model_factory = model_factory or (
+            lambda: create_faster_whisper_model(self.cpu_threads_per_worker)
+        )
         self._language = language
-        self._queue: Queue[SpeechSegment] = Queue(maxsize=max_queued_segments)
+        self._queue: Queue[tuple[int, SpeechSegment]] = Queue(
+            maxsize=max_queued_segments
+        )
         self._stop_event = Event()
-        self._thread: Thread | None = None
+        self._threads: list[Thread] = []
         self._stats_lock = Lock()
+        self._result_lock = Lock()
+        self._next_sequence = 0
+        self._next_result_sequence = 0
+        self._pending_results: dict[int, RecognitionResult] = {}
         self._completed_segments = 0
         self._failed_segments = 0
         self._processing_seconds = 0.0
-        self._active_started_at: float | None = None
+        self._active_started_at: dict[int, float] = {}
 
     @property
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return any(thread.is_alive() for thread in self._threads)
 
     @property
     def stats(self) -> RecognitionStats:
         with self._stats_lock:
-            active_started_at = self._active_started_at
+            now = perf_counter()
             return RecognitionStats(
                 queued_segments=self._queue.qsize(),
-                active_segments=int(active_started_at is not None),
-                active_elapsed_seconds=(
-                    perf_counter() - active_started_at
-                    if active_started_at is not None
-                    else 0.0
+                active_segments=len(self._active_started_at),
+                active_elapsed_seconds=sum(
+                    now - started_at
+                    for started_at in self._active_started_at.values()
                 ),
                 completed_segments=self._completed_segments,
                 failed_segments=self._failed_segments,
@@ -125,23 +137,32 @@ class RecognitionWorker:
         if self.is_running:
             return
         self._stop_event.clear()
-        self._thread = Thread(
-            target=self._run,
-            name="speech-recognition-worker",
-            daemon=True,
-        )
-        self._thread.start()
+        self._threads = [
+            Thread(
+                target=self._run,
+                args=(worker_index,),
+                name=f"speech-recognition-worker-{worker_index + 1}",
+                daemon=True,
+            )
+            for worker_index in range(self.worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
 
     def submit(self, segment: SpeechSegment) -> bool:
         """Queue one final chunk, or report a visible overload result."""
+        with self._result_lock:
+            sequence = self._next_sequence
+            self._next_sequence += 1
         try:
-            self._queue.put_nowait(segment)
+            self._queue.put_nowait((sequence, segment))
             return True
         except Full:
             self._warning_callback(
                 "Speech recognition is behind; one completed audio chunk was skipped."
             )
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 RecognitionResult(
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
@@ -150,7 +171,7 @@ class RecognitionWorker:
                     language_probability=None,
                     processing_seconds=0.0,
                     skipped=True,
-                )
+                ),
             )
             with self._stats_lock:
                 self._failed_segments += 1
@@ -158,25 +179,27 @@ class RecognitionWorker:
 
     def stop(self, timeout: float = 60.0) -> None:
         """Finish accepted chunks before stopping."""
-        thread = self._thread
-        if thread is None:
+        if not self._threads:
             return
         self._stop_event.set()
-        thread.join(timeout=timeout)
-        if thread.is_alive():
+        deadline = perf_counter() + timeout
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - perf_counter()))
+        if any(thread.is_alive() for thread in self._threads):
             raise RecognitionError("Speech recognition did not stop in time.")
-        self._thread = None
+        self._threads = []
 
     def cancel_pending(self) -> int:
         """Discard queued chunks while leaving an active transcription untouched."""
         cancelled = 0
         while True:
             try:
-                segment = self._queue.get_nowait()
+                sequence, segment = self._queue.get_nowait()
             except Empty:
                 break
             cancelled += 1
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 RecognitionResult(
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
@@ -186,14 +209,14 @@ class RecognitionWorker:
                     processing_seconds=0.0,
                     error="The caption was cancelled while the application was closing.",
                     skipped=True,
-                )
+                ),
             )
         if cancelled:
             with self._stats_lock:
                 self._failed_segments += cancelled
         return cancelled
 
-    def _run(self) -> None:
+    def _run(self, worker_index: int) -> None:
         try:
             model = self._model_factory()
         except Exception as error:
@@ -203,7 +226,7 @@ class RecognitionWorker:
 
         while True:
             try:
-                segment = self._queue.get(timeout=0.05)
+                sequence, segment = self._queue.get(timeout=0.05)
             except Empty:
                 if self._stop_event.is_set():
                     break
@@ -211,7 +234,7 @@ class RecognitionWorker:
 
             started = perf_counter()
             with self._stats_lock:
-                self._active_started_at = started
+                self._active_started_at[worker_index] = started
             try:
                 parts, info = model.transcribe(
                     segment.samples,
@@ -254,18 +277,19 @@ class RecognitionWorker:
                     self._processing_seconds += processing_seconds
             finally:
                 with self._stats_lock:
-                    self._active_started_at = None
-            self._result_callback(result)
+                    self._active_started_at.pop(worker_index, None)
+            self._complete_result(sequence, result)
 
     def _fail_waiting_segments(self, message: str) -> None:
         while True:
             try:
-                segment = self._queue.get_nowait()
+                sequence, segment = self._queue.get_nowait()
             except Empty:
                 return
             with self._stats_lock:
                 self._failed_segments += 1
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 RecognitionResult(
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
@@ -274,5 +298,14 @@ class RecognitionWorker:
                     language_probability=None,
                     processing_seconds=0.0,
                     error=message,
-                )
+                ),
             )
+
+    def _complete_result(self, sequence: int, result: RecognitionResult) -> None:
+        """Emit parallel recognition results in their original audio order."""
+        with self._result_lock:
+            self._pending_results[sequence] = result
+            while self._next_result_sequence in self._pending_results:
+                ready = self._pending_results.pop(self._next_result_sequence)
+                self._next_result_sequence += 1
+                self._result_callback(ready)

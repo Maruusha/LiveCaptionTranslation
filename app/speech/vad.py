@@ -80,7 +80,7 @@ class StreamingDetector(Protocol):
     def __call__(self, samples: np.ndarray) -> dict[str, int] | None: ...
 
 
-def create_silero_detector() -> StreamingDetector:
+def create_silero_detector(threshold: float = 0.5) -> StreamingDetector:
     """Load the package-bundled Silero ONNX model without network access."""
     import torch
     from silero_vad import VADIterator, load_silero_vad
@@ -89,7 +89,7 @@ def create_silero_detector() -> StreamingDetector:
     model = load_silero_vad(onnx=True)
     iterator = VADIterator(
         model,
-        threshold=0.5,
+        threshold=threshold,
         sampling_rate=VAD_SAMPLE_RATE,
         min_silence_duration_ms=400,
         speech_pad_ms=100,
@@ -110,19 +110,25 @@ class VoiceActivityWorker:
         event_callback: Callable[[SpeechEvent], None],
         warning_callback: Callable[[str], None],
         segment_callback: Callable[[SpeechSegment], None] | None = None,
-        detector_factory: Callable[[], StreamingDetector] = create_silero_detector,
+        detector_factory: Callable[[], StreamingDetector] | None = None,
         max_segment_seconds: float = DEFAULT_MAX_SEGMENT_SECONDS,
         min_segment_seconds: float = DEFAULT_MIN_SEGMENT_SECONDS,
+        speech_threshold: float = 0.5,
     ) -> None:
         if max_segment_seconds <= 0.0:
             raise ValueError("max_segment_seconds must be greater than zero.")
         if min_segment_seconds < 0.0:
             raise ValueError("min_segment_seconds cannot be negative.")
+        if not 0.0 < speech_threshold < 1.0:
+            raise ValueError("speech_threshold must be between zero and one.")
         self.source_queue = source_queue
         self._event_callback = event_callback
         self._warning_callback = warning_callback
         self._segment_callback = segment_callback
-        self._detector_factory = detector_factory
+        self.speech_threshold = float(speech_threshold)
+        self._detector_factory = detector_factory or (
+            lambda: create_silero_detector(self.speech_threshold)
+        )
         self._max_segment_samples = max(
             VAD_WINDOW_SAMPLES,
             int(round(max_segment_seconds * VAD_SAMPLE_RATE)),
