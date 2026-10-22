@@ -134,10 +134,10 @@ def test_main_window_starts_ready() -> None:
     window = MainWindow(device_provider=microphone_fixture)
 
     assert window.windowTitle() == APP_NAME
-    assert window.minimumWidth() == 820
-    assert window.minimumHeight() == 440
-    assert window.width() >= 940
-    assert window.height() >= 520
+    assert window.minimumWidth() == 900
+    assert window.minimumHeight() == 640
+    assert window.width() >= 1050
+    assert window.height() >= 760
     assert window.statusBar().currentMessage() == "Ready"
     assert window.centralWidget() is not None
     assert window.microphone_selector.count() == 1
@@ -216,8 +216,9 @@ def test_microphone_controls_start_update_and_stop() -> None:
             processing_seconds=0.1,
         )
     )
-    assert window.latest_caption.text() == (
-        "Original [FR]: Bonjour le monde\nTranslation [EN]: Hello world"
+    assert len(window.caption_chat.messages) == 1
+    assert window.caption_chat.messages[0].message_label.text() == (
+        "FR: Bonjour le monde\nEN: Hello world"
     )
 
     window.start_stop_button.click()

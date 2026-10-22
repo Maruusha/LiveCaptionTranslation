@@ -40,6 +40,7 @@ from app.core.state import RuntimeState, RuntimeStateMachine
 from app.speech.recognition import RecognitionStats
 from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
 from app.translation.translator import TranslationResult, TranslationStats
+from app.ui.chat_view import CaptionChatView
 from app.ui.finishing_dialog import FinishingCaptionsDialog
 
 
@@ -107,6 +108,7 @@ class MainWindow(QMainWindow):
         self._active_source: str | None = None
         self._active_microphone_name: str | None = None
         self._active_output_id: str | None = None
+        self._caption_source_label = "Speaker"
         self._device_refresh_pending = False
         self._outputs_loaded = False
         self._completed_speech_chunks = 0
@@ -135,8 +137,8 @@ class MainWindow(QMainWindow):
 
         self.setObjectName("mainWindow")
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(820, 440)
-        self.resize(940, 520)
+        self.setMinimumSize(900, 640)
+        self.resize(1050, 760)
 
         title = QLabel(APP_NAME)
         title.setObjectName("applicationTitle")
@@ -203,11 +205,6 @@ class MainWindow(QMainWindow):
         self.speech_turn_status = QLabel("Completed speech chunks: 0")
         self.speech_turn_status.setObjectName("speechTurnStatus")
 
-        self.latest_caption = QLabel("Latest caption: waiting for microphone")
-        self.latest_caption.setObjectName("latestCaption")
-        self.latest_caption.setWordWrap(True)
-        self.latest_caption.setMinimumHeight(76)
-
         self.language_selector = QComboBox()
         self.language_selector.setObjectName("speechLanguageSelector")
         self.language_selector.addItem("Automatic", userData=None)
@@ -243,9 +240,25 @@ class MainWindow(QMainWindow):
         microphone_layout.addWidget(self.input_level)
         microphone_layout.addWidget(self.speech_status)
         microphone_layout.addWidget(self.speech_turn_status)
-        microphone_layout.addWidget(self.latest_caption)
         microphone_layout.addWidget(self.start_stop_button)
         microphone_group.setLayout(microphone_layout)
+
+        self.caption_chat = CaptionChatView()
+        self.caption_view_selector.currentIndexChanged.connect(
+            self._update_caption_display_mode
+        )
+        self.clear_captions_button = QPushButton("Clear screen")
+        self.clear_captions_button.setObjectName("clearCaptionsButton")
+        self.clear_captions_button.clicked.connect(self._clear_caption_screen)
+
+        chat_actions = QHBoxLayout()
+        chat_actions.addStretch()
+        chat_actions.addWidget(self.clear_captions_button)
+
+        chat_group = QGroupBox("Live conversation")
+        chat_layout = QVBoxLayout(chat_group)
+        chat_layout.addLayout(chat_actions)
+        chat_layout.addWidget(self.caption_chat, stretch=1)
 
         self.performance_view_selector = QComboBox()
         self.performance_view_selector.setObjectName("performanceViewSelector")
@@ -305,7 +318,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(message)
         layout.addSpacing(4)
         layout.addLayout(panels_layout)
-        layout.addStretch()
+        layout.addWidget(chat_group, stretch=1)
 
         content = QWidget()
         content.setLayout(layout)
@@ -553,6 +566,9 @@ class MainWindow(QMainWindow):
         self._active_output_id = (
             selected_output.id if active_source == "computer_audio" else None
         )
+        self._caption_source_label = (
+            "Computer audio" if active_source == "computer_audio" else "Microphone"
+        )
         self._runtime.transition(RuntimeState.LIVE)
         self.microphone_source_button.setEnabled(False)
         self.computer_audio_source_button.setEnabled(False)
@@ -572,7 +588,7 @@ class MainWindow(QMainWindow):
         self.speech_status.setText("Speech detection: listening…")
         self._completed_speech_chunks = 0
         self.speech_turn_status.setText("Completed speech chunks: 0")
-        self.latest_caption.setText("Latest caption: listening…")
+        self.caption_chat.clear_messages()
         self.performance_summary.setText("Measuring performance…")
         self._performance_timer.start()
         self._update_performance_stats()
@@ -860,30 +876,24 @@ class MainWindow(QMainWindow):
     def _show_caption(self, result: TranslationResult) -> None:
         recognition = result.recognition
         if recognition.skipped or recognition.error:
-            self.latest_caption.setText(recognition.text)
+            self.caption_chat.add_message(
+                original_text=recognition.text,
+                source_language=recognition.language,
+                speaker=self._caption_source_label,
+                warning=True,
+            )
             self.statusBar().showMessage("Caption warning")
             return
 
         original_text = recognition.text or "[no speech recognized]"
-        source_language = (recognition.language or "unknown").upper()
-        original_line = f"Original [{source_language}]: {original_text}"
-        translated_line = None
-        if result.translated_text:
-            target_language = (result.target_language or "unknown").upper()
-            translated_line = (
-                f"Translation [{target_language}]: {result.translated_text}"
-            )
-
-        view = self.caption_view_selector.currentData()
-        if view == "translation" and translated_line is not None:
-            caption = translated_line
-        elif view == "original":
-            caption = original_line
-        elif translated_line is not None:
-            caption = f"{original_line}\n{translated_line}"
-        else:
-            caption = f"{original_line}\nTranslation unavailable"
-        self.latest_caption.setText(caption)
+        self.caption_chat.add_message(
+            original_text=original_text,
+            source_language=recognition.language,
+            translated_text=result.translated_text,
+            target_language=result.target_language,
+            speaker=self._caption_source_label,
+            warning=bool(result.error),
+        )
 
         if result.error:
             self.statusBar().showMessage("Translation warning")
@@ -897,6 +907,16 @@ class MainWindow(QMainWindow):
             recognition.processing_seconds,
             result.processing_seconds,
         )
+
+    def _update_caption_display_mode(self) -> None:
+        self.caption_chat.set_display_mode(
+            str(self.caption_view_selector.currentData())
+        )
+
+    def _clear_caption_screen(self) -> None:
+        self.caption_chat.clear_messages()
+        logger.info("Visible caption messages cleared")
+        self.statusBar().showMessage("Caption screen cleared")
 
     def _update_performance_stats(self) -> None:
         monitor = self._microphone_monitor

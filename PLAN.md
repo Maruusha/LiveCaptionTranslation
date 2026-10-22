@@ -669,6 +669,10 @@ Computer audio is captured at 48 kHz in stereo, downmixed to mono, and sent into
 - Test high-DPI screens, multiple monitors, and windowed or borderless games.
 - Measure UI responsiveness while the full caption pipeline is busy.
 
+**Current implementation (first chat slice, 2026-10-22):** The single latest-caption label has been replaced by a scrollable WhatsApp-style live conversation area. Every completed speech turn creates one left-aligned bubble containing its source label, local time, original language and text, and translated language and text. Warning or skipped captions use a separate warning colour. The existing Original only, Translation only, and Original and translation choices update all visible bubbles, not only new ones. New messages scroll into view only when the user was already near the bottom, and **Clear screen** removes visible bubbles without touching captured audio or future saved history. The layout has been enlarged and reorganized so the live controls, simple performance panel, and conversation remain visible together. All 53 automated tests pass.
+
+This is only the live message-screen foundation. Automatic Person labels and colours, temporary-to-final bubble replacement, the saved-conversation sidebar, right alignment for a manually selected `You`, durable history, and the compact overlay remain in their later stages.
+
 **Finished when:** Live captions remain readable and the interface stays responsive while audio processing runs in the background.
 
 ### Stage 8 — Local history and crash recovery
