@@ -1,7 +1,12 @@
+import sys
+
+import pytest
+
 from app.core.performance import (
     ProcessSnapshot,
     build_performance_report,
     format_mebibytes,
+    take_process_snapshot,
 )
 
 
@@ -30,3 +35,13 @@ def test_performance_report_calculates_resource_changes() -> None:
 
 def test_unknown_memory_has_clear_log_value() -> None:
     assert format_mebibytes(None) == "unavailable"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process counters")
+def test_windows_snapshot_reads_process_memory() -> None:
+    snapshot = take_process_snapshot()
+
+    assert snapshot.memory_bytes is not None
+    assert snapshot.memory_bytes > 0
+    assert snapshot.peak_memory_bytes is not None
+    assert snapshot.peak_memory_bytes >= snapshot.memory_bytes

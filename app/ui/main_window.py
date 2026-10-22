@@ -804,7 +804,13 @@ class MainWindow(QMainWindow):
         self.input_level.setValue(int(round(level)))
 
     def _show_microphone_warning(self, warning: str) -> None:
-        self.statusBar().showMessage(f"Microphone warning: {warning}")
+        source_name = (
+            "Computer audio"
+            if self._active_source == "computer_audio"
+            else "Microphone"
+        )
+        logger.warning("%s pipeline warning: %s", source_name, warning)
+        self.statusBar().showMessage(f"{source_name} warning: {warning}")
 
     def _show_speech_event(self, event: object) -> None:
         kind = getattr(event, "kind", None)

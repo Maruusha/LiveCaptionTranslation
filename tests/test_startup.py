@@ -285,6 +285,104 @@ def test_computer_audio_source_uses_the_loopback_pipeline() -> None:
     window.close()
 
 
+def test_computer_audio_pipeline_warning_is_visible_and_logged(caplog) -> None:
+    create_application(["live-caption-translation-test"])
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def loopback_monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=output_fixture,
+        loopback_monitor_factory=loopback_monitor_factory,
+    )
+    window.computer_audio_source_button.click()
+    window.start_stop_button.click()
+
+    with caplog.at_level("WARNING"):
+        monitors[0].warning_callback("recognition queue is full")
+
+    assert window.statusBar().currentMessage() == (
+        "Computer audio warning: recognition queue is full"
+    )
+    assert (
+        "Computer audio pipeline warning: recognition queue is full"
+        in caplog.text
+    )
+
+    window.start_stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    window.close()
+
+
+def test_refresh_keeps_selected_computer_output_when_connected() -> None:
+    create_application(["live-caption-translation-test"])
+    headphones = output_fixture()[0]
+    speakers = OutputAudioDevice(
+        id="speaker-2",
+        name="Test Speakers",
+        is_default=False,
+    )
+    provider_calls = 0
+
+    def changing_output_provider() -> list[OutputAudioDevice]:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            return [headphones, speakers]
+        return [speakers, headphones]
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=changing_output_provider,
+    )
+    window.computer_audio_source_button.click()
+    window.output_selector.setCurrentIndex(1)
+    assert window.output_selector.currentData().id == "speaker-2"
+
+    window.refresh_devices_button.click()
+
+    assert window.output_selector.currentData().id == "speaker-2"
+    assert window.output_selector.currentText() == "Test Speakers"
+    window.close()
+
+
+def test_active_computer_output_disconnect_stops_capture_and_refreshes() -> None:
+    create_application(["live-caption-translation-test"])
+    outputs = output_fixture()
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def connected_output_provider() -> list[OutputAudioDevice]:
+        return list(outputs)
+
+    def loopback_monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=connected_output_provider,
+        loopback_monitor_factory=loopback_monitor_factory,
+    )
+    window.computer_audio_source_button.click()
+    window.start_stop_button.click()
+    assert monitors[0].started
+
+    outputs.clear()
+    window._handle_connected_outputs_changed()
+
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.start_stop_button.text() == "Start computer audio"
+    assert not window.start_stop_button.isEnabled()
+    assert window.statusBar().currentMessage() == "Computer audio disconnected"
+    assert "was disconnected" in window.device_status.text()
+    window.close()
+
+
 def test_refresh_button_reloads_devices_and_writes_log(caplog) -> None:
     create_application(["live-caption-translation-test"])
     first_device = microphone_fixture()[0]
