@@ -46,6 +46,8 @@ class RecognitionResult:
 @dataclass(frozen=True, slots=True)
 class RecognitionStats:
     queued_segments: int
+    active_segments: int
+    active_elapsed_seconds: float
     completed_segments: int
     failed_segments: int
     processing_seconds: float
@@ -92,6 +94,7 @@ class RecognitionWorker:
         self._completed_segments = 0
         self._failed_segments = 0
         self._processing_seconds = 0.0
+        self._active_started_at: float | None = None
 
     @property
     def is_running(self) -> bool:
@@ -100,8 +103,15 @@ class RecognitionWorker:
     @property
     def stats(self) -> RecognitionStats:
         with self._stats_lock:
+            active_started_at = self._active_started_at
             return RecognitionStats(
                 queued_segments=self._queue.qsize(),
+                active_segments=int(active_started_at is not None),
+                active_elapsed_seconds=(
+                    perf_counter() - active_started_at
+                    if active_started_at is not None
+                    else 0.0
+                ),
                 completed_segments=self._completed_segments,
                 failed_segments=self._failed_segments,
                 processing_seconds=self._processing_seconds,
@@ -153,6 +163,32 @@ class RecognitionWorker:
             raise RecognitionError("Speech recognition did not stop in time.")
         self._thread = None
 
+    def cancel_pending(self) -> int:
+        """Discard queued chunks while leaving an active transcription untouched."""
+        cancelled = 0
+        while True:
+            try:
+                segment = self._queue.get_nowait()
+            except Empty:
+                break
+            cancelled += 1
+            self._result_callback(
+                RecognitionResult(
+                    start_sample=segment.start_sample,
+                    end_sample=segment.end_sample,
+                    text="[caption skipped: application closed before processing]",
+                    language=None,
+                    language_probability=None,
+                    processing_seconds=0.0,
+                    error="The caption was cancelled while the application was closing.",
+                    skipped=True,
+                )
+            )
+        if cancelled:
+            with self._stats_lock:
+                self._failed_segments += cancelled
+        return cancelled
+
     def _run(self) -> None:
         try:
             model = self._model_factory()
@@ -170,6 +206,8 @@ class RecognitionWorker:
                 continue
 
             started = perf_counter()
+            with self._stats_lock:
+                self._active_started_at = started
             try:
                 parts, info = model.transcribe(
                     segment.samples,
@@ -210,6 +248,9 @@ class RecognitionWorker:
                 with self._stats_lock:
                     self._failed_segments += 1
                     self._processing_seconds += processing_seconds
+            finally:
+                with self._stats_lock:
+                    self._active_started_at = None
             self._result_callback(result)
 
     def _fail_waiting_segments(self, message: str) -> None:

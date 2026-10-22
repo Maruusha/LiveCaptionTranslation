@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 import logging
+from threading import Thread
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QFont, QStandardItemModel
@@ -29,6 +30,7 @@ from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
 from app.core.performance import PerformanceReport, format_mebibytes
 from app.speech.recognition import RecognitionResult
 from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
+from app.ui.finishing_dialog import FinishingCaptionsDialog
 
 
 MonitorFactory = Callable[
@@ -72,6 +74,14 @@ class MainWindow(QMainWindow):
         self._active_microphone_name: str | None = None
         self._device_refresh_pending = False
         self._completed_speech_chunks = 0
+        self._stopping_monitor: MicrophoneLevelMonitor | None = None
+        self._stop_thread: Thread | None = None
+        self._stop_error: MicrophoneCaptureError | None = None
+        self._show_ready_after_stop = True
+        self._close_after_stop = False
+        self._allow_window_close = False
+        self._after_stop: Callable[[], None] | None = None
+        self._finishing_dialog: FinishingCaptionsDialog | None = None
 
         self.microphone_level_received.connect(self._set_microphone_level)
         self.microphone_warning_received.connect(self._show_microphone_warning)
@@ -184,6 +194,10 @@ class MainWindow(QMainWindow):
         self._performance_timer = QTimer(self)
         self._performance_timer.setInterval(1_000)
         self._performance_timer.timeout.connect(self._update_performance_stats)
+
+        self._stop_poll_timer = QTimer(self)
+        self._stop_poll_timer.setInterval(200)
+        self._stop_poll_timer.timeout.connect(self._poll_microphone_stop)
 
         panels_layout = QHBoxLayout()
         panels_layout.setSpacing(16)
@@ -332,39 +346,181 @@ class MainWindow(QMainWindow):
         self._performance_timer.start()
         self._update_performance_stats()
 
-    def _stop_microphone(self, show_ready: bool = True) -> None:
+    def _stop_microphone(
+        self,
+        show_ready: bool = True,
+        *,
+        close_after_stop: bool = False,
+        after_stop: Callable[[], None] | None = None,
+    ) -> None:
+        """Stop capture in the background so the interface remains responsive."""
+        if self._stop_thread is not None:
+            self._show_ready_after_stop = self._show_ready_after_stop and show_ready
+            self._close_after_stop = self._close_after_stop or close_after_stop
+            self._after_stop = after_stop or self._after_stop
+            if self._finishing_dialog is not None:
+                self._finishing_dialog.set_closing_application(
+                    self._close_after_stop
+                )
+            return
+
         monitor = self._microphone_monitor
+        if monitor is None:
+            if close_after_stop:
+                self._allow_window_close = True
+                self.close()
+            return
+
         self._microphone_monitor = None
         self._active_microphone_name = None
-
-        if monitor is not None:
-            try:
-                monitor.stop()
-            except MicrophoneCaptureError as error:
-                self.device_status.setText(str(error))
-                self.statusBar().showMessage("Microphone stop warning")
-                show_ready = False
-
         self._performance_timer.stop()
+        self.input_level.setValue(0)
+        self.speech_status.setText("Speech detection: finishing captions…")
+        self.microphone_selector.setEnabled(False)
+        self.refresh_devices_button.setEnabled(False)
+        self.start_stop_button.setEnabled(False)
+        self.start_stop_button.setText("Stopping…")
+        self.statusBar().showMessage("Finishing accepted captions…")
+
+        self._stopping_monitor = monitor
+        self._stop_error = None
+        self._show_ready_after_stop = show_ready
+        self._close_after_stop = close_after_stop
+        self._after_stop = after_stop
+        self._stop_thread = Thread(
+            target=self._stop_monitor_in_background,
+            args=(monitor,),
+            name="microphone-stop-worker",
+            daemon=True,
+        )
+        self._stop_thread.start()
+        self._stop_poll_timer.start()
+        QTimer.singleShot(200, self._show_finishing_dialog_if_needed)
+
+    def _stop_monitor_in_background(self, monitor: MicrophoneLevelMonitor) -> None:
+        try:
+            monitor.stop()
+        except MicrophoneCaptureError as error:
+            self._stop_error = error
+            logger.exception("Microphone did not stop cleanly")
+
+    def _show_finishing_dialog_if_needed(self) -> None:
+        thread = self._stop_thread
+        if thread is None or not thread.is_alive() or self._finishing_dialog is not None:
+            return
+        dialog = FinishingCaptionsDialog(
+            self,
+            closing_application=self._close_after_stop,
+        )
+        dialog.finish_now_requested.connect(self._skip_remaining_captions)
+        self._finishing_dialog = dialog
+        self._update_finishing_dialog()
+        dialog.open()
+
+    def _poll_microphone_stop(self) -> None:
+        thread = self._stop_thread
+        if thread is None:
+            self._stop_poll_timer.stop()
+            return
+        if thread.is_alive():
+            self._update_finishing_dialog()
+            return
+        thread.join(timeout=0.0)
+        self._finish_microphone_stop()
+
+    def _update_finishing_dialog(self) -> None:
+        dialog = self._finishing_dialog
+        monitor = self._stopping_monitor
+        if dialog is None or monitor is None:
+            return
+        stats = getattr(monitor, "recognition_stats", None)
+        if stats is None:
+            dialog.update_progress(
+                remaining_captions=0,
+                estimated_seconds=None,
+            )
+            return
+        remaining = stats.queued_segments + stats.active_segments
+        dialog.update_progress(
+            remaining_captions=remaining,
+            estimated_seconds=self._estimated_recognition_seconds(stats),
+        )
+
+    @staticmethod
+    def _estimated_recognition_seconds(stats: object) -> float | None:
+        queued = int(getattr(stats, "queued_segments", 0))
+        active = int(getattr(stats, "active_segments", 0))
+        remaining = queued + active
+        if remaining <= 0:
+            return None
+
+        completed = int(getattr(stats, "completed_segments", 0))
+        failed = int(getattr(stats, "failed_segments", 0))
+        processing_seconds = float(getattr(stats, "processing_seconds", 0.0))
+        processed = completed + failed
+        average_seconds = processing_seconds / processed if processed else 10.0
+        average_seconds = max(1.0, average_seconds)
+        active_elapsed = float(getattr(stats, "active_elapsed_seconds", 0.0))
+        active_remaining = (
+            max(1.0, average_seconds - active_elapsed) if active else 0.0
+        )
+        return queued * average_seconds + active_remaining
+
+    def _skip_remaining_captions(self) -> None:
+        monitor = self._stopping_monitor
+        if monitor is None:
+            return
+        cancel = getattr(monitor, "cancel_pending_recognition", None)
+        cancelled = int(cancel()) if callable(cancel) else 0
+        logger.info("User skipped %d queued caption(s) during shutdown", cancelled)
+        if self._finishing_dialog is not None:
+            self._finishing_dialog.show_finishing_current_caption()
+
+    def _finish_microphone_stop(self) -> None:
+        monitor = self._stopping_monitor
+        dialog = self._finishing_dialog
+        after_stop = self._after_stop
+        close_after_stop = self._close_after_stop
+        show_ready = self._show_ready_after_stop
+        stop_error = self._stop_error
+
+        self._stop_poll_timer.stop()
+        self._stop_thread = None
+        self._stopping_monitor = None
+        self._stop_error = None
+        self._after_stop = None
+        self._finishing_dialog = None
+        if dialog is not None:
+            dialog.accept()
+            dialog.deleteLater()
+
         if monitor is not None:
             self._show_performance_report(
                 monitor.performance_report,
                 monitor.voice_activity_stats,
             )
 
-        self.input_level.setValue(0)
         self.speech_status.setText("Speech detection: stopped")
         self.microphone_selector.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
+        self.start_stop_button.setEnabled(True)
         self.start_stop_button.setText("Start microphone")
 
-        if show_ready:
+        if stop_error is not None:
+            self.device_status.setText(str(stop_error))
+            self.statusBar().showMessage("Microphone stop warning")
+        elif show_ready:
             self.device_status.setText("Microphone stopped. Audio was not saved.")
             self.statusBar().showMessage("Ready")
 
         if self._device_refresh_pending and show_ready:
             self._device_refresh_pending = False
             self.refresh_connected_microphones()
+        if after_stop is not None:
+            after_stop()
+        if close_after_stop:
+            self._allow_window_close = True
+            self.close()
 
     def _set_microphone_level(self, level: float) -> None:
         self.input_level.setValue(int(round(level)))
@@ -480,13 +636,20 @@ class MainWindow(QMainWindow):
         if self._normalized_device_name(active_name) not in connected_names:
             disconnected_name = active_name
             logger.warning("Active microphone disconnected: %s", disconnected_name)
-            self._stop_microphone(show_ready=False)
             self._device_refresh_pending = False
-            self.refresh_connected_microphones()
-            self.device_status.setText(
-                f"{disconnected_name} was disconnected. Microphone capture stopped."
+
+            def finish_disconnect() -> None:
+                self.refresh_connected_microphones()
+                self.device_status.setText(
+                    f"{disconnected_name} was disconnected. "
+                    "Microphone capture stopped."
+                )
+                self.statusBar().showMessage("Microphone disconnected")
+
+            self._stop_microphone(
+                show_ready=False,
+                after_stop=finish_disconnect,
             )
-            self.statusBar().showMessage("Microphone disconnected")
             return
 
         self._device_refresh_pending = True
@@ -496,8 +659,17 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Always release the audio device before the window closes."""
-        self._stop_microphone(show_ready=False)
+        """Release audio asynchronously before allowing the window to close."""
+        if self._allow_window_close:
+            super().closeEvent(event)
+            return
+        if self._microphone_monitor is not None or self._stop_thread is not None:
+            event.ignore()
+            self._stop_microphone(
+                show_ready=False,
+                close_after_stop=True,
+            )
+            return
         super().closeEvent(event)
 
 

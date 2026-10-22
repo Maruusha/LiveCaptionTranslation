@@ -224,6 +224,11 @@ class MicrophoneLevelMonitor:
                 "The microphone did not stop cleanly."
             ) from stop_error
 
+    def cancel_pending_recognition(self) -> int:
+        """Discard recognition jobs which have not started yet."""
+        worker = self.recognition_worker
+        return worker.cancel_pending() if worker is not None else 0
+
     def _handle_audio(self, input_data, _frames, _time_info, status) -> None:
         if status:
             self._warning_callback(str(status))
@@ -292,9 +297,10 @@ class MicrophoneLevelMonitor:
         recognition_stats = self.recognition_stats
         if recognition_stats is not None:
             logger.info(
-                "Speech recognition summary: queued=%d, completed=%d, failed=%d, "
-                "processing time=%.3fs",
+                "Speech recognition summary: queued=%d, active=%d, completed=%d, "
+                "failed=%d, processing time=%.3fs",
                 recognition_stats.queued_segments,
+                recognition_stats.active_segments,
                 recognition_stats.completed_segments,
                 recognition_stats.failed_segments,
                 recognition_stats.processing_seconds,

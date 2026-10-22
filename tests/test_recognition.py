@@ -58,3 +58,21 @@ def test_recognition_queue_reports_visible_overload() -> None:
     assert results[0].skipped
     assert results[0].text == "[caption skipped: processing too slow]"
     assert "behind" in warnings[0]
+
+
+def test_pending_recognition_can_be_cancelled_during_shutdown() -> None:
+    results: list[RecognitionResult] = []
+    worker = RecognitionWorker(
+        result_callback=results.append,
+        warning_callback=lambda _warning: None,
+        model_factory=lambda: None,
+        max_queued_segments=2,
+    )
+    worker.submit(speech_segment())
+    worker.submit(speech_segment(start=2_000))
+
+    assert worker.cancel_pending() == 2
+    assert worker.stats.queued_segments == 0
+    assert worker.stats.failed_segments == 2
+    assert all(result.skipped for result in results)
+    assert all("closed before processing" in result.text for result in results)

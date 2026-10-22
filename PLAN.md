@@ -298,6 +298,8 @@ Starting, Live, Pausing, Resuming, or Stopping → Error
 
 Only enable controls that are valid for the current runtime state. `Clear overlay` hides current visible bubbles but does not delete saved messages. `Delete conversation` is a separate confirmed action. Stopping stops capture, discards provisional-only work, finishes already accepted final work, marks the database session `completed`, and then returns the application to `Idle`. An unexpected shutdown has no chance to run a transition; on the next launch, recovery changes any database session still marked `live` or `paused` to `incomplete`. The history interface may display `completed` and `incomplete` as saved-session badges, but they are not live processing states.
 
+Stopping or closing must never wait for recognition on the UI thread. If accepted captions are still processing, show a responsive progress dialog with the remaining-caption count and an estimate based on recent recognition speed. The user may keep waiting or skip queued captions; a caption already inside the model is allowed to finish safely. Closing continues automatically when cleanup completes.
+
 ## 7.1 Saved Conversation History
 
 Save every caption session locally so the user can read it again later.
@@ -561,6 +563,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 
 ### Stage 2 — Voice activity detection
 
+**Status: Complete for the basic local-caption milestone (2026-10-22).**
+
 - Add Silero VAD locally.
 - Mark speech start and speech end without transcription.
 - Test quiet voices, background noise, music, and short phrases.
@@ -571,23 +575,30 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 
 **Automated evaluation on 2026-10-19:** A repeatable local command, `.venv\Scripts\python.exe -m app.diagnostics.vad_evaluation`, runs the production VAD against a project-local 60-second speech sample plus deterministic quiet-speech, strong-noise, music-tone, background-noise, and short-phrase variants. Normal and quiet speech each produced 10 useful segments. The noisy variant produced 12 useful segments and one ignored short event, so strong noise can still split one speaker turn more often. Background noise produced no speech. A music tone triggered one 164 ms boundary pair, which the 200 ms filter correctly prevented from becoming a speech chunk. The short phrase remained detected. Average inference time was about `0.17 ms` per 32 ms window, or about `0.53%` of real time, after model load. All 30 automated tests passed. These generated cases are useful regression tests but do not replace testing real French and English voices through the selected microphone.
 
-**Live-device check on 2026-10-19:** A 20-second run processed 19.936 seconds of Realtek microphone input across 623 VAD windows with no processing warnings or false speech events. The working Realtek backend returned exact silence during the test. A separate Razer headset backend check returned only a very small background-level signal. This confirms device fallback and silent-input handling, but it does not count as a spoken-voice accuracy test. Repeat after confirming that the chosen microphone is unmuted and receiving audible input.
+**Preliminary live-device check on 2026-10-19:** A 20-second run processed 19.936 seconds of Realtek microphone input across 623 VAD windows with no processing warnings or false speech events. The working Realtek backend returned exact silence during the test. A separate Razer headset backend check returned only a very small background-level signal. This confirmed device fallback and silent-input handling; the later live completion run below replaced the missing spoken-voice check.
 
-**Remaining before completion:** Speak real French and English at normal and quiet levels, play real music/background sound near the microphone, check whether starts or word endings are cut, and record visible end-to-end boundary delay and live CPU/RAM use. Stage 2 is not complete until those live checks pass.
+**Live completion test on 2026-10-22:** A 429-second microphone run produced 43 speech starts, 43 speech ends, and 43 completed chunks with no audio-queue drops and no ignored short events. VAD processed 428.832 seconds of audio across 13,401 windows. Average inference time was 1.129 ms per 32 ms window, about 3.53% of real time. The matching start/end counts and bounded queues are sufficient to conclude the basic Stage 2 milestone.
+
+**Tuning note for later testing:** The current `400 ms` end-of-speech silence sometimes creates many 1–3 second chunks during short pauses. Compare it with about `700 ms`, aiming for typical final chunks around 3–8 seconds while retaining the 30-second safety split. Longer chunks may reduce recognition overhead and uncertain language guesses, but they also delay final captions. This is a tuning experiment, not a completed setting change.
 
 **Finished when:** Speech boundaries are reliable enough to create useful audio chunks and silence does not cause constant false speech events.
 
 ### Stage 3 — French and English speech recognition
 
+**Status: Complete for the basic local-caption milestone (2026-10-22).**
+
 - Add `faster-whisper` with a small CPU INT8 model first.
-- When VAD starts a speech turn, create a rolling buffer and periodically run preview recognition on buffer snapshots.
 - When VAD ends the turn, run final recognition on the completed speech chunk.
-- Keep each turn in one stable temporary bubble, then replace it with the final caption without duplication.
-- Prevent duplicate captions.
-- Test French, English, accents, names, and mixed-language speech.
+- Keep the recognition queue bounded and show skipped work visibly.
+- Prevent duplicate final captions.
+- Test basic French and English speech locally without internet access.
 - Measure recognition delay, queue size, CPU, and RAM.
 
-**Current implementation:** `faster-whisper 1.2.1` is installed inside the project `.venv/`. PyAV is pinned to `16.0.1` because the released faster-whisper decoder is not compatible with PyAV 19 yet. The multilingual `Systran/faster-whisper-small` model is pinned to revision `2ec96c5472da50d38d40c0cfe0602af2e94b4c8a` and stored under `models/speech/faster-whisper-small/` (about 486 MB). It loads from that local path with networking disabled, using CPU INT8 and four CPU threads. Completed VAD chunks now enter a bounded eight-item background recognition queue and produce a final French or English caption in the simple interface. Queue overload creates a visible skipped-caption result instead of silently losing work. A real offline smoke test loaded the model and processed silence successfully. Rolling preview captions, stable chat bubbles, language controls, real French/English accuracy tests, and full performance measurements remain unfinished.
+**Current implementation:** `faster-whisper 1.2.1` is installed inside the project `.venv/`. PyAV is pinned to `16.0.1` because the released faster-whisper decoder is not compatible with PyAV 19 yet. The multilingual `Systran/faster-whisper-small` model is pinned to revision `2ec96c5472da50d38d40c0cfe0602af2e94b4c8a` and stored under `models/speech/faster-whisper-small/` (about 486 MB). It loads from that local path with networking disabled, using CPU INT8 and four CPU threads. Completed VAD chunks enter a bounded eight-item background recognition queue and produce final local captions. Queue overload creates a visible skipped-caption result instead of silently losing work. Stop and window-close processing now remains responsive, displays the remaining-caption count and estimated time, and allows queued captions to be skipped safely.
+
+**Live completion test on 2026-10-22:** The same 429-second run created 43 recognition jobs. Whisper completed 41 captions and the bounded queue skipped two during a dense burst, giving a 95.3% processing-completion rate with no captured-audio loss. The 41 model calls used 283.576 seconds in total, with individual captions commonly taking about 5–12 seconds. This confirms offline French/English recognition and bounded-delay behavior, but it is not a 95.3% transcription-accuracy measurement.
+
+**Known limitations deferred beyond this basic milestone:** Short or noisy chunks can produce low-confidence guesses for other languages because the model is multilingual. French/English-only language controls, broader accent/name accuracy evaluation, rolling preview captions, and stable chat bubbles remain later work in their relevant language-control and interface stages.
 
 **Finished when:** A user can speak French or English and receive readable local captions without an internet connection or an ever-growing processing delay.
 
