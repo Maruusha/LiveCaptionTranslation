@@ -81,14 +81,14 @@ class FinishingCaptionsDialog(QDialog):
         if closing_application:
             self.setWindowTitle("Finishing captions before closing")
             self.message.setText(
-                "The microphone has stopped. Accepted captions are still being "
+                "Audio capture has stopped. Accepted captions are still being "
                 "processed before the application closes."
             )
             self.finish_now_button.setText("Skip queued captions")
         else:
             self.setWindowTitle("Finishing captions")
             self.message.setText(
-                "The microphone has stopped. Accepted captions are still being "
+                "Audio capture has stopped. Accepted captions are still being "
                 "processed."
             )
             self.finish_now_button.setText("Skip remaining")
@@ -100,7 +100,7 @@ class FinishingCaptionsDialog(QDialog):
         estimated_seconds: float | None,
     ) -> None:
         if remaining_captions <= 0:
-            self.detail.setText("Releasing the microphone and finishing cleanup…")
+            self.detail.setText("Releasing the audio device and finishing cleanup…")
             return
 
         noun = "caption" if remaining_captions == 1 else "captions"

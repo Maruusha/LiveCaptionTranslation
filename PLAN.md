@@ -65,7 +65,7 @@ Use Python for the first version because it makes local speech and translation m
 |---|---|---|
 | Desktop interface | PySide6 | Settings window and caption overlay |
 | Microphone capture | sounddevice | Read microphone audio |
-| Computer-output capture | Windows WASAPI loopback | Capture sound sent to speakers or headphones |
+| Computer-output capture | SoundCard 0.4.6 / Windows WASAPI loopback | Capture sound sent to speakers or headphones |
 | Speech detection | Silero VAD | Detect when someone starts and stops speaking |
 | Speech recognition | faster-whisper | Convert French or English speech into text locally |
 | Translation | MarianMT or NLLB | Translate French ↔ English locally |
@@ -628,6 +628,14 @@ An offline smoke check translated “Hello, how are you today?” to French and 
 - Test a browser video, local media player, voice call, and game.
 - Handle device changes and unsupported capture clearly.
 - Repeat the VAD, recognition, translation, and resource tests using system audio.
+
+**Current implementation (2026-10-22):** `SoundCard 0.4.6` is installed only inside the project `.venv/` and pinned in `requirements.txt`. It enumerates the currently connected Windows playback endpoints and opens the selected endpoint as a WASAPI loopback recorder. The interface now provides the planned **Microphone** or **Computer audio** radio choice, a separate speaker/headphone selector, refresh behavior that keeps the current selection when possible, and clear startup errors for unavailable loopback devices. Only one source can run at a time.
+
+Computer audio is captured at 48 kHz in stereo, downmixed to mono, and sent into the same bounded resampling, VAD, recognition, translation, performance, and responsive-shutdown pipeline used by the microphone. Stereo capture is intentional because the SoundCard Windows backend documents a single-channel recording problem. No captured audio is written to disk.
+
+**Initial live smoke test on 2026-10-22:** The default `Headphones (Razer Barracuda X (BT))` loopback endpoint opened without warnings and delivered 24 blocks / 1.024 seconds of computer audio, with a non-zero input level. This verifies device opening and live data flow, but not caption or translation quality.
+
+**Remaining before completion:** Run real browser-video, local-player, voice-call, and game tests. Confirm device switching and disconnection behavior, French and English VAD boundaries, caption/translation quality, long-run queue behavior, CPU/RAM use, and stop/close behavior with queued work. Stage 5 remains in progress until these live checks pass.
 
 **Finished when:** Normal sound playing through the selected Windows output device produces stable translated captions.
 

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
+from app.audio.loopback import OutputAudioDevice
 from app.core.performance import PerformanceReport
 from app.main import create_application
 from app.speech.recognition import RecognitionResult, RecognitionStats
@@ -103,6 +104,16 @@ def microphone_fixture() -> list[AudioDevice]:
             host_api="Windows WASAPI",
             max_input_channels=2,
             default_sample_rate=48_000.0,
+            is_default=True,
+        )
+    ]
+
+
+def output_fixture() -> list[OutputAudioDevice]:
+    return [
+        OutputAudioDevice(
+            id="speaker-1",
+            name="Test Headphones",
             is_default=True,
         )
     ]
@@ -219,6 +230,58 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert "Recognition: 2 completed" in window.performance_summary.text()
     assert "Translation: 2 completed" in window.performance_summary.text()
 
+    window.close()
+
+
+def test_computer_audio_source_uses_the_loopback_pipeline() -> None:
+    create_application(["live-caption-translation-test"])
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def loopback_monitor_factory(
+        output_device,
+        level_callback,
+        warning_callback,
+        speech_event_callback,
+        speech_segment_callback,
+        caption_callback,
+        recognition_language,
+    ):
+        monitor = FakeMicrophoneMonitor(
+            output_device,
+            level_callback,
+            warning_callback,
+            speech_event_callback,
+            speech_segment_callback,
+            caption_callback,
+            recognition_language,
+        )
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=output_fixture,
+        loopback_monitor_factory=loopback_monitor_factory,
+    )
+    window.computer_audio_source_button.click()
+
+    assert window.microphone_selector.isHidden()
+    assert not window.output_selector.isHidden()
+    assert window.output_selector.count() == 1
+    assert window.output_selector.currentData().id == "speaker-1"
+    assert "Test Headphones" in window.output_selector.currentText()
+    assert window.start_stop_button.text() == "Start computer audio"
+
+    window.start_stop_button.click()
+    assert monitors[0].device_index.id == "speaker-1"
+    assert monitors[0].started
+    assert window.start_stop_button.text() == "Stop computer audio"
+    assert not window.computer_audio_source_button.isEnabled()
+
+    window.start_stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.start_stop_button.text() == "Start computer audio"
+    assert window.computer_audio_source_button.isEnabled()
     window.close()
 
 

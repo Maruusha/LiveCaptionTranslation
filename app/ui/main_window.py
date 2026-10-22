@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QFont, QStandardItemModel
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +29,12 @@ from app.audio.devices import (
     refresh_input_devices,
 )
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
+from app.audio.loopback import (
+    LoopbackCaptureMonitor,
+    OutputAudioDevice,
+    list_output_devices,
+    refresh_output_devices,
+)
 from app.core.performance import PerformanceReport, format_mebibytes
 from app.speech.recognition import RecognitionStats
 from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
@@ -46,6 +54,18 @@ MonitorFactory = Callable[
     ],
     MicrophoneLevelMonitor,
 ]
+LoopbackMonitorFactory = Callable[
+    [
+        OutputAudioDevice,
+        Callable[[float], None],
+        Callable[[str], None],
+        Callable[[SpeechEvent], None],
+        Callable[[SpeechSegment], None],
+        Callable[[TranslationResult], None],
+        str | None,
+    ],
+    LoopbackCaptureMonitor,
+]
 
 logger = logging.getLogger(__name__)
 
@@ -64,17 +84,29 @@ class MainWindow(QMainWindow):
         device_provider: Callable[[], list[AudioDevice]] | None = None,
         monitor_factory: MonitorFactory | None = None,
         connected_name_provider: Callable[[], set[str]] | None = None,
+        output_device_provider: Callable[[], list[OutputAudioDevice]] | None = None,
+        loopback_monitor_factory: LoopbackMonitorFactory | None = None,
     ) -> None:
         super().__init__()
         self._device_provider = device_provider or list_input_devices
         self._refresh_device_provider = device_provider or refresh_input_devices
         self._monitor_factory = monitor_factory or MicrophoneLevelMonitor
+        self._output_device_provider = output_device_provider or list_output_devices
+        self._refresh_output_device_provider = (
+            output_device_provider or refresh_output_devices
+        )
+        self._loopback_monitor_factory = (
+            loopback_monitor_factory or LoopbackCaptureMonitor
+        )
         self._connected_name_provider = (
             connected_name_provider or self._qt_connected_microphone_names
         )
         self._microphone_monitor: MicrophoneLevelMonitor | None = None
+        self._active_source: str | None = None
         self._active_microphone_name: str | None = None
+        self._active_output_id: str | None = None
         self._device_refresh_pending = False
+        self._outputs_loaded = False
         self._completed_speech_chunks = 0
         self._stopping_monitor: MicrophoneLevelMonitor | None = None
         self._stop_thread: Thread | None = None
@@ -95,6 +127,9 @@ class MainWindow(QMainWindow):
         self._media_devices.audioInputsChanged.connect(
             self._handle_connected_microphones_changed
         )
+        self._media_devices.audioOutputsChanged.connect(
+            self._handle_connected_outputs_changed
+        )
 
         self.setObjectName("mainWindow")
         self.setWindowTitle(APP_NAME)
@@ -110,20 +145,44 @@ class MainWindow(QMainWindow):
         title_font.setBold(True)
         title.setFont(title_font)
 
-        message = QLabel("Choose the microphone that will provide live speech.")
+        message = QLabel("Choose where the live speech will come from.")
         message.setObjectName("welcomeMessage")
         message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.microphone_source_button = QRadioButton("Microphone")
+        self.microphone_source_button.setObjectName("microphoneSourceButton")
+        self.computer_audio_source_button = QRadioButton("Computer audio")
+        self.computer_audio_source_button.setObjectName("computerAudioSourceButton")
+        self.microphone_source_button.setChecked(True)
+        self.source_button_group = QButtonGroup(self)
+        self.source_button_group.addButton(self.microphone_source_button)
+        self.source_button_group.addButton(self.computer_audio_source_button)
+        self.source_button_group.buttonToggled.connect(self._handle_source_changed)
+
+        source_layout = QHBoxLayout()
+        source_layout.addWidget(QLabel("Audio source:"))
+        source_layout.addWidget(self.microphone_source_button)
+        source_layout.addWidget(self.computer_audio_source_button)
+        source_layout.addStretch()
 
         self.microphone_selector = QComboBox()
         self.microphone_selector.setObjectName("microphoneSelector")
         self.microphone_selector.setMinimumWidth(360)
 
+        self.output_selector = QComboBox()
+        self.output_selector.setObjectName("computerAudioSelector")
+        self.output_selector.setMinimumWidth(360)
+        self.output_selector.addItem("Select Computer audio to load devices")
+        self.output_selector.setEnabled(False)
+        self.output_selector.setVisible(False)
+
         self.refresh_devices_button = QPushButton("Refresh")
         self.refresh_devices_button.setObjectName("refreshMicrophonesButton")
-        self.refresh_devices_button.clicked.connect(self.refresh_connected_microphones)
+        self.refresh_devices_button.clicked.connect(self.refresh_selected_devices)
 
         selector_layout = QHBoxLayout()
         selector_layout.addWidget(self.microphone_selector, stretch=1)
+        selector_layout.addWidget(self.output_selector, stretch=1)
         selector_layout.addWidget(self.refresh_devices_button)
 
         self.device_status = QLabel()
@@ -172,8 +231,9 @@ class MainWindow(QMainWindow):
         self.start_stop_button.setMinimumHeight(48)
         self.start_stop_button.clicked.connect(self.toggle_microphone)
 
-        microphone_group = QGroupBox("Microphone")
+        microphone_group = QGroupBox("Live audio")
         microphone_layout = QVBoxLayout()
+        microphone_layout.addLayout(source_layout)
         microphone_layout.addLayout(language_layout)
         microphone_layout.addLayout(caption_view_layout)
         microphone_layout.addLayout(selector_layout)
@@ -310,7 +370,7 @@ class MainWindow(QMainWindow):
 
     def refresh_connected_microphones(self) -> None:
         """Restart device discovery and rebuild the visible microphone list."""
-        if self._microphone_monitor is not None:
+        if self._microphone_monitor is not None or self._stop_thread is not None:
             return
 
         self.refresh_devices_button.setEnabled(False)
@@ -325,45 +385,177 @@ class MainWindow(QMainWindow):
             self.refresh_devices_button.setText("Refresh")
             self.refresh_devices_button.setEnabled(True)
 
+    def refresh_outputs(
+        self,
+        provider: Callable[[], list[OutputAudioDevice]] | None = None,
+        refreshed: bool = False,
+    ) -> None:
+        """Reload connected Windows speaker and headphone endpoints."""
+        selected = self.output_selector.currentData()
+        selected_id = selected.id if isinstance(selected, OutputAudioDevice) else None
+        self.output_selector.clear()
+        try:
+            devices = (provider or self._output_device_provider)()
+        except MicrophoneCaptureError as error:
+            logger.exception("Computer audio device discovery failed")
+            self.output_selector.addItem("Computer audio check failed")
+            self.output_selector.setEnabled(False)
+            self.start_stop_button.setEnabled(False)
+            self.device_status.setText(str(error))
+            self.statusBar().showMessage("Computer audio discovery failed")
+            self._outputs_loaded = True
+            return
+
+        self._outputs_loaded = True
+        if not devices:
+            self.output_selector.addItem("No output devices found")
+            self.output_selector.setEnabled(False)
+            self.start_stop_button.setEnabled(False)
+            self.device_status.setText(
+                "Connect speakers or headphones, then refresh."
+            )
+            self.statusBar().showMessage("No computer audio device found")
+            return
+
+        for device in devices:
+            self.output_selector.addItem(device.display_name, userData=device)
+        if selected_id is not None:
+            for index, device in enumerate(devices):
+                if device.id == selected_id:
+                    self.output_selector.setCurrentIndex(index)
+                    break
+
+        self.output_selector.setEnabled(True)
+        self.start_stop_button.setEnabled(True)
+        noun = "device" if len(devices) == 1 else "devices"
+        self.device_status.setText(
+            f"Found {len(devices)} connected computer audio {noun}."
+        )
+        self.statusBar().showMessage("Ready")
+        if refreshed:
+            logger.info(
+                "Computer audio list refreshed: %d connected device(s): %s",
+                len(devices),
+                ", ".join(device.name for device in devices),
+            )
+
+    def refresh_connected_outputs(self) -> None:
+        if self._microphone_monitor is not None or self._stop_thread is not None:
+            return
+        self.refresh_devices_button.setEnabled(False)
+        self.refresh_devices_button.setText("Refreshing…")
+        self.statusBar().showMessage("Refreshing computer audio list…")
+        try:
+            self.refresh_outputs(
+                provider=self._refresh_output_device_provider,
+                refreshed=True,
+            )
+        finally:
+            self.refresh_devices_button.setText("Refresh")
+            self.refresh_devices_button.setEnabled(True)
+
+    def refresh_selected_devices(self) -> None:
+        if self.computer_audio_source_button.isChecked():
+            self.refresh_connected_outputs()
+        else:
+            self.refresh_connected_microphones()
+
+    def _handle_source_changed(self, _button, checked: bool) -> None:
+        if not checked or self._microphone_monitor is not None:
+            return
+        computer_audio = self.computer_audio_source_button.isChecked()
+        self.microphone_selector.setVisible(not computer_audio)
+        self.output_selector.setVisible(computer_audio)
+        if computer_audio and not self._outputs_loaded:
+            self.refresh_outputs()
+        elif computer_audio:
+            self.start_stop_button.setEnabled(self.output_selector.isEnabled())
+            self.device_status.setText(
+                f"Selected computer audio: {self.output_selector.currentText()}."
+            )
+            self.statusBar().showMessage("Ready")
+        else:
+            self.start_stop_button.setEnabled(self.microphone_selector.isEnabled())
+            self.device_status.setText(
+                f"Found {self.microphone_selector.count()} connected "
+                f"{'microphone' if self.microphone_selector.count() == 1 else 'microphones'}."
+            )
+            self.statusBar().showMessage("Ready")
+        self.start_stop_button.setText(
+            "Start computer audio" if computer_audio else "Start microphone"
+        )
+
     def toggle_microphone(self) -> None:
-        """Start or stop the caption pipeline for the selected microphone."""
+        """Start or stop the caption pipeline for the selected audio source."""
         if self._microphone_monitor is not None:
             self._stop_microphone()
             return
 
-        selected_device = self.microphone_selector.currentData()
-        if not isinstance(selected_device, AudioDevice):
-            self.statusBar().showMessage("Select a microphone first")
-            return
-
-        monitor = self._monitor_factory(
-            selected_device.input_indices,
-            self.microphone_level_received.emit,
-            self.microphone_warning_received.emit,
-            self.speech_event_received.emit,
-            self.speech_segment_received.emit,
-            self.caption_received.emit,
-            self.language_selector.currentData(),
-        )
+        computer_audio = self.computer_audio_source_button.isChecked()
+        if computer_audio:
+            selected_output = self.output_selector.currentData()
+            if not isinstance(selected_output, OutputAudioDevice):
+                self.statusBar().showMessage("Select a computer audio device first")
+                return
+            monitor = self._loopback_monitor_factory(
+                selected_output,
+                self.microphone_level_received.emit,
+                self.microphone_warning_received.emit,
+                self.speech_event_received.emit,
+                self.speech_segment_received.emit,
+                self.caption_received.emit,
+                self.language_selector.currentData(),
+            )
+            selected_name = selected_output.name
+            active_source = "computer_audio"
+        else:
+            selected_device = self.microphone_selector.currentData()
+            if not isinstance(selected_device, AudioDevice):
+                self.statusBar().showMessage("Select a microphone first")
+                return
+            monitor = self._monitor_factory(
+                selected_device.input_indices,
+                self.microphone_level_received.emit,
+                self.microphone_warning_received.emit,
+                self.speech_event_received.emit,
+                self.speech_segment_received.emit,
+                self.caption_received.emit,
+                self.language_selector.currentData(),
+            )
+            selected_name = selected_device.name
+            active_source = "microphone"
 
         try:
             monitor.start()
         except MicrophoneCaptureError as error:
             self.input_level.setValue(0)
             self.device_status.setText(str(error))
-            self.statusBar().showMessage("Microphone could not start")
+            self.statusBar().showMessage("Audio capture could not start")
             return
 
         self._microphone_monitor = monitor
-        self._active_microphone_name = selected_device.name
+        self._active_source = active_source
+        self._active_microphone_name = (
+            selected_name if active_source == "microphone" else None
+        )
+        self._active_output_id = (
+            selected_output.id if active_source == "computer_audio" else None
+        )
+        self.microphone_source_button.setEnabled(False)
+        self.computer_audio_source_button.setEnabled(False)
         self.microphone_selector.setEnabled(False)
+        self.output_selector.setEnabled(False)
         self.language_selector.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
-        self.start_stop_button.setText("Stop microphone")
-        self.device_status.setText(
-            f"Listening to {self.microphone_selector.currentText()}. Audio is not saved."
+        self.start_stop_button.setText(
+            "Stop computer audio" if computer_audio else "Stop microphone"
         )
-        self.statusBar().showMessage("Microphone active")
+        self.device_status.setText(
+            f"Listening to {selected_name}. Audio is not saved."
+        )
+        self.statusBar().showMessage(
+            "Computer audio active" if computer_audio else "Microphone active"
+        )
         self.speech_status.setText("Speech detection: listening…")
         self._completed_speech_chunks = 0
         self.speech_turn_status.setText("Completed speech chunks: 0")
@@ -398,7 +590,9 @@ class MainWindow(QMainWindow):
             return
 
         self._microphone_monitor = None
+        self._active_source = None
         self._active_microphone_name = None
+        self._active_output_id = None
         self._performance_timer.stop()
         self.input_level.setValue(0)
         self.speech_status.setText("Speech detection: finishing captions…")
@@ -568,22 +762,38 @@ class MainWindow(QMainWindow):
             )
 
         self.speech_status.setText("Speech detection: stopped")
-        self.microphone_selector.setEnabled(True)
+        computer_audio = self.computer_audio_source_button.isChecked()
+        self.microphone_source_button.setEnabled(True)
+        self.computer_audio_source_button.setEnabled(True)
+        self.microphone_selector.setEnabled(
+            not computer_audio
+            and isinstance(self.microphone_selector.currentData(), AudioDevice)
+        )
+        self.output_selector.setEnabled(
+            computer_audio
+            and isinstance(self.output_selector.currentData(), OutputAudioDevice)
+        )
         self.language_selector.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
-        self.start_stop_button.setEnabled(True)
-        self.start_stop_button.setText("Start microphone")
+        self.start_stop_button.setEnabled(
+            self.output_selector.isEnabled()
+            if computer_audio
+            else self.microphone_selector.isEnabled()
+        )
+        self.start_stop_button.setText(
+            "Start computer audio" if computer_audio else "Start microphone"
+        )
 
         if stop_error is not None:
             self.device_status.setText(str(stop_error))
             self.statusBar().showMessage("Microphone stop warning")
         elif show_ready:
-            self.device_status.setText("Microphone stopped. Audio was not saved.")
+            self.device_status.setText("Audio capture stopped. Audio was not saved.")
             self.statusBar().showMessage("Ready")
 
         if self._device_refresh_pending and show_ready:
             self._device_refresh_pending = False
-            self.refresh_connected_microphones()
+            self.refresh_selected_devices()
         if after_stop is not None:
             after_stop()
         if close_after_stop:
@@ -734,9 +944,12 @@ class MainWindow(QMainWindow):
 
     def _handle_connected_microphones_changed(self) -> None:
         """React to microphone connection changes reported by Windows and Qt."""
+        if self._active_source == "computer_audio":
+            return
         active_name = self._active_microphone_name
         if active_name is None:
-            self.refresh_connected_microphones()
+            if self.microphone_source_button.isChecked():
+                self.refresh_connected_microphones()
             return
 
         connected_names = {
@@ -766,6 +979,48 @@ class MainWindow(QMainWindow):
         logger.info("Audio devices changed while microphone capture is active")
         self.statusBar().showMessage(
             "Audio devices changed; the list will refresh after capture stops"
+        )
+
+    def _handle_connected_outputs_changed(self) -> None:
+        """React to speaker and headphone connection changes reported by Qt."""
+        if self._active_source == "microphone":
+            return
+        active_output_id = self._active_output_id
+        if active_output_id is None:
+            if self.computer_audio_source_button.isChecked() and self._outputs_loaded:
+                self.refresh_connected_outputs()
+            return
+
+        try:
+            connected_ids = {
+                device.id for device in self._output_device_provider()
+            }
+        except MicrophoneCaptureError as error:
+            logger.warning("Could not verify computer audio devices: %s", error)
+            self.statusBar().showMessage("Computer audio device check failed")
+            return
+        if active_output_id not in connected_ids:
+            logger.warning("Active computer audio device disconnected")
+            self._device_refresh_pending = False
+
+            def finish_disconnect() -> None:
+                self.refresh_connected_outputs()
+                self.device_status.setText(
+                    "The selected computer audio device was disconnected. "
+                    "Capture stopped."
+                )
+                self.statusBar().showMessage("Computer audio disconnected")
+
+            self._stop_microphone(
+                show_ready=False,
+                after_stop=finish_disconnect,
+            )
+            return
+
+        self._device_refresh_pending = True
+        logger.info("Computer audio devices changed while capture is active")
+        self.statusBar().showMessage(
+            "Computer audio devices changed; the list will refresh after capture stops"
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
