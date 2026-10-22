@@ -26,6 +26,8 @@ from app.speech.vad import VoiceActivityStats
 from app.translation.translator import TranslationResult, TranslationStats
 from app.ui.history_sidebar import LIVE_ITEM_KEY
 from app.ui.main_window import MainWindow
+from app.ui.caption_overlay import OverlayAppearance
+from app.ui.overlay_settings import MemorySettings
 
 
 class FakeMicrophoneMonitor:
@@ -172,6 +174,7 @@ def test_main_window_starts_ready() -> None:
     assert window.start_stop_button.minimumHeight() == 48
     assert window.to_bottom_button.text() == "To bottom"
     assert window.overlay_toggle_button.text() == "Show overlay"
+    assert window.overlay_settings_button.text() == "Overlay settings"
     assert not window.caption_overlay.isVisible()
     assert window.runtime_state is RuntimeState.IDLE
 
@@ -191,6 +194,36 @@ def test_main_window_starts_ready() -> None:
     assert not window.caption_overlay.isVisible()
 
     window.close()
+
+
+def test_overlay_appearance_and_geometry_persist_between_windows() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+    expected = OverlayAppearance(
+        font_size=19,
+        text_colour="#aabbcc",
+        background_colour="#112233",
+        opacity_percent=70,
+        click_through=False,
+    )
+    window.caption_overlay.apply_appearance(expected)
+    window.caption_overlay.resize(640, 190)
+    window._save_overlay_settings()
+    window.close()
+
+    restored = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+
+    assert restored.caption_overlay.appearance == expected
+    assert restored.caption_overlay.size().width() == 640
+    assert restored.caption_overlay.size().height() == 190
+    restored.close()
 
 
 def test_microphone_controls_start_update_and_stop() -> None:

@@ -197,7 +197,7 @@ class CaptionChatView(QScrollArea):
         self._bubbles.append(bubble)
 
         if was_at_bottom:
-            QTimer.singleShot(0, self.scroll_to_bottom)
+            QTimer.singleShot(0, self, self.scroll_to_bottom)
         return bubble
 
     def set_display_mode(self, mode: str) -> None:

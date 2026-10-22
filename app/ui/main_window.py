@@ -54,6 +54,15 @@ from app.ui.caption_overlay import CaptionOverlay
 from app.ui.chat_view import CaptionChatView
 from app.ui.finishing_dialog import FinishingCaptionsDialog
 from app.ui.history_sidebar import ConversationSidebar, LIVE_ITEM_KEY
+from app.ui.overlay_settings import (
+    OverlaySettingsDialog,
+    SettingsBackend,
+    create_interface_settings,
+    load_overlay_appearance,
+    load_overlay_geometry,
+    save_overlay_appearance,
+    save_overlay_geometry,
+)
 
 
 MonitorFactory = Callable[
@@ -108,10 +117,12 @@ class MainWindow(QMainWindow):
         output_device_provider: Callable[[], list[OutputAudioDevice]] | None = None,
         loopback_monitor_factory: LoopbackMonitorFactory | None = None,
         history_database: HistoryDatabase | None = None,
+        interface_settings: SettingsBackend | None = None,
     ) -> None:
         super().__init__()
         self._runtime = RuntimeStateMachine()
         self._history = history_database or HistoryDatabase()
+        self._interface_settings = interface_settings or create_interface_settings()
         recovered_sessions = self._history.recover_interrupted_sessions()
         if recovered_sessions:
             logger.info(
@@ -360,6 +371,12 @@ class MainWindow(QMainWindow):
 
         self.caption_chat = CaptionChatView()
         self.caption_overlay = CaptionOverlay(self)
+        self.caption_overlay.apply_appearance(
+            load_overlay_appearance(self._interface_settings)
+        )
+        overlay_geometry = load_overlay_geometry(self._interface_settings)
+        if overlay_geometry is not None:
+            self.caption_overlay.restoreGeometry(overlay_geometry)
         self.caption_overlay.hidden_by_user.connect(
             self._handle_overlay_hidden_by_user
         )
@@ -370,6 +387,9 @@ class MainWindow(QMainWindow):
         self.overlay_toggle_button.setObjectName("overlayToggleButton")
         self.overlay_toggle_button.setCheckable(True)
         self.overlay_toggle_button.toggled.connect(self._toggle_caption_overlay)
+        self.overlay_settings_button = QPushButton("Overlay settings")
+        self.overlay_settings_button.setObjectName("overlaySettingsButton")
+        self.overlay_settings_button.clicked.connect(self._open_overlay_settings)
         self.clear_captions_button = QPushButton("Clear screen")
         self.clear_captions_button.setObjectName("clearCaptionsButton")
         self.clear_captions_button.clicked.connect(self._clear_caption_screen)
@@ -379,6 +399,7 @@ class MainWindow(QMainWindow):
 
         chat_actions = QHBoxLayout()
         chat_actions.addWidget(self.overlay_toggle_button)
+        chat_actions.addWidget(self.overlay_settings_button)
         chat_actions.addStretch()
         chat_actions.addWidget(self.to_bottom_button)
         chat_actions.addWidget(self.clear_captions_button)
@@ -1314,10 +1335,33 @@ class MainWindow(QMainWindow):
             "Hide overlay" if visible else "Show overlay"
         )
         if visible:
+            self.caption_overlay.ensure_visible_on_screen()
             self.caption_overlay.show()
             self.caption_overlay.raise_()
         else:
+            self._save_overlay_settings()
             self.caption_overlay.hide()
+
+    def _open_overlay_settings(self) -> None:
+        dialog = OverlaySettingsDialog(self.caption_overlay.appearance, self)
+        if not dialog.exec():
+            return
+        self.caption_overlay.apply_appearance(dialog.appearance)
+        save_overlay_appearance(
+            self._interface_settings,
+            self.caption_overlay.appearance,
+        )
+        self._interface_settings.sync()
+
+    def _save_overlay_settings(self) -> None:
+        save_overlay_appearance(
+            self._interface_settings,
+            self.caption_overlay.appearance,
+        )
+        save_overlay_geometry(
+            self._interface_settings,
+            self.caption_overlay.saveGeometry(),
+        )
 
     def _handle_overlay_hidden_by_user(self) -> None:
         self.overlay_toggle_button.setChecked(False)
@@ -1482,6 +1526,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release audio asynchronously before allowing the window to close."""
         if self._allow_window_close:
+            self._save_overlay_settings()
             self.caption_overlay.hide()
             super().closeEvent(event)
             return
@@ -1492,6 +1537,7 @@ class MainWindow(QMainWindow):
                 close_after_stop=True,
             )
             return
+        self._save_overlay_settings()
         self.caption_overlay.hide()
         super().closeEvent(event)
 

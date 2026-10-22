@@ -2,11 +2,50 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QSizeGrip,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.ui.chat_view import format_caption_text
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayAppearance:
+    """User-controlled overlay presentation values."""
+
+    font_size: int = 13
+    text_colour: str = "#ffffff"
+    background_colour: str = "#14181c"
+    opacity_percent: int = 88
+    click_through: bool = False
+
+    def normalized(self) -> "OverlayAppearance":
+        """Return safe values even if a saved settings file was edited."""
+
+        text_colour = QColor(self.text_colour)
+        background_colour = QColor(self.background_colour)
+        return OverlayAppearance(
+            font_size=max(10, min(30, int(self.font_size))),
+            text_colour=(
+                text_colour.name() if text_colour.isValid() else "#ffffff"
+            ),
+            background_colour=(
+                background_colour.name()
+                if background_colour.isValid()
+                else "#14181c"
+            ),
+            opacity_percent=max(30, min(100, int(self.opacity_percent))),
+            click_through=bool(self.click_through),
+        )
 
 
 class CaptionOverlay(QWidget):
@@ -30,16 +69,10 @@ class CaptionOverlay(QWidget):
         self._display_mode = "both"
         self._message: dict[str, str | bool | None] | None = None
         self._drag_offset: QPoint | None = None
+        self._appearance = OverlayAppearance()
 
-        panel = QFrame()
-        panel.setObjectName("captionOverlayPanel")
-        panel.setStyleSheet(
-            "QFrame#captionOverlayPanel {"
-            "background-color: rgba(20, 24, 28, 225);"
-            "border: 1px solid rgba(255, 255, 255, 80);"
-            "border-radius: 12px;"
-            "}"
-        )
+        self.panel = QFrame()
+        self.panel.setObjectName("captionOverlayPanel")
 
         self.header_label = QLabel("Live captions · drag to move")
         self.header_label.setObjectName("captionOverlayHeader")
@@ -57,15 +90,89 @@ class CaptionOverlay(QWidget):
         self.caption_label.setFont(caption_font)
         self.caption_label.setStyleSheet("color: #ffffff;")
 
-        panel_layout = QVBoxLayout(panel)
+        panel_layout = QVBoxLayout(self.panel)
         panel_layout.setContentsMargins(16, 12, 16, 14)
         panel_layout.setSpacing(7)
         panel_layout.addWidget(self.header_label)
         panel_layout.addWidget(self.caption_label, stretch=1)
+        grip_row = QHBoxLayout()
+        grip_row.setContentsMargins(0, 0, 0, 0)
+        grip_row.addStretch()
+        self.size_grip = QSizeGrip(self.panel)
+        self.size_grip.setObjectName("captionOverlaySizeGrip")
+        grip_row.addWidget(self.size_grip)
+        panel_layout.addLayout(grip_row)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.addWidget(panel)
+        layout.addWidget(self.panel)
+        self.apply_appearance(self._appearance)
+
+    @property
+    def appearance(self) -> OverlayAppearance:
+        return self._appearance
+
+    def apply_appearance(self, appearance: OverlayAppearance) -> None:
+        """Apply validated appearance values to the live overlay."""
+
+        self._appearance = appearance.normalized()
+        colour = QColor(self._appearance.background_colour)
+        alpha = round(255 * self._appearance.opacity_percent / 100)
+        self.panel.setStyleSheet(
+            "QFrame#captionOverlayPanel {"
+            f"background-color: rgba({colour.red()}, {colour.green()}, "
+            f"{colour.blue()}, {alpha});"
+            "border: 1px solid rgba(255, 255, 255, 80);"
+            "border-radius: 12px;"
+            "}"
+        )
+        caption_font = self.caption_label.font()
+        caption_font.setPointSize(self._appearance.font_size)
+        caption_font.setBold(True)
+        self.caption_label.setFont(caption_font)
+        click_through_changed = (
+            self.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            != self._appearance.click_through
+        )
+        was_visible = self.isVisible()
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            self._appearance.click_through,
+        )
+        if click_through_changed:
+            self.setWindowFlag(
+                Qt.WindowType.WindowTransparentForInput,
+                self._appearance.click_through,
+            )
+            if was_visible:
+                self.show()
+        self._render_colours()
+
+    def ensure_visible_on_screen(self) -> None:
+        """Move a restored overlay back if its old monitor is unavailable."""
+
+        frame = self.frameGeometry()
+        screens = QGuiApplication.screens()
+        if any(frame.intersects(screen.availableGeometry()) for screen in screens):
+            return
+        primary = QGuiApplication.primaryScreen()
+        if primary is None:
+            return
+        available = primary.availableGeometry()
+        self.move(
+            available.center().x() - self.width() // 2,
+            available.bottom() - self.height() - 40,
+        )
+
+    def _render_colours(self) -> None:
+        warning = bool(self._message and self._message["warning"])
+        colour = "#ffd166" if warning else self._appearance.text_colour
+        self.caption_label.setStyleSheet(f"color: {colour};")
+        header_colour = QColor(self._appearance.text_colour)
+        header_colour.setAlpha(180)
+        self.header_label.setStyleSheet(
+            f"color: {header_colour.name(QColor.NameFormat.HexArgb)};"
+        )
 
     def set_message(
         self,
@@ -99,7 +206,7 @@ class CaptionOverlay(QWidget):
         self._message = None
         self.header_label.setText("Live captions · drag to move")
         self.caption_label.setText("Waiting for a live caption…")
-        self.caption_label.setStyleSheet("color: #ffffff;")
+        self._render_colours()
 
     def _render_message(self) -> None:
         message = self._message
@@ -119,8 +226,7 @@ class CaptionOverlay(QWidget):
                 mode=self._display_mode,
             )
         )
-        colour = "#ffd166" if bool(message["warning"]) else "#ffffff"
-        self.caption_label.setStyleSheet(f"color: {colour};")
+        self._render_colours()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
