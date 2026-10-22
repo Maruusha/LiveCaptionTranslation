@@ -610,6 +610,14 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 - Show original and translated text.
 - Measure translation quality and added delay in both directions.
 
+**Current implementation (2026-10-21):** Use the official directional `Helsinki-NLP/opus-mt-en-fr` and `Helsinki-NLP/opus-mt-fr-en` Marian models instead of a much larger multilingual model. The source revisions are pinned to `dd7f6540a7a48a7f4db59e5c0b9c42c8eea67f18` and `c4aed37b318c763fd177aa449b44e3b783cc6c02`. Both were converted locally to CTranslate2 INT8 and stored under `models/translation/`; each installed direction is about 75.7 MiB. Runtime translation uses the existing CPU CTranslate2 library plus project-local `sentencepiece 0.2.2`, loads only the direction needed, and does not access the network.
+
+Final recognition results now enter a bounded eight-caption translation queue. Recognition and audio capture are not blocked while translation runs. Queue overload or model errors preserve the original caption and show a visible translation warning. The interface provides **Automatic**, **French**, and **English** spoken-language modes and can show both texts, only the original, or only the translation. Translation queue counts, failures, and total processing time appear in the simple Performance view and diagnostic log.
+
+An offline smoke check translated “Hello, how are you today?” to French and “Bonjour, comment allez-vous aujourd’hui ?” to English. Model loading took about `0.36–0.41 seconds`; translations took about `0.04 seconds` on this computer. These are development measurements, not a quality benchmark. All 34 automated tests passed after integration.
+
+**Remaining before completion:** The separate testing branch should check real recognized captions in both directions, accents, names, numbers, punctuation, longer speech, automatic-language mistakes, repeated direction switching, offline use, and live CPU/RAM/latency. Tune or replace the models only if those checks show unacceptable quality.
+
 **Finished when:** Final French captions receive useful English translations and final English captions receive useful French translations without preventing live transcription.
 
 ### Stage 5 — Computer-output capture

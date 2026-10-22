@@ -81,12 +81,16 @@ class RecognitionWorker:
         warning_callback: Callable[[str], None],
         model_factory: Callable[[], WhisperLikeModel] = create_faster_whisper_model,
         max_queued_segments: int = 8,
+        language: str | None = None,
     ) -> None:
         if max_queued_segments <= 0:
             raise ValueError("max_queued_segments must be greater than zero.")
+        if language not in {None, "en", "fr"}:
+            raise ValueError("language must be None, 'en', or 'fr'.")
         self._result_callback = result_callback
         self._warning_callback = warning_callback
         self._model_factory = model_factory
+        self._language = language
         self._queue: Queue[SpeechSegment] = Queue(maxsize=max_queued_segments)
         self._stop_event = Event()
         self._thread: Thread | None = None
@@ -142,7 +146,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text="[caption skipped: processing too slow]",
-                    language=None,
+                    language=self._language,
                     language_probability=None,
                     processing_seconds=0.0,
                     skipped=True,
@@ -212,7 +216,7 @@ class RecognitionWorker:
                 parts, info = model.transcribe(
                     segment.samples,
                     task="transcribe",
-                    language=None,
+                    language=self._language,
                     beam_size=1,
                     vad_filter=False,
                     condition_on_previous_text=False,
@@ -226,7 +230,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text=text,
-                    language=getattr(info, "language", None),
+                    language=self._language or getattr(info, "language", None),
                     language_probability=getattr(info, "language_probability", None),
                     processing_seconds=processing_seconds,
                 )
@@ -240,7 +244,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text="[caption unavailable]",
-                    language=None,
+                    language=self._language,
                     language_probability=None,
                     processing_seconds=processing_seconds,
                     error=str(error),
@@ -266,7 +270,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text="[caption unavailable]",
-                    language=None,
+                    language=self._language,
                     language_probability=None,
                     processing_seconds=0.0,
                     error=message,

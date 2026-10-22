@@ -20,6 +20,7 @@ def test_recognition_worker_transcribes_a_completed_chunk() -> None:
         def transcribe(self, audio, **options):
             assert audio.size == 1_600
             assert options["beam_size"] == 1
+            assert options["language"] is None
             return iter(
                 [SimpleNamespace(text=" Bonjour "), SimpleNamespace(text="le monde")]
             ), SimpleNamespace(language="fr", language_probability=0.98)
@@ -76,3 +77,27 @@ def test_pending_recognition_can_be_cancelled_during_shutdown() -> None:
     assert worker.stats.failed_segments == 2
     assert all(result.skipped for result in results)
     assert all("closed before processing" in result.text for result in results)
+
+
+def test_recognition_worker_uses_a_manual_language() -> None:
+    results: list[RecognitionResult] = []
+
+    class FakeModel:
+        def transcribe(self, _audio, **options):
+            assert options["language"] == "fr"
+            return iter([SimpleNamespace(text=" Bonjour")]), SimpleNamespace(
+                language="en",
+                language_probability=0.25,
+            )
+
+    worker = RecognitionWorker(
+        result_callback=results.append,
+        warning_callback=lambda _warning: None,
+        model_factory=FakeModel,
+        language="fr",
+    )
+    worker.start()
+    worker.submit(speech_segment())
+    worker.stop()
+
+    assert results[0].language == "fr"
