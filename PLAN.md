@@ -653,6 +653,10 @@ Computer audio is captured at 48 kHz in stereo, downmixed to mono, and sent into
 - Flush already accepted speech safely when stopping.
 - Test repeated pause and resume operations.
 
+**Current implementation (first slice, 2026-10-22):** The application now has one explicit runtime state machine with `idle`, `starting`, `live`, `pausing`, `paused`, `resuming`, `stopping`, and `error` states. Invalid transitions raise a clear internal error instead of silently creating contradictory UI and capture state. The existing start, successful live capture, asynchronous stop, and capture-start failure paths now report through this state machine. Pause and resume transitions are defined and tested at the core level but are not connected to buttons or audio control yet. All 50 automated tests pass.
+
+**Next slice:** Add separate Pause/Resume and Stop controls, stop accepting audio immediately at the pause boundary, settle already accepted work in the background, and resume the same in-memory session without resetting its captions or counters.
+
 **Finished when:** Session controls behave consistently without losing finished messages, duplicating audio, or creating unintended sessions.
 
 ### Stage 7 — Main chat interface and overlay

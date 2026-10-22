@@ -15,7 +15,9 @@ from PySide6.QtWidgets import QApplication
 from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
 from app.audio.loopback import OutputAudioDevice
+from app.audio.microphone import MicrophoneCaptureError
 from app.core.performance import PerformanceReport
+from app.core.state import RuntimeState
 from app.main import create_application
 from app.speech.recognition import RecognitionResult, RecognitionStats
 from app.speech.vad import VoiceActivityStats
@@ -147,6 +149,7 @@ def test_main_window_starts_ready() -> None:
     assert window.language_selector.currentText() == "Automatic"
     assert window.caption_view_selector.currentText() == "Original and translation"
     assert window.start_stop_button.minimumHeight() == 48
+    assert window.runtime_state is RuntimeState.IDLE
 
     window.close()
 
@@ -185,6 +188,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert monitors[0].device_index == (12,)
     assert monitors[0].recognition_language is None
     assert monitors[0].started
+    assert window.runtime_state is RuntimeState.LIVE
     assert window.start_stop_button.text() == "Stop microphone"
     assert not window.microphone_selector.isEnabled()
 
@@ -218,6 +222,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
 
     window.start_stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.runtime_state is RuntimeState.IDLE
     assert window.start_stop_button.text() == "Start microphone"
     assert window.microphone_selector.isEnabled()
     assert "Duration: 01:05" in window.performance_summary.text()
@@ -230,6 +235,27 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert "Recognition: 2 completed" in window.performance_summary.text()
     assert "Translation: 2 completed" in window.performance_summary.text()
 
+    window.close()
+
+
+def test_capture_start_failure_enters_error_state() -> None:
+    create_application(["live-caption-translation-test"])
+
+    class FailingMonitor(FakeMicrophoneMonitor):
+        def start(self) -> None:
+            raise MicrophoneCaptureError("Test capture could not start.")
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=lambda *arguments: FailingMonitor(*arguments),
+    )
+
+    window.start_stop_button.click()
+
+    assert window.runtime_state is RuntimeState.ERROR
+    assert window._microphone_monitor is None
+    assert window.statusBar().currentMessage() == "Audio capture could not start"
+    assert window.device_status.text() == "Test capture could not start."
     window.close()
 
 

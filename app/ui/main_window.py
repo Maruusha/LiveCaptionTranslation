@@ -36,6 +36,7 @@ from app.audio.loopback import (
     refresh_output_devices,
 )
 from app.core.performance import PerformanceReport, format_mebibytes
+from app.core.state import RuntimeState, RuntimeStateMachine
 from app.speech.recognition import RecognitionStats
 from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
 from app.translation.translator import TranslationResult, TranslationStats
@@ -88,6 +89,7 @@ class MainWindow(QMainWindow):
         loopback_monitor_factory: LoopbackMonitorFactory | None = None,
     ) -> None:
         super().__init__()
+        self._runtime = RuntimeStateMachine()
         self._device_provider = device_provider or list_input_devices
         self._refresh_device_provider = device_provider or refresh_input_devices
         self._monitor_factory = monitor_factory or MicrophoneLevelMonitor
@@ -311,6 +313,11 @@ class MainWindow(QMainWindow):
 
         self.refresh_microphones()
 
+    @property
+    def runtime_state(self) -> RuntimeState:
+        """Return the current processing state for UI and diagnostics."""
+        return self._runtime.state
+
     def refresh_microphones(
         self,
         provider: Callable[[], list[AudioDevice]] | None = None,
@@ -491,6 +498,9 @@ class MainWindow(QMainWindow):
             self._stop_microphone()
             return
 
+        if self._runtime.state is RuntimeState.ERROR:
+            self._runtime.transition(RuntimeState.IDLE)
+
         computer_audio = self.computer_audio_source_button.isChecked()
         if computer_audio:
             selected_output = self.output_selector.currentData()
@@ -525,9 +535,11 @@ class MainWindow(QMainWindow):
             selected_name = selected_device.name
             active_source = "microphone"
 
+        self._runtime.transition(RuntimeState.STARTING)
         try:
             monitor.start()
         except MicrophoneCaptureError as error:
+            self._runtime.transition(RuntimeState.ERROR)
             self.input_level.setValue(0)
             self.device_status.setText(str(error))
             self.statusBar().showMessage("Audio capture could not start")
@@ -541,6 +553,7 @@ class MainWindow(QMainWindow):
         self._active_output_id = (
             selected_output.id if active_source == "computer_audio" else None
         )
+        self._runtime.transition(RuntimeState.LIVE)
         self.microphone_source_button.setEnabled(False)
         self.computer_audio_source_button.setEnabled(False)
         self.microphone_selector.setEnabled(False)
@@ -588,6 +601,9 @@ class MainWindow(QMainWindow):
                 self._allow_window_close = True
                 self.close()
             return
+
+        if self._runtime.state in {RuntimeState.LIVE, RuntimeState.ERROR}:
+            self._runtime.transition(RuntimeState.STOPPING)
 
         self._microphone_monitor = None
         self._active_source = None
@@ -785,11 +801,15 @@ class MainWindow(QMainWindow):
         )
 
         if stop_error is not None:
+            self._runtime.transition(RuntimeState.ERROR)
             self.device_status.setText(str(stop_error))
             self.statusBar().showMessage("Microphone stop warning")
         elif show_ready:
+            self._runtime.transition(RuntimeState.IDLE)
             self.device_status.setText("Audio capture stopped. Audio was not saved.")
             self.statusBar().showMessage("Ready")
+        else:
+            self._runtime.transition(RuntimeState.IDLE)
 
         if self._device_refresh_pending and show_ready:
             self._device_refresh_pending = False
