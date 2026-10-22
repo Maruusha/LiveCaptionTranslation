@@ -16,6 +16,34 @@ from PySide6.QtWidgets import (
 )
 
 
+def format_caption_text(
+    *,
+    original_text: str,
+    source_language: str | None,
+    translated_text: str | None,
+    target_language: str | None,
+    mode: str,
+) -> str:
+    """Format one caption consistently for the chat and compact overlay."""
+    if mode not in {"both", "original", "translation"}:
+        raise ValueError(f"Unknown caption display mode: {mode}")
+    source = (source_language or "unknown").upper()
+    target = (target_language or "unknown").upper()
+    original_line = f"{source}: {original_text}"
+    translated_line = (
+        f"{target}: {translated_text}"
+        if translated_text
+        else "Translation unavailable"
+    )
+    if mode == "original":
+        return original_line
+    if mode == "translation":
+        return translated_line
+    if translated_text:
+        return f"{original_line}\n{translated_line}"
+    return f"{original_line}\nTranslation unavailable"
+
+
 class CaptionMessageBubble(QFrame):
     """One completed caption and its optional translation."""
 
@@ -81,24 +109,15 @@ class CaptionMessageBubble(QFrame):
         self.set_display_mode("both")
 
     def set_display_mode(self, mode: str) -> None:
-        source = (self.source_language or "unknown").upper()
-        target = (self.target_language or "unknown").upper()
-        original_line = f"{source}: {self.original_text}"
-        translated_line = (
-            f"{target}: {self.translated_text}"
-            if self.translated_text
-            else "Translation unavailable"
+        self.message_label.setText(
+            format_caption_text(
+                original_text=self.original_text,
+                source_language=self.source_language,
+                translated_text=self.translated_text,
+                target_language=self.target_language,
+                mode=mode,
+            )
         )
-
-        if mode == "original":
-            text = original_line
-        elif mode == "translation":
-            text = translated_line
-        elif self.translated_text:
-            text = f"{original_line}\n{translated_line}"
-        else:
-            text = f"{original_line}\nTranslation unavailable"
-        self.message_label.setText(text)
 
 
 class CaptionChatView(QScrollArea):

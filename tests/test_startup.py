@@ -171,6 +171,8 @@ def test_main_window_starts_ready() -> None:
     assert window.whisper_workers_label.text() == "Whisper workers: 1"
     assert window.start_stop_button.minimumHeight() == 48
     assert window.to_bottom_button.text() == "To bottom"
+    assert window.overlay_toggle_button.text() == "Show overlay"
+    assert not window.caption_overlay.isVisible()
     assert window.runtime_state is RuntimeState.IDLE
 
     window.show()
@@ -180,6 +182,13 @@ def test_main_window_starts_ready() -> None:
         QPoint(0, window.start_stop_button.height()),
     ).y()
     assert button_bottom <= window.microphone_group.contentsRect().bottom() - 12
+
+    window.overlay_toggle_button.click()
+    QApplication.processEvents()
+    assert window.caption_overlay.isVisible()
+    assert window.overlay_toggle_button.text() == "Hide overlay"
+    window.overlay_toggle_button.click()
+    assert not window.caption_overlay.isVisible()
 
     window.close()
 
@@ -269,6 +278,9 @@ def test_microphone_controls_start_update_and_stop() -> None:
     )
     assert len(window.caption_chat.messages) == 1
     assert window.caption_chat.messages[0].message_label.text() == (
+        "FR: Bonjour le monde\nEN: Hello world"
+    )
+    assert window.caption_overlay.caption_label.text() == (
         "FR: Bonjour le monde\nEN: Hello world"
     )
     saved_messages = window._history.get_messages(

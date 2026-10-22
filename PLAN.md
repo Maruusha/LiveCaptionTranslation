@@ -671,7 +671,11 @@ Computer audio is captured at 48 kHz in stereo, downmixed to mono, and sent into
 
 **Current implementation (first chat slice, 2026-10-22):** The single latest-caption label has been replaced by a scrollable WhatsApp-style live conversation area. Every completed speech turn creates one left-aligned bubble containing its source label, local time, original language and text, and translated language and text. Warning or skipped captions use a separate warning colour. The existing Original only, Translation only, and Original and translation choices update all visible bubbles, not only new ones. New messages scroll into view only when the user was already near the bottom. **To bottom** jumps directly to the newest message, while **Clear screen** removes visible bubbles without deleting saved history. The lower interface now uses the familiar chat layout: conversations on the left and the selected conversation's message bubbles on the right. The live controls and simple performance panel remain above it. All 61 automated tests pass.
 
-Automatic Person labels and colours, temporary-to-final bubble replacement, right alignment for a manually selected `You`, and the compact overlay remain in their later stages.
+**Current implementation (overlay foundation, 2026-10-22):** A **Show overlay** control opens a separate frameless, always-on-top caption window. It displays the newest live result, including source label, time, original text, translation, and warning colour, and follows the main Original, Translation, or combined display choice. The overlay can be dragged to another screen position, hidden without stopping capture, and cleared with the main caption screen. Advanced font, colour, transparency, resizing, click-through, and saved-position controls remain later Stage 7 slices.
+
+**Current automated verification:** All 65 tests pass, including overlay formatting, window flags, show/hide integration, and live-caption updates.
+
+Automatic Person labels and colours, temporary-to-final bubble replacement, right alignment for a manually selected `You`, and advanced overlay customization remain in later stages.
 
 **Finished when:** Live captions remain readable and the interface stays responsive while audio processing runs in the background.
 

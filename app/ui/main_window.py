@@ -50,6 +50,7 @@ from app.speech.vad import (
     VoiceActivityStats,
 )
 from app.translation.translator import TranslationResult, TranslationStats
+from app.ui.caption_overlay import CaptionOverlay
 from app.ui.chat_view import CaptionChatView
 from app.ui.finishing_dialog import FinishingCaptionsDialog
 from app.ui.history_sidebar import ConversationSidebar, LIVE_ITEM_KEY
@@ -358,9 +359,17 @@ class MainWindow(QMainWindow):
         )
 
         self.caption_chat = CaptionChatView()
+        self.caption_overlay = CaptionOverlay(self)
+        self.caption_overlay.hidden_by_user.connect(
+            self._handle_overlay_hidden_by_user
+        )
         self.caption_view_selector.currentIndexChanged.connect(
             self._update_caption_display_mode
         )
+        self.overlay_toggle_button = QPushButton("Show overlay")
+        self.overlay_toggle_button.setObjectName("overlayToggleButton")
+        self.overlay_toggle_button.setCheckable(True)
+        self.overlay_toggle_button.toggled.connect(self._toggle_caption_overlay)
         self.clear_captions_button = QPushButton("Clear screen")
         self.clear_captions_button.setObjectName("clearCaptionsButton")
         self.clear_captions_button.clicked.connect(self._clear_caption_screen)
@@ -369,6 +378,7 @@ class MainWindow(QMainWindow):
         self.to_bottom_button.clicked.connect(self.caption_chat.scroll_to_bottom)
 
         chat_actions = QHBoxLayout()
+        chat_actions.addWidget(self.overlay_toggle_button)
         chat_actions.addStretch()
         chat_actions.addWidget(self.to_bottom_button)
         chat_actions.addWidget(self.clear_captions_button)
@@ -861,6 +871,7 @@ class MainWindow(QMainWindow):
         self._completed_speech_chunks = 0
         self.speech_turn_status.setText("Completed speech chunks: 0")
         self.caption_chat.clear_messages()
+        self.caption_overlay.clear_message()
         self.performance_summary.setText("Measuring performance…")
         self._performance_timer.start()
         self._update_performance_stats()
@@ -1201,18 +1212,27 @@ class MainWindow(QMainWindow):
         created_at = local_timestamp()
         self._save_caption_to_history(result, created_at)
         if recognition.skipped or recognition.error:
+            timestamp = self._history_message_time(created_at)
             if self._showing_live_conversation:
                 self.caption_chat.add_message(
                     original_text=recognition.text,
                     source_language=recognition.language,
                     speaker=self._caption_source_label,
-                    timestamp=self._history_message_time(created_at),
+                    timestamp=timestamp,
                     warning=True,
                 )
+            self.caption_overlay.set_message(
+                original_text=recognition.text,
+                source_language=recognition.language,
+                speaker=self._caption_source_label,
+                timestamp=timestamp,
+                warning=True,
+            )
             self.statusBar().showMessage("Caption warning")
             return
 
         original_text = recognition.text or "[no speech recognized]"
+        timestamp = self._history_message_time(created_at)
         if self._showing_live_conversation:
             self.caption_chat.add_message(
                 original_text=original_text,
@@ -1220,9 +1240,18 @@ class MainWindow(QMainWindow):
                 translated_text=result.translated_text,
                 target_language=result.target_language,
                 speaker=self._caption_source_label,
-                timestamp=self._history_message_time(created_at),
+                timestamp=timestamp,
                 warning=bool(result.error),
             )
+        self.caption_overlay.set_message(
+            original_text=original_text,
+            source_language=recognition.language,
+            translated_text=result.translated_text,
+            target_language=result.target_language,
+            speaker=self._caption_source_label,
+            timestamp=timestamp,
+            warning=bool(result.error),
+        )
 
         if result.error:
             self.statusBar().showMessage("Translation warning")
@@ -1276,12 +1305,26 @@ class MainWindow(QMainWindow):
         self._refresh_conversation_sidebar(selected_key)
 
     def _update_caption_display_mode(self) -> None:
-        self.caption_chat.set_display_mode(
-            str(self.caption_view_selector.currentData())
+        mode = str(self.caption_view_selector.currentData())
+        self.caption_chat.set_display_mode(mode)
+        self.caption_overlay.set_display_mode(mode)
+
+    def _toggle_caption_overlay(self, visible: bool) -> None:
+        self.overlay_toggle_button.setText(
+            "Hide overlay" if visible else "Show overlay"
         )
+        if visible:
+            self.caption_overlay.show()
+            self.caption_overlay.raise_()
+        else:
+            self.caption_overlay.hide()
+
+    def _handle_overlay_hidden_by_user(self) -> None:
+        self.overlay_toggle_button.setChecked(False)
 
     def _clear_caption_screen(self) -> None:
         self.caption_chat.clear_messages()
+        self.caption_overlay.clear_message()
         logger.info("Visible caption messages cleared")
         self.statusBar().showMessage("Caption screen cleared")
 
@@ -1439,6 +1482,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release audio asynchronously before allowing the window to close."""
         if self._allow_window_close:
+            self.caption_overlay.hide()
             super().closeEvent(event)
             return
         if self._microphone_monitor is not None or self._stop_thread is not None:
@@ -1448,6 +1492,7 @@ class MainWindow(QMainWindow):
                 close_after_stop=True,
             )
             return
+        self.caption_overlay.hide()
         super().closeEvent(event)
 
 
