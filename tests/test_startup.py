@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from threading import Event
+from time import monotonic, sleep
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,8 +16,9 @@ from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
 from app.core.performance import PerformanceReport
 from app.main import create_application
-from app.speech.recognition import RecognitionResult
+from app.speech.recognition import RecognitionResult, RecognitionStats
 from app.speech.vad import VoiceActivityStats
+from app.translation.translator import TranslationResult, TranslationStats
 from app.ui.main_window import MainWindow
 
 
@@ -27,7 +30,8 @@ class FakeMicrophoneMonitor:
         warning_callback,
         speech_event_callback,
         speech_segment_callback,
-        recognition_callback,
+        caption_callback,
+        recognition_language,
     ) -> None:
         self.device_index = device_index
         self.level_callback = level_callback
@@ -36,7 +40,8 @@ class FakeMicrophoneMonitor:
         self.stopped = False
         self.speech_event_callback = speech_event_callback
         self.speech_segment_callback = speech_segment_callback
-        self.recognition_callback = recognition_callback
+        self.caption_callback = caption_callback
+        self.recognition_language = recognition_language
         self.performance_report = PerformanceReport(
             elapsed_seconds=65.0,
             average_cpu_percent=2.5,
@@ -54,12 +59,40 @@ class FakeMicrophoneMonitor:
             completed_segments=2,
             filtered_short_segments=1,
         )
+        self.recognition_stats = RecognitionStats(
+            queued_segments=0,
+            active_segments=0,
+            active_elapsed_seconds=0.0,
+            completed_segments=2,
+            failed_segments=0,
+            processing_seconds=1.2,
+        )
+        self.translation_stats = TranslationStats(
+            queued_captions=0,
+            active_captions=0,
+            active_elapsed_seconds=0.0,
+            completed_captions=2,
+            failed_captions=0,
+            processing_seconds=0.3,
+        )
 
     def start(self) -> None:
         self.started = True
 
     def stop(self) -> None:
         self.stopped = True
+
+
+def wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    application = QApplication.instance()
+    while monotonic() < deadline:
+        if predicate():
+            return
+        if application is not None:
+            application.processEvents()
+        sleep(0.01)
+    assert predicate()
 
 
 def microphone_fixture() -> list[AudioDevice]:
@@ -100,6 +133,8 @@ def test_main_window_starts_ready() -> None:
     assert window.performance_view_selector.currentText() == "Simple stats"
     assert not window.performance_view_selector.model().item(1).isEnabled()
     assert window.performance_summary.text() == "No capture measured yet."
+    assert window.language_selector.currentText() == "Automatic"
+    assert window.caption_view_selector.currentText() == "Original and translation"
     assert window.start_stop_button.minimumHeight() == 48
 
     window.close()
@@ -115,7 +150,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
         warning_callback,
         speech_event_callback,
         speech_segment_callback,
-        recognition_callback,
+        caption_callback,
+        recognition_language,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -123,7 +159,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
             warning_callback,
             speech_event_callback,
             speech_segment_callback,
-            recognition_callback,
+            caption_callback,
+            recognition_language,
         )
         monitors.append(monitor)
         return monitor
@@ -135,6 +172,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
 
     window.start_stop_button.click()
     assert monitors[0].device_index == (12,)
+    assert monitors[0].recognition_language is None
     assert monitors[0].started
     assert window.start_stop_button.text() == "Stop microphone"
     assert not window.microphone_selector.isEnabled()
@@ -149,19 +187,26 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert "Last turn: 1.2s" in window.speech_turn_status.text()
 
     window.caption_received.emit(
-        RecognitionResult(
-            start_sample=0,
-            end_sample=16_000,
-            text="Bonjour le monde",
-            language="fr",
-            language_probability=0.99,
-            processing_seconds=0.4,
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="Bonjour le monde",
+                language="fr",
+                language_probability=0.99,
+                processing_seconds=0.4,
+            ),
+            translated_text="Hello world",
+            target_language="en",
+            processing_seconds=0.1,
         )
     )
-    assert window.latest_caption.text() == "Latest caption [FR]: Bonjour le monde"
+    assert window.latest_caption.text() == (
+        "Original [FR]: Bonjour le monde\nTranslation [EN]: Hello world"
+    )
 
     window.start_stop_button.click()
-    assert monitors[0].stopped
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     assert window.start_stop_button.text() == "Start microphone"
     assert window.microphone_selector.isEnabled()
     assert "Duration: 01:05" in window.performance_summary.text()
@@ -171,6 +216,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert "Speech starts: 2" in window.performance_summary.text()
     assert "Completed turns: 2" in window.performance_summary.text()
     assert "Audio chunks: 2" in window.performance_summary.text()
+    assert "Recognition: 2 completed" in window.performance_summary.text()
+    assert "Translation: 2 completed" in window.performance_summary.text()
 
     window.close()
 
@@ -264,7 +311,8 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
         warning_callback,
         speech_event_callback,
         speech_segment_callback,
-        recognition_callback,
+        caption_callback,
+        recognition_language,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -272,7 +320,8 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
             warning_callback,
             speech_event_callback,
             speech_segment_callback,
-            recognition_callback,
+            caption_callback,
+            recognition_language,
         )
         monitors.append(monitor)
         return monitor
@@ -288,13 +337,115 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
     connected_names.clear()
     window._handle_connected_microphones_changed()
 
-    assert monitors[0].stopped
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     assert window.start_stop_button.text() == "Start microphone"
     assert not window.start_stop_button.isEnabled()
     assert window.statusBar().currentMessage() == "Microphone disconnected"
     assert "was disconnected" in window.device_status.text()
 
     window.close()
+
+
+def test_slow_stop_shows_caption_progress_without_blocking_the_window() -> None:
+    create_application(["live-caption-translation-test"])
+    release_stop = Event()
+    monitors = []
+
+    class SlowMonitor(FakeMicrophoneMonitor):
+        cancelled = False
+
+        def __init__(self, *arguments) -> None:
+            super().__init__(*arguments)
+            self.recognition_stats = SimpleNamespace(
+                queued_segments=2,
+                active_segments=1,
+                active_elapsed_seconds=0.5,
+                completed_segments=2,
+                failed_segments=0,
+                processing_seconds=4.0,
+            )
+
+        def stop(self) -> None:
+            release_stop.wait(timeout=2.0)
+            self.stopped = True
+
+        def cancel_pending_recognition(self) -> int:
+            self.cancelled = True
+            return 2
+
+    def monitor_factory(*arguments):
+        monitor = SlowMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+    )
+    window.start_stop_button.click()
+    window.start_stop_button.click()
+
+    assert window.start_stop_button.text() == "Stopping…"
+    assert not window.start_stop_button.isEnabled()
+    wait_until(lambda: window._finishing_dialog is not None)
+    dialog = window._finishing_dialog
+    assert dialog is not None
+    assert "3 captions remaining" in dialog.detail.text()
+    assert "about 9 seconds" in dialog.detail.text()
+
+    dialog.finish_now_button.click()
+    assert monitors[0].cancelled
+    assert "already in progress" in dialog.detail.text()
+
+    release_stop.set()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.start_stop_button.isEnabled()
+    window.close()
+
+
+def test_window_close_waits_in_background_and_closes_automatically() -> None:
+    create_application(["live-caption-translation-test"])
+    release_stop = Event()
+
+    class SlowCloseMonitor(FakeMicrophoneMonitor):
+        def __init__(self, *arguments) -> None:
+            super().__init__(*arguments)
+            self.recognition_stats = SimpleNamespace(
+                queued_segments=0,
+                active_segments=1,
+                active_elapsed_seconds=1.0,
+                completed_segments=1,
+                failed_segments=0,
+                processing_seconds=3.0,
+            )
+
+        def stop(self) -> None:
+            release_stop.wait(timeout=2.0)
+            self.stopped = True
+
+    def monitor_factory(*arguments):
+        return SlowCloseMonitor(*arguments)
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+    )
+    window.show()
+    window.start_stop_button.click()
+
+    started = monotonic()
+    window.close()
+    assert monotonic() - started < 0.5
+    assert window._stop_thread is not None
+    wait_until(lambda: window._finishing_dialog is not None)
+    dialog = window._finishing_dialog
+    assert dialog is not None
+    assert dialog.windowTitle() == "Finishing captions before closing"
+    assert dialog.finish_now_button.text() == "Skip queued captions"
+
+    release_stop.set()
+    wait_until(lambda: window._stop_thread is None)
+    assert not window.isVisible()
 
 
 def test_idle_device_change_refreshes_automatically() -> None:

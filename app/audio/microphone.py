@@ -29,6 +29,12 @@ from app.speech.vad import (
     VoiceActivityStats,
     VoiceActivityWorker,
 )
+from app.translation.translator import (
+    TranslationError,
+    TranslationResult,
+    TranslationStats,
+    TranslationWorker,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -49,7 +55,7 @@ def calculate_input_level(samples: np.ndarray) -> int:
 
 
 class MicrophoneLevelMonitor:
-    """Read a microphone only long enough to calculate its current level."""
+    """Capture microphone audio and coordinate local processing workers."""
 
     def __init__(
         self,
@@ -58,7 +64,8 @@ class MicrophoneLevelMonitor:
         warning_callback: Callable[[str], None],
         speech_event_callback: Callable[[SpeechEvent], None] | None = None,
         speech_segment_callback: Callable[[SpeechSegment], None] | None = None,
-        recognition_callback: Callable[[RecognitionResult], None] | None = None,
+        caption_callback: Callable[[TranslationResult], None] | None = None,
+        recognition_language: str | None = None,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -72,6 +79,7 @@ class MicrophoneLevelMonitor:
         self._level_callback = level_callback
         self._warning_callback = warning_callback
         self._speech_segment_callback = speech_segment_callback
+        self._caption_callback = caption_callback
         self.audio_buffer = audio_buffer or BoundedAudioFrameQueue(
             max_seconds=5.0,
             max_frames=2_048,
@@ -88,10 +96,19 @@ class MicrophoneLevelMonitor:
         )
         self.recognition_worker = (
             RecognitionWorker(
-                result_callback=recognition_callback,
+                result_callback=self._handle_recognition_result,
+                warning_callback=self._warning_callback,
+                language=recognition_language,
+            )
+            if caption_callback is not None
+            else None
+        )
+        self.translation_worker = (
+            TranslationWorker(
+                result_callback=caption_callback,
                 warning_callback=self._warning_callback,
             )
-            if recognition_callback is not None
+            if caption_callback is not None
             else None
         )
         self.voice_activity_worker = (
@@ -131,6 +148,11 @@ class MicrophoneLevelMonitor:
         worker = self.recognition_worker
         return worker.stats if worker is not None else None
 
+    @property
+    def translation_stats(self) -> TranslationStats | None:
+        worker = self.translation_worker
+        return worker.stats if worker is not None else None
+
     def start(self) -> None:
         """Open the selected microphone and begin level callbacks."""
         if self.is_running:
@@ -168,6 +190,8 @@ class MicrophoneLevelMonitor:
             )
             self._performance_start = take_process_snapshot()
             self.last_performance_report = None
+            if self.translation_worker is not None:
+                self.translation_worker.start()
             if self.recognition_worker is not None:
                 self.recognition_worker.start()
             if self.voice_activity_worker is not None:
@@ -217,12 +241,27 @@ class MicrophoneLevelMonitor:
             except RecognitionError as error:
                 stop_error = stop_error or error
 
+        if self.translation_worker is not None:
+            try:
+                self.translation_worker.stop()
+            except TranslationError as error:
+                stop_error = stop_error or error
+
         self._log_capture_summary()
 
         if stop_error is not None:
             raise MicrophoneCaptureError(
                 "The microphone did not stop cleanly."
             ) from stop_error
+
+    def cancel_pending_captions(self) -> int:
+        """Discard queued recognition and translation jobs."""
+        cancelled = 0
+        if self.recognition_worker is not None:
+            cancelled += self.recognition_worker.cancel_pending()
+        if self.translation_worker is not None:
+            cancelled += self.translation_worker.cancel_pending()
+        return cancelled
 
     def _handle_audio(self, input_data, _frames, _time_info, status) -> None:
         if status:
@@ -244,6 +283,14 @@ class MicrophoneLevelMonitor:
             self._speech_segment_callback(segment)
         if self.recognition_worker is not None:
             self.recognition_worker.submit(segment)
+
+    def _handle_recognition_result(self, result: RecognitionResult) -> None:
+        if self.translation_worker is not None:
+            self.translation_worker.submit(result)
+        elif self._caption_callback is not None:
+            self._caption_callback(
+                TranslationResult(result, None, None, 0.0)
+            )
 
     def _log_capture_summary(self) -> None:
         start = self._performance_start
@@ -292,12 +339,24 @@ class MicrophoneLevelMonitor:
         recognition_stats = self.recognition_stats
         if recognition_stats is not None:
             logger.info(
-                "Speech recognition summary: queued=%d, completed=%d, failed=%d, "
-                "processing time=%.3fs",
+                "Speech recognition summary: queued=%d, active=%d, completed=%d, "
+                "failed=%d, processing time=%.3fs",
                 recognition_stats.queued_segments,
+                recognition_stats.active_segments,
                 recognition_stats.completed_segments,
                 recognition_stats.failed_segments,
                 recognition_stats.processing_seconds,
+            )
+        translation_stats = self.translation_stats
+        if translation_stats is not None:
+            logger.info(
+                "Translation summary: queued=%d, active=%d, completed=%d, "
+                "failed=%d, processing time=%.3fs",
+                translation_stats.queued_captions,
+                translation_stats.active_captions,
+                translation_stats.completed_captions,
+                translation_stats.failed_captions,
+                translation_stats.processing_seconds,
             )
 
 

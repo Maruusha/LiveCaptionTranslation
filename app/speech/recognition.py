@@ -46,6 +46,8 @@ class RecognitionResult:
 @dataclass(frozen=True, slots=True)
 class RecognitionStats:
     queued_segments: int
+    active_segments: int
+    active_elapsed_seconds: float
     completed_segments: int
     failed_segments: int
     processing_seconds: float
@@ -79,12 +81,16 @@ class RecognitionWorker:
         warning_callback: Callable[[str], None],
         model_factory: Callable[[], WhisperLikeModel] = create_faster_whisper_model,
         max_queued_segments: int = 8,
+        language: str | None = None,
     ) -> None:
         if max_queued_segments <= 0:
             raise ValueError("max_queued_segments must be greater than zero.")
+        if language not in {None, "en", "fr"}:
+            raise ValueError("language must be None, 'en', or 'fr'.")
         self._result_callback = result_callback
         self._warning_callback = warning_callback
         self._model_factory = model_factory
+        self._language = language
         self._queue: Queue[SpeechSegment] = Queue(maxsize=max_queued_segments)
         self._stop_event = Event()
         self._thread: Thread | None = None
@@ -92,6 +98,7 @@ class RecognitionWorker:
         self._completed_segments = 0
         self._failed_segments = 0
         self._processing_seconds = 0.0
+        self._active_started_at: float | None = None
 
     @property
     def is_running(self) -> bool:
@@ -100,8 +107,15 @@ class RecognitionWorker:
     @property
     def stats(self) -> RecognitionStats:
         with self._stats_lock:
+            active_started_at = self._active_started_at
             return RecognitionStats(
                 queued_segments=self._queue.qsize(),
+                active_segments=int(active_started_at is not None),
+                active_elapsed_seconds=(
+                    perf_counter() - active_started_at
+                    if active_started_at is not None
+                    else 0.0
+                ),
                 completed_segments=self._completed_segments,
                 failed_segments=self._failed_segments,
                 processing_seconds=self._processing_seconds,
@@ -132,7 +146,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text="[caption skipped: processing too slow]",
-                    language=None,
+                    language=self._language,
                     language_probability=None,
                     processing_seconds=0.0,
                     skipped=True,
@@ -153,6 +167,32 @@ class RecognitionWorker:
             raise RecognitionError("Speech recognition did not stop in time.")
         self._thread = None
 
+    def cancel_pending(self) -> int:
+        """Discard queued chunks while leaving an active transcription untouched."""
+        cancelled = 0
+        while True:
+            try:
+                segment = self._queue.get_nowait()
+            except Empty:
+                break
+            cancelled += 1
+            self._result_callback(
+                RecognitionResult(
+                    start_sample=segment.start_sample,
+                    end_sample=segment.end_sample,
+                    text="[caption skipped: application closed before processing]",
+                    language=None,
+                    language_probability=None,
+                    processing_seconds=0.0,
+                    error="The caption was cancelled while the application was closing.",
+                    skipped=True,
+                )
+            )
+        if cancelled:
+            with self._stats_lock:
+                self._failed_segments += cancelled
+        return cancelled
+
     def _run(self) -> None:
         try:
             model = self._model_factory()
@@ -170,11 +210,13 @@ class RecognitionWorker:
                 continue
 
             started = perf_counter()
+            with self._stats_lock:
+                self._active_started_at = started
             try:
                 parts, info = model.transcribe(
                     segment.samples,
                     task="transcribe",
-                    language=None,
+                    language=self._language,
                     beam_size=1,
                     vad_filter=False,
                     condition_on_previous_text=False,
@@ -188,7 +230,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text=text,
-                    language=getattr(info, "language", None),
+                    language=self._language or getattr(info, "language", None),
                     language_probability=getattr(info, "language_probability", None),
                     processing_seconds=processing_seconds,
                 )
@@ -202,7 +244,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text="[caption unavailable]",
-                    language=None,
+                    language=self._language,
                     language_probability=None,
                     processing_seconds=processing_seconds,
                     error=str(error),
@@ -210,6 +252,9 @@ class RecognitionWorker:
                 with self._stats_lock:
                     self._failed_segments += 1
                     self._processing_seconds += processing_seconds
+            finally:
+                with self._stats_lock:
+                    self._active_started_at = None
             self._result_callback(result)
 
     def _fail_waiting_segments(self, message: str) -> None:
@@ -225,7 +270,7 @@ class RecognitionWorker:
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
                     text="[caption unavailable]",
-                    language=None,
+                    language=self._language,
                     language_probability=None,
                     processing_seconds=0.0,
                     error=message,
