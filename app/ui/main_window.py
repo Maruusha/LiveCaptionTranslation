@@ -1,7 +1,10 @@
 """Main desktop window for the application shell."""
 
 from collections.abc import Callable
+from datetime import datetime
 import logging
+from queue import Empty, SimpleQueue
+import sqlite3
 from threading import Thread
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -38,11 +41,18 @@ from app.audio.loopback import (
 )
 from app.core.performance import PerformanceReport, format_mebibytes
 from app.core.state import RuntimeState, RuntimeStateMachine
+from app.history.database import HistoryDatabase, local_timestamp
 from app.speech.recognition import RecognitionStats
-from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
+from app.speech.vad import (
+    VAD_SAMPLE_RATE,
+    SpeechEvent,
+    SpeechSegment,
+    VoiceActivityStats,
+)
 from app.translation.translator import TranslationResult, TranslationStats
 from app.ui.chat_view import CaptionChatView
 from app.ui.finishing_dialog import FinishingCaptionsDialog
+from app.ui.history_sidebar import ConversationSidebar, LIVE_ITEM_KEY
 
 
 MonitorFactory = Callable[
@@ -83,6 +93,7 @@ class MainWindow(QMainWindow):
     speech_event_received = Signal(object)
     speech_segment_received = Signal(object)
     caption_received = Signal(object)
+    queued_captions_ready = Signal()
 
     def __init__(
         self,
@@ -91,9 +102,20 @@ class MainWindow(QMainWindow):
         connected_name_provider: Callable[[], set[str]] | None = None,
         output_device_provider: Callable[[], list[OutputAudioDevice]] | None = None,
         loopback_monitor_factory: LoopbackMonitorFactory | None = None,
+        history_database: HistoryDatabase | None = None,
     ) -> None:
         super().__init__()
         self._runtime = RuntimeStateMachine()
+        self._history = history_database or HistoryDatabase()
+        recovered_sessions = self._history.recover_interrupted_sessions()
+        if recovered_sessions:
+            logger.info(
+                "Recovered %d interrupted caption session(s)",
+                recovered_sessions,
+            )
+        self._active_history_session_id: int | None = None
+        self._viewing_history_session_id: int | None = None
+        self._showing_live_conversation = False
         self._device_provider = device_provider or list_input_devices
         self._refresh_device_provider = device_provider or refresh_input_devices
         self._monitor_factory = monitor_factory or MicrophoneLevelMonitor
@@ -123,12 +145,14 @@ class MainWindow(QMainWindow):
         self._allow_window_close = False
         self._after_stop: Callable[[], None] | None = None
         self._finishing_dialog: FinishingCaptionsDialog | None = None
+        self._pending_caption_results: SimpleQueue[TranslationResult] = SimpleQueue()
 
         self.microphone_level_received.connect(self._set_microphone_level)
         self.microphone_warning_received.connect(self._show_microphone_warning)
         self.speech_event_received.connect(self._show_speech_event)
         self.speech_segment_received.connect(self._show_speech_segment)
         self.caption_received.connect(self._show_caption)
+        self.queued_captions_ready.connect(self._drain_queued_captions)
 
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(
@@ -266,8 +290,11 @@ class MainWindow(QMainWindow):
         self.start_stop_button.setMinimumHeight(48)
         self.start_stop_button.clicked.connect(self.toggle_microphone)
 
-        microphone_group = QGroupBox("Live audio")
+        self.microphone_group = QGroupBox("Live audio")
+        self.microphone_group.setObjectName("liveAudioGroup")
         microphone_layout = QVBoxLayout()
+        microphone_layout.setContentsMargins(12, 18, 12, 16)
+        microphone_layout.setSpacing(8)
         microphone_layout.addLayout(source_layout)
         microphone_layout.addLayout(language_layout)
         microphone_layout.addLayout(caption_view_layout)
@@ -278,7 +305,11 @@ class MainWindow(QMainWindow):
         microphone_layout.addWidget(self.speech_status)
         microphone_layout.addWidget(self.speech_turn_status)
         microphone_layout.addWidget(self.start_stop_button)
-        microphone_group.setLayout(microphone_layout)
+        microphone_layout.addSpacing(4)
+        self.microphone_group.setLayout(microphone_layout)
+        self.microphone_group.setMinimumHeight(
+            self.microphone_group.minimumSizeHint().height()
+        )
 
         self.caption_chat = CaptionChatView()
         self.caption_view_selector.currentIndexChanged.connect(
@@ -296,10 +327,23 @@ class MainWindow(QMainWindow):
         chat_actions.addWidget(self.to_bottom_button)
         chat_actions.addWidget(self.clear_captions_button)
 
-        chat_group = QGroupBox("Live conversation")
-        chat_layout = QVBoxLayout(chat_group)
+        self.chat_group = QGroupBox("Live conversation")
+        chat_layout = QVBoxLayout(self.chat_group)
         chat_layout.addLayout(chat_actions)
         chat_layout.addWidget(self.caption_chat, stretch=1)
+
+        self.conversation_sidebar = ConversationSidebar()
+        self.conversation_sidebar.live_selected.connect(
+            self._show_live_conversation
+        )
+        self.conversation_sidebar.session_selected.connect(
+            self._show_saved_conversation
+        )
+
+        conversation_layout = QHBoxLayout()
+        conversation_layout.setSpacing(12)
+        conversation_layout.addWidget(self.conversation_sidebar)
+        conversation_layout.addWidget(self.chat_group, stretch=1)
 
         self.performance_view_selector = QComboBox()
         self.performance_view_selector.setObjectName("performanceViewSelector")
@@ -342,7 +386,7 @@ class MainWindow(QMainWindow):
         panels_layout = QHBoxLayout()
         panels_layout.setSpacing(16)
         panels_layout.addWidget(
-            microphone_group,
+            self.microphone_group,
             stretch=3,
             alignment=Qt.AlignmentFlag.AlignTop,
         )
@@ -359,18 +403,97 @@ class MainWindow(QMainWindow):
         layout.addWidget(message)
         layout.addSpacing(4)
         layout.addLayout(panels_layout)
-        layout.addWidget(chat_group, stretch=1)
+        layout.addLayout(conversation_layout, stretch=1)
 
         content = QWidget()
         content.setLayout(layout)
         self.setCentralWidget(content)
 
         self.refresh_microphones()
+        self._refresh_conversation_sidebar()
 
     @property
     def runtime_state(self) -> RuntimeState:
         """Return the current processing state for UI and diagnostics."""
         return self._runtime.state
+
+    def _refresh_conversation_sidebar(
+        self,
+        selected_key: str | int | None = None,
+    ) -> None:
+        if selected_key is None:
+            selected_key = self.conversation_sidebar.selected_key()
+        self.conversation_sidebar.set_sessions(
+            self._history.list_sessions(),
+            show_live=self._active_history_session_id is not None,
+            selected_key=selected_key,
+        )
+        if self._viewing_history_session_id is None:
+            current_key = self.conversation_sidebar.selected_key()
+            if current_key == LIVE_ITEM_KEY:
+                self._show_live_conversation()
+            elif isinstance(current_key, int):
+                self._show_saved_conversation(current_key)
+
+    def _show_live_conversation(self) -> None:
+        session_id = self._active_history_session_id
+        if session_id is None:
+            return
+        self._showing_live_conversation = True
+        self._viewing_history_session_id = session_id
+        self.chat_group.setTitle("Live conversation")
+        self._load_history_messages(session_id)
+
+    def _show_saved_conversation(self, session_id: int) -> None:
+        session = self._history.get_session(session_id)
+        if session is None:
+            return
+        self._showing_live_conversation = False
+        self._viewing_history_session_id = session_id
+        status = session.status.capitalize()
+        self.chat_group.setTitle(f"{session.title} · {status}")
+        self._load_history_messages(session_id)
+
+    def _load_history_messages(self, session_id: int) -> None:
+        self.caption_chat.clear_messages()
+        for message in self._history.get_messages(session_id):
+            self.caption_chat.add_message(
+                original_text=message.original_text,
+                source_language=message.source_language,
+                translated_text=message.translated_text,
+                target_language=message.target_language,
+                speaker=message.speaker_label,
+                timestamp=self._history_message_time(message.created_at),
+                warning=message.warning,
+            )
+        QTimer.singleShot(0, self.caption_chat.scroll_to_bottom)
+
+    @staticmethod
+    def _history_message_time(timestamp: str) -> str:
+        try:
+            return datetime.fromisoformat(timestamp).astimezone().strftime("%H:%M")
+        except ValueError:
+            return timestamp
+
+    def _create_history_session(self, active_source: str) -> int:
+        source_label = (
+            "Computer audio" if active_source == "computer_audio" else "Microphone"
+        )
+        preferred_language = self.language_selector.currentData()
+        language_mode = preferred_language or "automatic"
+        target_language = (
+            "en" if preferred_language == "fr" else "fr"
+            if preferred_language == "en"
+            else None
+        )
+        title_time = datetime.now().astimezone().strftime("%d %b %Y %H:%M")
+        return self._history.create_session(
+            title=f"{source_label} · {title_time}",
+            audio_source=active_source,
+            language_mode=str(language_mode),
+            preferred_source_language=preferred_language,
+            target_language=target_language,
+        )
 
     def refresh_microphones(
         self,
@@ -573,7 +696,7 @@ class MainWindow(QMainWindow):
                 self.microphone_warning_received.emit,
                 self.speech_event_received.emit,
                 self.speech_segment_received.emit,
-                self.caption_received.emit,
+                self._queue_caption_from_worker,
                 self.language_selector.currentData(),
                 float(self.speech_chunk_duration_slider.value()),
             )
@@ -590,7 +713,7 @@ class MainWindow(QMainWindow):
                 self.microphone_warning_received.emit,
                 self.speech_event_received.emit,
                 self.speech_segment_received.emit,
-                self.caption_received.emit,
+                self._queue_caption_from_worker,
                 self.language_selector.currentData(),
                 float(self.speech_chunk_duration_slider.value()),
             )
@@ -599,8 +722,29 @@ class MainWindow(QMainWindow):
 
         self._runtime.transition(RuntimeState.STARTING)
         try:
+            history_session_id = self._create_history_session(active_source)
+        except sqlite3.Error as error:
+            self._runtime.transition(RuntimeState.ERROR)
+            logger.exception("Caption history session could not be created")
+            self.device_status.setText(
+                "Local conversation history could not be started."
+            )
+            self.statusBar().showMessage("History database error")
+            return
+
+        self._active_history_session_id = history_session_id
+        try:
             monitor.start()
         except MicrophoneCaptureError as error:
+            try:
+                self._history.finish_session(
+                    history_session_id,
+                    status="incomplete",
+                )
+            except sqlite3.Error:
+                logger.exception("Failed to close unsuccessful history session")
+            self._active_history_session_id = None
+            self._refresh_conversation_sidebar(history_session_id)
             self._runtime.transition(RuntimeState.ERROR)
             self.input_level.setValue(0)
             self.device_status.setText(str(error))
@@ -619,6 +763,10 @@ class MainWindow(QMainWindow):
             "Computer audio" if active_source == "computer_audio" else "Microphone"
         )
         self._runtime.transition(RuntimeState.LIVE)
+        self._showing_live_conversation = True
+        self._viewing_history_session_id = history_session_id
+        self.chat_group.setTitle("Live conversation")
+        self._refresh_conversation_sidebar(LIVE_ITEM_KEY)
         self.microphone_source_button.setEnabled(False)
         self.computer_audio_source_button.setEnabled(False)
         self.microphone_selector.setEnabled(False)
@@ -825,6 +973,10 @@ class MainWindow(QMainWindow):
         show_ready = self._show_ready_after_stop
         stop_error = self._stop_error
 
+        # The processing workers are now stopped, so every accepted result is in
+        # this handoff queue. Drain it before closing the active history session.
+        self._drain_queued_captions()
+
         self._stop_poll_timer.stop()
         self._stop_thread = None
         self._stopping_monitor = None
@@ -841,6 +993,30 @@ class MainWindow(QMainWindow):
                 monitor.voice_activity_stats,
                 monitor.recognition_stats,
                 monitor.translation_stats,
+            )
+
+        history_session_id = self._active_history_session_id
+        if history_session_id is not None:
+            history_status = "incomplete" if stop_error is not None else "completed"
+            try:
+                self._history.finish_session(
+                    history_session_id,
+                    status=history_status,
+                )
+            except sqlite3.Error:
+                logger.exception("Caption history session could not be finished")
+                self.statusBar().showMessage("History database error")
+            self._active_history_session_id = None
+            if self._showing_live_conversation:
+                self._showing_live_conversation = False
+                self._viewing_history_session_id = history_session_id
+                session = self._history.get_session(history_session_id)
+                if session is not None:
+                    self.chat_group.setTitle(
+                        f"{session.title} · {session.status.capitalize()}"
+                    )
+            self._refresh_conversation_sidebar(
+                self._viewing_history_session_id
             )
 
         self.speech_status.setText("Speech detection: stopped")
@@ -928,27 +1104,47 @@ class MainWindow(QMainWindow):
             forced_split,
         )
 
+    def _queue_caption_from_worker(self, result: TranslationResult) -> None:
+        """Hand a worker result to the UI without losing it during shutdown."""
+        self._pending_caption_results.put(result)
+        self.queued_captions_ready.emit()
+
+    def _drain_queued_captions(self) -> None:
+        """Display all worker results currently waiting for the UI thread."""
+        while True:
+            try:
+                result = self._pending_caption_results.get_nowait()
+            except Empty:
+                return
+            self._show_caption(result)
+
     def _show_caption(self, result: TranslationResult) -> None:
         recognition = result.recognition
+        created_at = local_timestamp()
+        self._save_caption_to_history(result, created_at)
         if recognition.skipped or recognition.error:
-            self.caption_chat.add_message(
-                original_text=recognition.text,
-                source_language=recognition.language,
-                speaker=self._caption_source_label,
-                warning=True,
-            )
+            if self._showing_live_conversation:
+                self.caption_chat.add_message(
+                    original_text=recognition.text,
+                    source_language=recognition.language,
+                    speaker=self._caption_source_label,
+                    timestamp=self._history_message_time(created_at),
+                    warning=True,
+                )
             self.statusBar().showMessage("Caption warning")
             return
 
         original_text = recognition.text or "[no speech recognized]"
-        self.caption_chat.add_message(
-            original_text=original_text,
-            source_language=recognition.language,
-            translated_text=result.translated_text,
-            target_language=result.target_language,
-            speaker=self._caption_source_label,
-            warning=bool(result.error),
-        )
+        if self._showing_live_conversation:
+            self.caption_chat.add_message(
+                original_text=original_text,
+                source_language=recognition.language,
+                translated_text=result.translated_text,
+                target_language=result.target_language,
+                speaker=self._caption_source_label,
+                timestamp=self._history_message_time(created_at),
+                warning=bool(result.error),
+            )
 
         if result.error:
             self.statusBar().showMessage("Translation warning")
@@ -962,6 +1158,44 @@ class MainWindow(QMainWindow):
             recognition.processing_seconds,
             result.processing_seconds,
         )
+
+    def _save_caption_to_history(
+        self,
+        result: TranslationResult,
+        created_at: str,
+    ) -> None:
+        session_id = self._active_history_session_id
+        if session_id is None:
+            return
+        recognition = result.recognition
+        try:
+            self._history.add_message(
+                session_id=session_id,
+                speaker_label=self._caption_source_label,
+                start_offset_seconds=recognition.start_sample / VAD_SAMPLE_RATE,
+                end_offset_seconds=recognition.end_sample / VAD_SAMPLE_RATE,
+                source_language=recognition.language,
+                language_confidence=recognition.language_probability,
+                original_text=recognition.text or "[no speech recognized]",
+                target_language=result.target_language,
+                translated_text=result.translated_text,
+                warning=bool(
+                    recognition.skipped or recognition.error or result.error
+                ),
+                error_text=recognition.error or result.error,
+                created_at=created_at,
+            )
+        except sqlite3.Error:
+            logger.exception("Caption could not be saved to local history")
+            self.statusBar().showMessage("Caption history save failed")
+            return
+
+        selected_key: str | int | None = (
+            LIVE_ITEM_KEY
+            if self._showing_live_conversation
+            else self._viewing_history_session_id
+        )
+        self._refresh_conversation_sidebar(selected_key)
 
     def _update_caption_display_mode(self) -> None:
         self.caption_chat.set_display_mode(

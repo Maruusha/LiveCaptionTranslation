@@ -669,9 +669,9 @@ Computer audio is captured at 48 kHz in stereo, downmixed to mono, and sent into
 - Test high-DPI screens, multiple monitors, and windowed or borderless games.
 - Measure UI responsiveness while the full caption pipeline is busy.
 
-**Current implementation (first chat slice, 2026-10-22):** The single latest-caption label has been replaced by a scrollable WhatsApp-style live conversation area. Every completed speech turn creates one left-aligned bubble containing its source label, local time, original language and text, and translated language and text. Warning or skipped captions use a separate warning colour. The existing Original only, Translation only, and Original and translation choices update all visible bubbles, not only new ones. New messages scroll into view only when the user was already near the bottom. **To bottom** jumps directly to the newest message, while **Clear screen** removes visible bubbles without touching captured audio or future saved history. The layout has been enlarged and reorganized so the live controls, simple performance panel, and conversation remain visible together. All 55 automated tests pass.
+**Current implementation (first chat slice, 2026-10-22):** The single latest-caption label has been replaced by a scrollable WhatsApp-style live conversation area. Every completed speech turn creates one left-aligned bubble containing its source label, local time, original language and text, and translated language and text. Warning or skipped captions use a separate warning colour. The existing Original only, Translation only, and Original and translation choices update all visible bubbles, not only new ones. New messages scroll into view only when the user was already near the bottom. **To bottom** jumps directly to the newest message, while **Clear screen** removes visible bubbles without deleting saved history. The lower interface now uses the familiar chat layout: conversations on the left and the selected conversation's message bubbles on the right. The live controls and simple performance panel remain above it. All 61 automated tests pass.
 
-This is only the live message-screen foundation. Automatic Person labels and colours, temporary-to-final bubble replacement, the saved-conversation sidebar, right alignment for a manually selected `You`, durable history, and the compact overlay remain in their later stages.
+Automatic Person labels and colours, temporary-to-final bubble replacement, right alignment for a manually selected `You`, and the compact overlay remain in their later stages.
 
 **Finished when:** Live captions remain readable and the interface stays responsive while audio processing runs in the background.
 
@@ -683,6 +683,10 @@ This is only the live message-screen foundation. Automatic Person labels and col
 - Add the left conversation list, history reader, search, rename, and deletion controls.
 - Keep raw audio out of the database.
 - Test database recovery, long histories, and deletion rules.
+
+**Current implementation (first history slice, 2026-10-22):** A project-local SQLite database at `data/history.sqlite3` now stores sessions, session events, and every final or warning caption as it arrives; raw audio is never stored. The schema also creates the planned `persons`, `person_voice_signatures`, `session_persons`, and `session_voice_signatures` tables so later speaker stages can extend the data without replacing the history design. A session is created when capture starts, marked `completed` after a clean stop, marked `incomplete` after a stop error, and any `live` or `paused` rows left by an earlier process are recovered as `incomplete` on the next launch.
+
+The left conversation list shows newest sessions first with a title, time, latest-caption preview, and status. Selecting a saved session loads its messages into the same chat view on the right. A **Live conversation** entry stays at the top during capture. The user can read an older session while new live captions continue saving in the background, then return to Live to see the newest messages. `data/` is excluded from Git. Search, rename, confirmed deletion, pause-event storage, database maintenance controls, and long-history performance testing remain to be implemented.
 
 **Finished when:** Completed and interrupted sessions can be reopened with their captions, translations, labels, timestamps, and pause events intact.
 
