@@ -259,7 +259,7 @@ Remaining: browser video, local player, voice call, game, device switch/disconne
 
 ### Stage 6 — Session controls
 
-**Implemented; loaded live tests pending.** Pause/resume/stop use the explicit state machine, preserve one history session and continuous offsets, record events, and remain responsive while accepted captions finish. Automated coverage includes repeated transitions and stop from paused. The game-load clean-stop case still needs improvement or a successful retest.
+**Implemented; loaded live tests pending.** Pause/resume/stop use the explicit state machine, preserve one history session and continuous offsets, record events, and remain responsive while accepted captions finish. Application exit is now explicit: transient finishing dialogs cannot make Qt quit, and only an accepted main-window close requests process exit. Automated coverage includes repeated transitions, stop from paused, and Stop returning to a visible idle window. The game-load clean-stop case still needs improvement or a successful retest.
 
 ### Stage 7 — Chat interface and overlay
 
@@ -304,7 +304,7 @@ Planned: Windows package, first-run model downloader, file verification, disk-sp
 - High-DPI and multiple-monitor overlay behavior.
 - Offline operation, CPU-only operation, and later a supported GPU computer.
 
-Current automated baseline after speaker diagnostics and remembered-people management: 100 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
+Current automated baseline after explicit Stop-versus-Exit handling: 101 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
 
 ## Deferred and distant-future work
 

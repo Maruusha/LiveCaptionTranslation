@@ -125,6 +125,7 @@ class MainWindow(QMainWindow):
     speech_segment_received = Signal(object)
     caption_received = Signal(object)
     queued_captions_ready = Signal()
+    application_exit_requested = Signal()
 
     def __init__(
         self,
@@ -1616,6 +1617,8 @@ class MainWindow(QMainWindow):
         self._after_stop = None
         self._finishing_dialog = None
         self._stop_operation = "stop"
+        self._close_after_stop = False
+        self._show_ready_after_stop = True
         if dialog is not None:
             dialog.accept()
             dialog.deleteLater()
@@ -2333,6 +2336,7 @@ class MainWindow(QMainWindow):
             self._save_interface_settings()
             self.caption_overlay.hide()
             super().closeEvent(event)
+            self.application_exit_requested.emit()
             return
         if self._microphone_monitor is not None or self._stop_thread is not None:
             event.ignore()
@@ -2344,5 +2348,6 @@ class MainWindow(QMainWindow):
         self._save_interface_settings()
         self.caption_overlay.hide()
         super().closeEvent(event)
+        self.application_exit_requested.emit()
 
 

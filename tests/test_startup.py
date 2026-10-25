@@ -144,6 +144,7 @@ def test_application_has_expected_metadata() -> None:
     assert isinstance(application, QApplication)
     assert application.applicationName() == APP_NAME
     assert application.applicationVersion() == APP_VERSION
+    assert not application.quitOnLastWindowClosed()
 
 
 def test_main_window_starts_ready() -> None:
@@ -466,6 +467,34 @@ def test_caption_completed_during_stop_is_shown_and_saved() -> None:
     assert saved_messages[0].original_text == "Queued caption"
     assert window._history.get_session(session_id).status == "completed"
     window.close()
+
+
+def test_stop_returns_to_visible_idle_window_without_requesting_exit() -> None:
+    create_application(["live-caption-translation-test"])
+    monitors = []
+
+    def monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+    )
+    exit_requests = []
+    window.application_exit_requested.connect(lambda: exit_requests.append(True))
+    window.show()
+    window.start_stop_button.click()
+    window.stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+
+    assert window.runtime_state is RuntimeState.IDLE
+    assert window.isVisible()
+    assert exit_requests == []
+
+    window.close()
+    assert exit_requests == [True]
 
 
 def test_detected_session_speaker_can_be_remembered_with_user_approval() -> None:

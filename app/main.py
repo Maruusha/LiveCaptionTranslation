@@ -31,6 +31,7 @@ def create_application(arguments: Sequence[str] | None = None) -> QApplication:
     global _application_instance
     existing_application = QApplication.instance()
     if existing_application is not None:
+        existing_application.setQuitOnLastWindowClosed(False)
         _application_instance = existing_application
         return existing_application
 
@@ -38,6 +39,9 @@ def create_application(arguments: Sequence[str] | None = None) -> QApplication:
     application.setApplicationName(APP_NAME)
     application.setApplicationVersion(APP_VERSION)
     application.setOrganizationName("LiveCaptionTranslation")
+    # Only an accepted MainWindow close may end the process. Transient dialogs
+    # closing during Stop must never make Qt quit the application.
+    application.setQuitOnLastWindowClosed(False)
     _application_instance = application
     return application
 
@@ -60,6 +64,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
         return 1
     window.show()
+    window.application_exit_requested.connect(application.quit)
     exit_code = application.exec()
     logger.info("Application stopped with exit code %s", exit_code)
     return exit_code
