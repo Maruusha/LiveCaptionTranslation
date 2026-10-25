@@ -89,6 +89,7 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
         speech_threshold: float = 0.5,
         speaker_profiles: tuple[RememberedSpeakerProfile, ...] | None = None,
         session_speaker_profiles: tuple[SessionSpeakerProfile, ...] = (),
+        speaker_match_threshold: float = 0.65,
     ) -> None:
         super().__init__(
             0,
@@ -102,6 +103,7 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
             speech_threshold,
             speaker_profiles=speaker_profiles,
             session_speaker_profiles=session_speaker_profiles,
+            speaker_match_threshold=speaker_match_threshold,
         )
         self.output_device = output_device
         self._capture_stop = Event()

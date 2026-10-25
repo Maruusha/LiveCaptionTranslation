@@ -35,6 +35,7 @@ from app.speakers.identification import (
     SessionSpeakerProfile,
     SpeakerIdentification,
     SpeakerIdentificationError,
+    SpeakerIdentificationStats,
     SpeakerIdentificationWorker,
 )
 from app.translation.translator import (
@@ -78,6 +79,7 @@ class MicrophoneLevelMonitor:
         speech_threshold: float = 0.5,
         speaker_profiles: tuple[RememberedSpeakerProfile, ...] | None = None,
         session_speaker_profiles: tuple[SessionSpeakerProfile, ...] = (),
+        speaker_match_threshold: float = 0.65,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -128,6 +130,7 @@ class MicrophoneLevelMonitor:
                 warning_callback=self._warning_callback,
                 remembered_profiles=speaker_profiles,
                 session_profiles=session_speaker_profiles,
+                match_threshold=speaker_match_threshold,
             )
             if caption_callback is not None and speaker_profiles is not None
             else None
@@ -181,6 +184,11 @@ class MicrophoneLevelMonitor:
     @property
     def translation_stats(self) -> TranslationStats | None:
         worker = self.translation_worker
+        return worker.stats if worker is not None else None
+
+    @property
+    def speaker_identification_stats(self) -> SpeakerIdentificationStats | None:
+        worker = self.speaker_worker
         return worker.stats if worker is not None else None
 
     def start(self) -> None:
@@ -433,6 +441,18 @@ class MicrophoneLevelMonitor:
                 translation_stats.unsupported_captions,
                 translation_stats.failed_captions,
                 translation_stats.processing_seconds,
+            )
+        speaker_stats = self.speaker_identification_stats
+        if speaker_stats is not None:
+            logger.info(
+                "Speaker identification summary: model load=%.3fs, queued=%d, "
+                "completed=%d, unknown=%d, failed=%d, processing time=%.3fs",
+                speaker_stats.model_load_seconds,
+                speaker_stats.queued_segments,
+                speaker_stats.completed_segments,
+                speaker_stats.unknown_segments,
+                speaker_stats.failed_segments,
+                speaker_stats.processing_seconds,
             )
 
 

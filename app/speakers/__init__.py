@@ -13,6 +13,7 @@ from app.speakers.identification import (
     RememberedSpeakerProfile,
     SessionSpeakerProfile,
     SpeakerIdentification,
+    SpeakerIdentificationStats,
     SpeakerIdentificationWorker,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "RememberedSpeakerProfile",
     "SessionSpeakerProfile",
     "SpeakerIdentification",
+    "SpeakerIdentificationStats",
     "SpeakerIdentificationWorker",
     "assign_caption_speaker",
     "person_index",

@@ -456,3 +456,67 @@ def test_remembered_person_copies_approved_signature_and_renames_messages() -> N
         second_embedding,
     }
 
+
+def test_remembered_people_can_be_managed_without_deleting_conversations() -> None:
+    database = HistoryDatabase(":memory:")
+
+    def remember(name: str, marker: int) -> tuple[int, int, int]:
+        session_id = create_session(database, f"Session {name}")
+        session_person_id = database.upsert_session_person(
+            session_id=session_id,
+            session_label="Person A",
+            person_id=None,
+            confidence=0.9,
+        )
+        database.add_session_voice_signature(
+            session_person_id=session_person_id,
+            embedding=bytes([marker]) * 8,
+            model_name="test-model",
+            model_version="1",
+            dimensions=2,
+            quality_score=0.9,
+        )
+        database.add_message(
+            session_id=session_id,
+            session_person_id=session_person_id,
+            speaker_label="Person A",
+            start_offset_seconds=0.0,
+            end_offset_seconds=1.0,
+            source_language="en",
+            language_confidence=0.9,
+            original_text=f"Message from {name}",
+            target_language="fr",
+            translated_text=None,
+        )
+        return (
+            database.remember_session_person(session_person_id, name),
+            session_id,
+            session_person_id,
+        )
+
+    alice_id, alice_session, _ = remember("Alice", 1)
+    bob_id, bob_session, _ = remember("Bob", 2)
+    assert [person.name for person in database.list_people()] == ["Alice", "Bob"]
+
+    database.set_person_recognition_enabled(alice_id, False)
+    assert [profile.name for profile in database.list_person_profiles()] == ["Bob"]
+    database.set_person_recognition_enabled(alice_id, True)
+    database.rename_person(alice_id, "Alicia")
+    assert database.get_messages(alice_session)[0].speaker_label == "Alicia"
+
+    database.merge_people(bob_id, alice_id)
+    assert [person.name for person in database.list_people()] == ["Alicia"]
+    assert database.get_messages(bob_session)[0].speaker_label == "Alicia"
+
+    database.forget_person_voice(alice_id)
+    summary = database.list_people()[0]
+    assert not summary.recognition_enabled
+    assert summary.signature_count == 0
+    assert database.get_messages(alice_session)[0].speaker_label == "Person A"
+    assert database.get_messages(bob_session)[0].speaker_label == "Person A"
+
+    database.delete_person(alice_id)
+    assert database.list_people() == []
+    assert database.get_session(alice_session) is not None
+    assert database.get_session(bob_session) is not None
+

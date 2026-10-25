@@ -81,6 +81,15 @@ class PersonProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class RememberedPersonSummary:
+    id: int
+    name: str
+    recognition_enabled: bool
+    signature_count: int
+    session_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class SessionPerson:
     id: int
     session_id: int
@@ -874,11 +883,7 @@ class HistoryDatabase:
     def remember_session_person(self, session_person_id: int, name: str) -> int:
         """Create or update one user-approved person and copy voice signatures."""
 
-        normalized_name = " ".join(name.split())
-        if not normalized_name:
-            raise ValueError("Person name cannot be empty.")
-        if len(normalized_name) > 120:
-            raise ValueError("Person name cannot exceed 120 characters.")
+        normalized_name = self._validated_person_name(name)
         now = local_timestamp()
         with self._lock, self._connection:
             row = self._connection.execute(
@@ -912,6 +917,13 @@ class HistoryDatabase:
             )
             self._connection.execute(
                 """
+                UPDATE session_persons SET session_display_name = ?
+                WHERE person_id = ?
+                """,
+                (normalized_name, person_id),
+            )
+            self._connection.execute(
+                """
                 INSERT INTO person_voice_signatures(
                     person_id, embedding, model_name, model_version,
                     dimensions, quality_score, created_at,
@@ -935,9 +947,11 @@ class HistoryDatabase:
             self._connection.execute(
                 """
                 UPDATE messages SET speaker_label = ?
-                WHERE session_person_id = ?
+                WHERE session_person_id IN (
+                    SELECT id FROM session_persons WHERE person_id = ?
+                )
                 """,
-                (normalized_name, session_person_id),
+                (normalized_name, person_id),
             )
             return int(person_id)
 
@@ -979,6 +993,240 @@ class HistoryDatabase:
             PersonProfile(person_id, name, tuple(signatures))
             for person_id, (name, signatures) in grouped.items()
         ]
+
+    def list_people(self) -> list[RememberedPersonSummary]:
+        """List remembered people, including disabled or signature-free rows."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT persons.id, persons.name, persons.recognition_enabled,
+                       COUNT(DISTINCT signatures.id) AS signature_count,
+                       COUNT(DISTINCT session_people.session_id) AS session_count
+                FROM persons
+                LEFT JOIN person_voice_signatures AS signatures
+                  ON signatures.person_id = persons.id
+                LEFT JOIN session_persons AS session_people
+                  ON session_people.person_id = persons.id
+                GROUP BY persons.id
+                ORDER BY LOWER(COALESCE(persons.name, '')), persons.id
+                """
+            ).fetchall()
+        return [
+            RememberedPersonSummary(
+                id=int(row["id"]),
+                name=str(row["name"] or "Unnamed person"),
+                recognition_enabled=bool(row["recognition_enabled"]),
+                signature_count=int(row["signature_count"]),
+                session_count=int(row["session_count"]),
+            )
+            for row in rows
+        ]
+
+    def rename_person(self, person_id: int, name: str) -> None:
+        normalized_name = self._validated_person_name(name)
+        now = local_timestamp()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE persons SET name = ?, updated_at = ? WHERE id = ?",
+                (normalized_name, now, person_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("The selected remembered person does not exist.")
+            self._connection.execute(
+                """
+                UPDATE session_persons SET session_display_name = ?
+                WHERE person_id = ?
+                """,
+                (normalized_name, person_id),
+            )
+            self._connection.execute(
+                """
+                UPDATE messages SET speaker_label = ?
+                WHERE session_person_id IN (
+                    SELECT id FROM session_persons WHERE person_id = ?
+                )
+                """,
+                (normalized_name, person_id),
+            )
+
+    def set_person_recognition_enabled(
+        self,
+        person_id: int,
+        enabled: bool,
+    ) -> None:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE persons
+                SET recognition_enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(enabled), local_timestamp(), person_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("The selected remembered person does not exist.")
+
+    def forget_person_voice(self, person_id: int) -> None:
+        """Remove reusable identity data while preserving conversation text."""
+
+        with self._lock, self._connection:
+            self._require_person(person_id)
+            self._restore_original_session_labels(person_id)
+            self._connection.execute(
+                "DELETE FROM person_voice_signatures WHERE person_id = ?",
+                (person_id,),
+            )
+            self._connection.execute(
+                """
+                UPDATE persons
+                SET recognition_enabled = 0, updated_at = ? WHERE id = ?
+                """,
+                (local_timestamp(), person_id),
+            )
+
+    def delete_person(self, person_id: int) -> None:
+        """Delete one profile while retaining its conversations and labels."""
+
+        with self._lock, self._connection:
+            self._require_person(person_id)
+            self._restore_original_session_labels(person_id)
+            self._connection.execute("DELETE FROM persons WHERE id = ?", (person_id,))
+
+    def merge_people(
+        self,
+        source_person_id: int,
+        target_person_id: int,
+        *,
+        max_signatures: int = 5,
+    ) -> None:
+        """Merge one mistaken duplicate into the selected remembered person."""
+
+        if source_person_id == target_person_id:
+            raise ValueError("Choose two different remembered people to merge.")
+        if max_signatures <= 0:
+            raise ValueError("max_signatures must be greater than zero.")
+        with self._lock, self._connection:
+            self._require_person(source_person_id)
+            target_name = self._require_person(target_person_id)
+            source_signatures = self._connection.execute(
+                """
+                SELECT embedding, model_name, model_version, dimensions,
+                       quality_score, created_at, source_session_person_id
+                FROM person_voice_signatures WHERE person_id = ?
+                ORDER BY quality_score DESC, id DESC
+                """,
+                (source_person_id,),
+            ).fetchall()
+            for signature in source_signatures:
+                duplicate = self._connection.execute(
+                    """
+                    SELECT 1 FROM person_voice_signatures
+                    WHERE person_id = ? AND embedding = ?
+                      AND model_name = ? AND model_version = ?
+                    """,
+                    (
+                        target_person_id,
+                        signature["embedding"],
+                        signature["model_name"],
+                        signature["model_version"],
+                    ),
+                ).fetchone()
+                if duplicate is None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO person_voice_signatures(
+                            person_id, embedding, model_name, model_version,
+                            dimensions, quality_score, created_at,
+                            source_session_person_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            target_person_id,
+                            signature["embedding"],
+                            signature["model_name"],
+                            signature["model_version"],
+                            signature["dimensions"],
+                            signature["quality_score"],
+                            signature["created_at"],
+                            signature["source_session_person_id"],
+                        ),
+                    )
+            self._connection.execute(
+                """
+                UPDATE session_persons
+                SET person_id = ?, session_display_name = ?
+                WHERE person_id = ?
+                """,
+                (target_person_id, target_name, source_person_id),
+            )
+            self._connection.execute(
+                """
+                UPDATE messages SET speaker_label = ?
+                WHERE session_person_id IN (
+                    SELECT id FROM session_persons WHERE person_id = ?
+                )
+                """,
+                (target_name, target_person_id),
+            )
+            self._connection.execute(
+                "DELETE FROM persons WHERE id = ?",
+                (source_person_id,),
+            )
+            kept = self._connection.execute(
+                """
+                SELECT id FROM person_voice_signatures
+                WHERE person_id = ?
+                ORDER BY quality_score DESC, id DESC
+                LIMIT -1 OFFSET ?
+                """,
+                (target_person_id, max_signatures),
+            ).fetchall()
+            self._connection.executemany(
+                "DELETE FROM person_voice_signatures WHERE id = ?",
+                ((int(row["id"]),) for row in kept),
+            )
+
+    @staticmethod
+    def _validated_person_name(name: str) -> str:
+        normalized_name = " ".join(name.split())
+        if not normalized_name:
+            raise ValueError("Person name cannot be empty.")
+        if len(normalized_name) > 120:
+            raise ValueError("Person name cannot exceed 120 characters.")
+        return normalized_name
+
+    def _require_person(self, person_id: int) -> str:
+        row = self._connection.execute(
+            "SELECT name FROM persons WHERE id = ?",
+            (person_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("The selected remembered person does not exist.")
+        return str(row["name"] or "Unnamed person")
+
+    def _restore_original_session_labels(self, person_id: int) -> None:
+        self._connection.execute(
+            """
+            UPDATE messages
+            SET speaker_label = (
+                SELECT session_label FROM session_persons
+                WHERE session_persons.id = messages.session_person_id
+            )
+            WHERE session_person_id IN (
+                SELECT id FROM session_persons WHERE person_id = ?
+            )
+            """,
+            (person_id,),
+        )
+        self._connection.execute(
+            """
+            UPDATE session_persons
+            SET person_id = NULL, session_display_name = NULL
+            WHERE person_id = ?
+            """,
+            (person_id,),
+        )
 
     def list_session_speaker_profiles(
         self,

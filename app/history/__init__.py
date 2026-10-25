@@ -6,6 +6,7 @@ from app.history.database import (
     HistorySession,
     PersonProfile,
     PersonVoiceSignature,
+    RememberedPersonSummary,
     SessionPerson,
     SessionSpeakerProfile,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "HistorySession",
     "PersonProfile",
     "PersonVoiceSignature",
+    "RememberedPersonSummary",
     "SessionPerson",
     "SessionSpeakerProfile",
 ]

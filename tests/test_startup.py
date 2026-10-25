@@ -176,6 +176,10 @@ def test_main_window_starts_ready() -> None:
         "Speech sensitivity: 5/9 (Balanced)"
     )
     assert not window.speaker_identification_checkbox.isChecked()
+    assert window.speaker_match_slider.value() == 5
+    assert not window.speaker_match_slider.isEnabled()
+    assert window.speaker_match_label.text() == "Voice match: 5/9 (Balanced)"
+    assert window.remembered_people_button.text() == "Remembered people"
     assert window.start_stop_button.minimumHeight() == 48
     assert window.pause_resume_button.minimumHeight() == 48
     assert window.stop_button.minimumHeight() == 48
@@ -266,6 +270,7 @@ def test_main_interface_choices_persist_between_windows() -> None:
     window.speech_chunk_duration_slider.setValue(45)
     window.speech_sensitivity_slider.setValue(8)
     window.speaker_identification_checkbox.setChecked(True)
+    window.speaker_match_slider.setValue(7)
     window.sidebar_toggle_button.setChecked(False)
     window.close()
 
@@ -282,6 +287,8 @@ def test_main_interface_choices_persist_between_windows() -> None:
     assert restored.speech_chunk_duration_slider.value() == 45
     assert restored.speech_sensitivity_slider.value() == 8
     assert restored.speaker_identification_checkbox.isChecked()
+    assert restored.speaker_match_slider.value() == 7
+    assert restored.speaker_match_slider.isEnabled()
     assert restored.conversation_sidebar.isHidden()
     assert restored.sidebar_toggle_button.text() == "Show conversations"
     restored.close()
@@ -515,6 +522,35 @@ def test_detected_session_speaker_can_be_remembered_with_user_approval() -> None
     assert history.list_person_profiles()[0].name == "Alice"
     assert window.caption_chat.messages[0].speaker_label.text() == "Alice"
     assert window._remembered_speaker_profiles()[0].name == "Alice"
+
+    window.stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    window.close()
+
+
+def test_speaker_detection_setting_reaches_capture_pipeline() -> None:
+    create_application(["live-caption-translation-test"])
+    captured_options = {}
+    monitors = []
+
+    def monitor_factory(*arguments, **options):
+        captured_options.update(options)
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+    )
+    window.speaker_identification_checkbox.setChecked(True)
+    window.speaker_match_slider.setValue(7)
+    window.start_stop_button.click()
+
+    assert captured_options["speaker_profiles"] == ()
+    assert captured_options["session_speaker_profiles"] == ()
+    assert captured_options["speaker_match_threshold"] == 0.73
+    assert not window.speaker_match_slider.isEnabled()
 
     window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)

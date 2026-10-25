@@ -275,13 +275,15 @@ Remaining: high-DPI, multiple-monitor, windowed/borderless game, and full-pipeli
 
 **In progress; first live integration implemented.** sherpa-onnx 1.12.33 and project-local INT8 segmentation plus TitaNet embedding models are installed. The isolated wrapper provides unlimited labels, diarization, timestamp assignment, and conservative unknown/overlap results. The 16-second public two-speaker sample found two speakers and four turns in 0.488 seconds after a 0.231-second load, ending near 171 MiB.
 
-An optional, bounded speaker-embedding worker now runs beside Whisper, keeps up to five signatures per session speaker, joins results by sample timestamps, and saves session people/signatures. Pause/resume restores the existing clusters and Person indices. It remains disabled by default. Next: test combined CPU/RAM, delay, merges, splits, overlap, and 2/3/4+ real speakers before treating live diarization as complete.
+An optional, bounded speaker-embedding worker now runs beside Whisper, keeps up to five signatures per session speaker, joins results by sample timestamps, and saves session people/signatures. Pause/resume restores the existing clusters and Person indices. A saved **Voice match** setting maps levels 1–9 to similarity thresholds 0.49–0.81; the default balanced level is the original 0.65 threshold. Live statistics show model load, labelled, unknown, queued, failed, and total speaker-processing values. It remains disabled by default. Next: test combined CPU/RAM, delay, merges, splits, overlap, threshold behavior, and 2/3/4+ real speakers before treating live diarization as complete.
 
 ### Stage 10 — Remembered people
 
-**Initial opt-in slice implemented.** When speaker detection is enabled, the user can right-click a labelled message and choose **Remember or rename speaker…**. Only that explicit action creates a permanent person and copies up to five session signatures. Later sessions load approved profiles and can show the saved name for a strong, unambiguous voice match. Short speech stays `Unknown`, and the feature is disabled by default.
+**Local management slice implemented.** When speaker detection is enabled, the user can right-click a labelled message and choose **Remember or rename speaker…**. Only that explicit action creates a permanent person and copies up to five session signatures. Later sessions load approved profiles and can show the saved name for a strong, unambiguous voice match. Short speech stays `Unknown`, and the feature is disabled by default.
 
-Remaining: a remembered-people management screen, merge/forget/delete controls, adjustable thresholds, quality filtering beyond minimum duration, and real false-accept/false-reject testing with similar voices.
+The **Remembered people** manager lists profile status, signature count, and linked-session count. It supports rename, recognition enable/disable, merge, **Forget voice**, and profile deletion. Forget and delete restore the original session Person labels while retaining conversation text. Merging keeps the strongest five distinct signatures and updates linked messages to the chosen name. Management is disabled during live capture so a running worker cannot immediately relink a profile the user just removed; it is available while idle or paused.
+
+Remaining: stronger quality filtering, an optional candidate-confirmation period before creating a new Person label, and real false-accept/false-reject testing with similar voices.
 
 ### Stage 11 — Packaging and offline setup
 
@@ -302,7 +304,7 @@ Planned: Windows package, first-run model downloader, file verification, disk-sp
 - High-DPI and multiple-monitor overlay behavior.
 - Offline operation, CPU-only operation, and later a supported GPU computer.
 
-Current automated baseline after the first remembered-speaker slice: 97 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
+Current automated baseline after speaker diagnostics and remembered-people management: 100 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
 
 ## Deferred and distant-future work
 

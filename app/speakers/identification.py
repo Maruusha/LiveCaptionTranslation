@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
+from time import perf_counter
 from typing import Protocol
 
 import numpy as np
@@ -57,6 +58,18 @@ class SpeakerIdentification:
     confidence: float
     embedding: np.ndarray | None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerIdentificationStats:
+    queued_segments: int
+    active_segments: int
+    active_elapsed_seconds: float
+    completed_segments: int
+    unknown_segments: int
+    failed_segments: int
+    model_load_seconds: float
+    processing_seconds: float
 
 
 class SherpaSpeakerEmbeddingModel:
@@ -147,11 +160,36 @@ class SpeakerIdentificationWorker:
         self._session_signatures: dict[int, list[np.ndarray]] = {}
         self._session_person_ids: dict[int, int | None] = {}
         self._session_names: dict[int, str | None] = {}
+        self._completed_segments = 0
+        self._unknown_segments = 0
+        self._failed_segments = 0
+        self._model_load_seconds = 0.0
+        self._processing_seconds = 0.0
+        self._active_started_at: float | None = None
 
     @property
     def is_running(self) -> bool:
         thread = self._thread
         return thread is not None and thread.is_alive()
+
+    @property
+    def stats(self) -> SpeakerIdentificationStats:
+        with self._state_lock:
+            active_started_at = self._active_started_at
+            return SpeakerIdentificationStats(
+                queued_segments=self._queue.qsize(),
+                active_segments=int(active_started_at is not None),
+                active_elapsed_seconds=(
+                    perf_counter() - active_started_at
+                    if active_started_at is not None
+                    else 0.0
+                ),
+                completed_segments=self._completed_segments,
+                unknown_segments=self._unknown_segments,
+                failed_segments=self._failed_segments,
+                model_load_seconds=self._model_load_seconds,
+                processing_seconds=self._processing_seconds,
+            )
 
     def start(self) -> None:
         if self.is_running:
@@ -162,6 +200,12 @@ class SpeakerIdentificationWorker:
             self._session_signatures.clear()
             self._session_person_ids.clear()
             self._session_names.clear()
+            self._completed_segments = 0
+            self._unknown_segments = 0
+            self._failed_segments = 0
+            self._model_load_seconds = 0.0
+            self._processing_seconds = 0.0
+            self._active_started_at = None
         self._thread = Thread(
             target=self._run,
             name="speaker-identification-worker",
@@ -211,9 +255,12 @@ class SpeakerIdentificationWorker:
 
     def _run(self) -> None:
         try:
+            model_load_started = perf_counter()
             model = self._model_factory()
             profiles = self._prepare_profiles(model.dimension)
             self._prepare_session_profiles(model.dimension)
+            with self._state_lock:
+                self._model_load_seconds = perf_counter() - model_load_started
         except Exception as error:
             message = f"Speaker-identification model could not load: {error}"
             with self._state_lock:
@@ -229,6 +276,9 @@ class SpeakerIdentificationWorker:
                 if self._stop_event.is_set():
                     return
                 continue
+            started = perf_counter()
+            with self._state_lock:
+                self._active_started_at = started
             try:
                 if segment.samples.size < self._minimum_samples:
                     self._emit_unknown(segment)
@@ -237,10 +287,16 @@ class SpeakerIdentificationWorker:
                 self._result_callback(
                     self._classify(segment, embedding, profiles)
                 )
+                with self._state_lock:
+                    self._completed_segments += 1
             except Exception as error:
                 message = f"Speaker identification failed: {error}"
                 self._warning_callback(message)
                 self._emit_unknown(segment, str(error))
+            finally:
+                with self._state_lock:
+                    self._processing_seconds += perf_counter() - started
+                    self._active_started_at = None
 
     def _prepare_profiles(
         self,
@@ -413,6 +469,10 @@ class SpeakerIdentificationWorker:
         segment: SpeechSegment,
         error: str | None = None,
     ) -> None:
+        with self._state_lock:
+            self._unknown_segments += 1
+            if error is not None:
+                self._failed_segments += 1
         self._result_callback(
             SpeakerIdentification(
                 segment.start_sample,

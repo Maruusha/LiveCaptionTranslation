@@ -59,6 +59,7 @@ from app.speakers.identification import (
     SPEAKER_MODEL_VERSION,
     RememberedSpeakerProfile,
     SessionSpeakerProfile,
+    SpeakerIdentificationStats,
 )
 from app.speech.vad import (
     VAD_SAMPLE_RATE,
@@ -80,6 +81,7 @@ from app.ui.overlay_settings import (
     save_overlay_appearance,
     save_overlay_geometry,
 )
+from app.ui.people_dialog import RememberedPeopleDialog
 
 
 MonitorFactory = Callable[
@@ -318,6 +320,28 @@ class MainWindow(QMainWindow):
             "Uses additional CPU. Voice signatures stay session-only unless "
             "you explicitly remember a speaker from a message bubble."
         )
+        self.speaker_identification_checkbox.toggled.connect(
+            self._update_speaker_controls
+        )
+        self.speaker_match_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speaker_match_slider.setObjectName("speakerMatchSlider")
+        self.speaker_match_slider.setRange(1, 9)
+        self.speaker_match_slider.setValue(5)
+        self.speaker_match_slider.setTickInterval(1)
+        self.speaker_match_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.speaker_match_slider.setToolTip(
+            "Stricter matching reduces wrong remembered names but may miss "
+            "the same person more often."
+        )
+        self.speaker_match_label = QLabel()
+        self.speaker_match_slider.valueChanged.connect(
+            self._update_speaker_match_label
+        )
+        self._update_speaker_match_label()
+        speaker_match_layout = QHBoxLayout()
+        speaker_match_layout.addWidget(self.speaker_match_label)
+        speaker_match_layout.addWidget(self.speaker_match_slider, stretch=1)
+        self._update_speaker_controls()
 
         self.speech_chunk_duration_slider = QSlider(
             Qt.Orientation.Horizontal
@@ -420,6 +444,11 @@ class MainWindow(QMainWindow):
         self.clear_captions_button = QPushButton("Clear screen")
         self.clear_captions_button.setObjectName("clearCaptionsButton")
         self.clear_captions_button.clicked.connect(self._clear_caption_screen)
+        self.remembered_people_button = QPushButton("Remembered people")
+        self.remembered_people_button.setObjectName("rememberedPeopleButton")
+        self.remembered_people_button.clicked.connect(
+            self._open_remembered_people
+        )
         self.to_bottom_button = QPushButton("To bottom")
         self.to_bottom_button.setObjectName("toBottomButton")
         self.to_bottom_button.clicked.connect(self.caption_chat.scroll_to_bottom)
@@ -435,6 +464,7 @@ class MainWindow(QMainWindow):
         chat_actions.addWidget(self.overlay_toggle_button)
         chat_actions.addWidget(self.overlay_settings_button)
         chat_actions.addWidget(self.sidebar_toggle_button)
+        chat_actions.addWidget(self.remembered_people_button)
         chat_actions.addStretch()
         chat_actions.addWidget(self.to_bottom_button)
         chat_actions.addWidget(self.clear_captions_button)
@@ -505,6 +535,7 @@ class MainWindow(QMainWindow):
         performance_layout.addLayout(chunk_duration_layout)
         performance_layout.addLayout(sensitivity_layout)
         performance_layout.addWidget(self.speaker_identification_checkbox)
+        performance_layout.addLayout(speaker_match_layout)
         performance_layout.addLayout(performance_selector_layout)
         performance_layout.addWidget(self.performance_summary)
         performance_layout.addStretch()
@@ -1039,6 +1070,26 @@ class MainWindow(QMainWindow):
         # Keep Silero's exit threshold (speech threshold - 0.15) positive.
         return round(0.875 - self.speech_sensitivity_slider.value() * 0.075, 3)
 
+    def _update_speaker_match_label(self, _value: int | None = None) -> None:
+        value = self.speaker_match_slider.value()
+        description = "Balanced"
+        if value < 5:
+            description = "Looser"
+        elif value > 5:
+            description = "Stricter"
+        self.speaker_match_label.setText(
+            f"Voice match: {value}/9 ({description})"
+        )
+
+    def _update_speaker_controls(self, _checked: bool | None = None) -> None:
+        self.speaker_match_slider.setEnabled(
+            self.speaker_identification_checkbox.isChecked()
+            and self._runtime.state is RuntimeState.IDLE
+        )
+
+    def _speaker_match_threshold(self) -> float:
+        return round(0.45 + self.speaker_match_slider.value() * 0.04, 2)
+
     def _remembered_speaker_profiles(
         self,
     ) -> tuple[RememberedSpeakerProfile, ...]:
@@ -1128,6 +1179,7 @@ class MainWindow(QMainWindow):
                     session_speaker_profiles=(
                         self._current_session_speaker_profiles()
                     ),
+                    speaker_match_threshold=self._speaker_match_threshold(),
                 )
                 if speaker_profiles is not None
                 else self._loopback_monitor_factory(
@@ -1154,6 +1206,7 @@ class MainWindow(QMainWindow):
                 session_speaker_profiles=(
                     self._current_session_speaker_profiles()
                 ),
+                speaker_match_threshold=self._speaker_match_threshold(),
             )
             if speaker_profiles is not None
             else self._monitor_factory(
@@ -1243,6 +1296,8 @@ class MainWindow(QMainWindow):
         self.speech_chunk_duration_slider.setEnabled(False)
         self.speech_sensitivity_slider.setEnabled(False)
         self.speaker_identification_checkbox.setEnabled(False)
+        self.speaker_match_slider.setEnabled(False)
+        self.remembered_people_button.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setVisible(False)
         self.pause_resume_button.setText("Pause")
@@ -1294,6 +1349,7 @@ class MainWindow(QMainWindow):
         self._runtime.transition(RuntimeState.RESUMING)
         self.pause_resume_button.setEnabled(False)
         self.stop_button.setEnabled(False)
+        self.remembered_people_button.setEnabled(False)
         self.speech_status.setText("Speech detection: resuming…")
         self.statusBar().showMessage("Resuming audio capture…")
 
@@ -1570,6 +1626,7 @@ class MainWindow(QMainWindow):
                 monitor.voice_activity_stats,
                 monitor.recognition_stats,
                 monitor.translation_stats,
+                getattr(monitor, "speaker_identification_stats", None),
             )
 
         if stop_operation == "pause" and stop_error is None:
@@ -1603,6 +1660,7 @@ class MainWindow(QMainWindow):
             self.stop_button.setText("Stop")
             self.stop_button.setEnabled(True)
             self.stop_button.setVisible(True)
+            self.remembered_people_button.setEnabled(True)
             self._refresh_conversation_sidebar(LIVE_ITEM_KEY)
             logger.info("Caption session paused")
             if after_stop is not None:
@@ -1656,6 +1714,8 @@ class MainWindow(QMainWindow):
         self.speech_chunk_duration_slider.setEnabled(True)
         self.speech_sensitivity_slider.setEnabled(True)
         self.speaker_identification_checkbox.setEnabled(True)
+        self._update_speaker_controls()
+        self.remembered_people_button.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.start_stop_button.setEnabled(
             self.output_selector.isEnabled()
@@ -1923,6 +1983,17 @@ class MainWindow(QMainWindow):
         logger.info("Session speaker remembered with user-approved name")
         self.statusBar().showMessage("Speaker remembered for future sessions")
 
+    def _open_remembered_people(self) -> None:
+        dialog = RememberedPeopleDialog(self._history, self)
+        dialog.exec()
+        if self._viewing_history_session_id is not None:
+            self._load_history_messages(self._viewing_history_session_id)
+        self._refresh_conversation_sidebar(
+            LIVE_ITEM_KEY
+            if self._showing_live_conversation
+            else self._viewing_history_session_id
+        )
+
     def _update_caption_display_mode(self) -> None:
         mode = str(self.caption_view_selector.currentData())
         self.caption_chat.set_display_mode(mode)
@@ -2032,6 +2103,13 @@ class MainWindow(QMainWindow):
                 False,
             )
         )
+        self.speaker_match_slider.setValue(
+            self._safe_setting_int(
+                self._interface_settings.value("ui/speaker_match", 5),
+                5,
+            )
+        )
+        self._update_speaker_controls()
         self._expanded_sidebar_width = max(
             230,
             min(
@@ -2071,6 +2149,9 @@ class MainWindow(QMainWindow):
             self.speaker_identification_checkbox.isChecked(),
         )
         self._interface_settings.setValue(
+            "ui/speaker_match", self.speaker_match_slider.value()
+        )
+        self._interface_settings.setValue(
             "ui/sidebar_width", self._expanded_sidebar_width
         )
         self._interface_settings.setValue(
@@ -2093,6 +2174,7 @@ class MainWindow(QMainWindow):
             monitor.voice_activity_stats,
             monitor.recognition_stats,
             monitor.translation_stats,
+            getattr(monitor, "speaker_identification_stats", None),
         )
 
     def _show_performance_report(
@@ -2101,6 +2183,7 @@ class MainWindow(QMainWindow):
         vad_stats: VoiceActivityStats | None = None,
         recognition_stats: RecognitionStats | None = None,
         translation_stats: TranslationStats | None = None,
+        speaker_stats: SpeakerIdentificationStats | None = None,
     ) -> None:
         if report is None:
             return
@@ -2136,6 +2219,14 @@ class MainWindow(QMainWindow):
                 f"{translation_stats.queued_captions} queued  |  "
                 f"{translation_stats.failed_captions} failed  |  "
                 f"{translation_stats.processing_seconds:.2f}s total"
+            )
+        if speaker_stats is not None:
+            summary += (
+                f"\nSpeakers: {speaker_stats.completed_segments} labelled  |  "
+                f"{speaker_stats.unknown_segments} unknown  |  "
+                f"{speaker_stats.queued_segments} queued  |  "
+                f"{speaker_stats.failed_segments} failed  |  "
+                f"{speaker_stats.processing_seconds:.2f}s total"
             )
         self.performance_summary.setText(summary)
 

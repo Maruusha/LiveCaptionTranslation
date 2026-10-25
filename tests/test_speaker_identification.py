@@ -56,6 +56,10 @@ def test_worker_reuses_session_label_and_finds_remembered_person() -> None:
     assert results[0].session_speaker_index == results[1].session_speaker_index
     assert results[2].remembered_person_id == 7
     assert results[2].session_speaker_index == 1
+    assert worker.stats.completed_segments == 3
+    assert worker.stats.unknown_segments == 0
+    assert worker.stats.failed_segments == 0
+    assert worker.stats.processing_seconds >= 0.0
 
 
 def test_short_speech_stays_unknown_and_does_not_create_person() -> None:
@@ -78,6 +82,8 @@ def test_short_speech_stays_unknown_and_does_not_create_person() -> None:
 
     assert result[0].label == "Unknown"
     assert result[1].label == "Person A"
+    assert worker.stats.completed_segments == 1
+    assert worker.stats.unknown_segments == 1
 
 
 def test_worker_restores_session_labels_after_pause() -> None:
