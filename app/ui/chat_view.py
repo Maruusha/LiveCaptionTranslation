@@ -203,6 +203,25 @@ class CaptionChatView(QScrollArea):
             QTimer.singleShot(0, self, self.scroll_to_bottom)
         return bubble
 
+    def add_event(self, text: str, timestamp: str = "") -> QLabel:
+        """Add a centered saved-session event such as Pause or Resume."""
+
+        scrollbar = self.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        self._placeholder.hide()
+        label = QLabel(f"{text}  ·  {timestamp}" if timestamp else text)
+        label.setObjectName("conversationEvent")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet(
+            "color: #667781; background: #f0f2f5; border-radius: 9px; "
+            "padding: 4px 10px;"
+        )
+        self._layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self._rows.append(label)
+        if was_at_bottom:
+            QTimer.singleShot(0, self, self.scroll_to_bottom)
+        return label
+
     def set_display_mode(self, mode: str) -> None:
         if mode not in {"both", "original", "translation"}:
             raise ValueError(f"Unknown caption display mode: {mode}")

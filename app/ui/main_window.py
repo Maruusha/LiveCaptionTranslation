@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QRadioButton,
@@ -42,7 +44,12 @@ from app.audio.loopback import (
 )
 from app.core.performance import PerformanceReport, format_mebibytes
 from app.core.state import RuntimeState, RuntimeStateMachine
-from app.history.database import HistoryDatabase, local_timestamp
+from app.history.database import (
+    HistoryDatabase,
+    HistoryEvent,
+    HistoryMessage,
+    local_timestamp,
+)
 from app.speech.recognition import RecognitionStats
 from app.speech.vad import (
     VAD_SAMPLE_RATE,
@@ -131,6 +138,7 @@ class MainWindow(QMainWindow):
         self._active_history_session_id: int | None = None
         self._viewing_history_session_id: int | None = None
         self._showing_live_conversation = False
+        self._history_search_text = ""
         self._device_provider = device_provider or list_input_devices
         self._refresh_device_provider = device_provider or refresh_input_devices
         self._monitor_factory = monitor_factory or MicrophoneLevelMonitor
@@ -422,6 +430,21 @@ class MainWindow(QMainWindow):
         self.conversation_sidebar.session_selected.connect(
             self._show_saved_conversation
         )
+        self.conversation_sidebar.search_changed.connect(
+            self._search_conversations
+        )
+        self.conversation_sidebar.rename_requested.connect(
+            self._rename_conversation
+        )
+        self.conversation_sidebar.delete_requested.connect(
+            self._delete_conversation
+        )
+        self.conversation_sidebar.delete_all_requested.connect(
+            self._delete_all_conversations
+        )
+        self.conversation_sidebar.maintenance_requested.connect(
+            self._maintain_history_database
+        )
 
         self.conversation_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.conversation_splitter.setObjectName("conversationSplitter")
@@ -502,6 +525,14 @@ class MainWindow(QMainWindow):
         self._restore_interface_settings()
         self.refresh_microphones()
         self._refresh_conversation_sidebar()
+        if self._history.startup_integrity != ("ok",):
+            details = "; ".join(self._history.startup_integrity)
+            logger.error("History database integrity warning: %s", details)
+            self.conversation_sidebar.set_database_warning(
+                "History database problem detected. The original database was "
+                "kept. Open Maintain for details."
+            )
+            self.statusBar().showMessage("History database needs attention")
 
     @property
     def runtime_state(self) -> RuntimeState:
@@ -514,8 +545,23 @@ class MainWindow(QMainWindow):
     ) -> None:
         if selected_key is None:
             selected_key = self.conversation_sidebar.selected_key()
+        all_sessions = self._history.list_sessions()
+        sessions = (
+            self._history.list_sessions(self._history_search_text)
+            if self._history_search_text
+            else all_sessions
+        )
+        active_session_id = self._active_history_session_id
+        sessions = [
+            session for session in sessions if session.id != active_session_id
+        ]
+        has_saved_sessions = any(
+            session.id != active_session_id
+            and session.status in {"completed", "incomplete"}
+            for session in all_sessions
+        )
         self.conversation_sidebar.set_sessions(
-            self._history.list_sessions(),
+            sessions,
             show_live=self._active_history_session_id is not None,
             live_status=(
                 "Paused"
@@ -524,6 +570,7 @@ class MainWindow(QMainWindow):
                 else "Listening now"
             ),
             selected_key=selected_key,
+            has_saved_sessions=has_saved_sessions,
         )
         if self._viewing_history_session_id is None:
             current_key = self.conversation_sidebar.selected_key()
@@ -553,16 +600,48 @@ class MainWindow(QMainWindow):
 
     def _load_history_messages(self, session_id: int) -> None:
         self.caption_chat.clear_messages()
+        timeline: list[
+            tuple[float, int, int, str, HistoryMessage | HistoryEvent]
+        ] = []
         for message in self._history.get_messages(session_id):
-            self.caption_chat.add_message(
-                original_text=message.original_text,
-                source_language=message.source_language,
-                translated_text=message.translated_text,
-                target_language=message.target_language,
-                speaker=message.speaker_label,
-                timestamp=self._history_message_time(message.created_at),
-                warning=message.warning,
+            timeline.append(
+                (
+                    self._history_sort_time(message.created_at),
+                    1,
+                    message.id,
+                    "message",
+                    message,
+                )
             )
+        for event in self._history.get_events(session_id):
+            if event.event_type not in {"pause", "resume"}:
+                continue
+            timeline.append(
+                (
+                    self._history_sort_time(event.occurred_at),
+                    0 if event.event_type == "resume" else 2,
+                    event.id,
+                    "event",
+                    event,
+                )
+            )
+        timeline.sort(key=lambda item: item[:3])
+        for _occurred_at, _priority, _item_id, kind, item in timeline:
+            if kind == "event" and isinstance(item, HistoryEvent):
+                self.caption_chat.add_event(
+                    "Paused" if item.event_type == "pause" else "Resumed",
+                    self._history_message_time(item.occurred_at),
+                )
+            elif isinstance(item, HistoryMessage):
+                self.caption_chat.add_message(
+                    original_text=item.original_text,
+                    source_language=item.source_language,
+                    translated_text=item.translated_text,
+                    target_language=item.target_language,
+                    speaker=item.speaker_label,
+                    timestamp=self._history_message_time(item.created_at),
+                    warning=item.warning,
+                )
         QTimer.singleShot(
             0,
             self.caption_chat,
@@ -575,6 +654,151 @@ class MainWindow(QMainWindow):
             return datetime.fromisoformat(timestamp).astimezone().strftime("%H:%M")
         except ValueError:
             return timestamp
+
+    @staticmethod
+    def _history_sort_time(timestamp: str) -> float:
+        try:
+            return datetime.fromisoformat(timestamp).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _search_conversations(self, search_text: str) -> None:
+        self._history_search_text = search_text.strip()
+        selected_key = self.conversation_sidebar.selected_key()
+        self._refresh_conversation_sidebar(selected_key)
+        self._show_selected_conversation()
+
+    def _show_selected_conversation(self) -> None:
+        selected_key = self.conversation_sidebar.selected_key()
+        if selected_key == LIVE_ITEM_KEY:
+            self._show_live_conversation()
+        elif isinstance(selected_key, int):
+            self._show_saved_conversation(selected_key)
+        else:
+            self._showing_live_conversation = False
+            self._viewing_history_session_id = None
+            self.chat_group.setTitle("Conversation history")
+            self.caption_chat.clear_messages()
+
+    def _rename_conversation(self, session_id: int) -> None:
+        session = self._history.get_session(session_id)
+        if session is None:
+            return
+        title, accepted = QInputDialog.getText(
+            self,
+            "Rename conversation",
+            "Conversation title:",
+            text=session.title,
+        )
+        if not accepted:
+            return
+        try:
+            self._history.rename_session(session_id, title)
+        except (sqlite3.Error, ValueError) as error:
+            QMessageBox.warning(self, "Rename failed", str(error))
+            return
+        self._refresh_conversation_sidebar(session_id)
+        if self._viewing_history_session_id == session_id:
+            self._show_saved_conversation(session_id)
+        logger.info("Conversation %d renamed", session_id)
+        self.statusBar().showMessage("Conversation renamed")
+
+    def _delete_conversation(self, session_id: int) -> None:
+        session = self._history.get_session(session_id)
+        if session is None:
+            return
+        choice = QMessageBox.question(
+            self,
+            "Delete conversation",
+            f'Delete "{session.title}" and all of its saved captions?\n\n'
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._history.delete_session(session_id)
+        except (sqlite3.Error, ValueError) as error:
+            QMessageBox.warning(self, "Delete failed", str(error))
+            return
+        if self._viewing_history_session_id == session_id:
+            self._viewing_history_session_id = None
+            self._showing_live_conversation = False
+        preferred_key = (
+            LIVE_ITEM_KEY if self._active_history_session_id is not None else None
+        )
+        self._refresh_conversation_sidebar(preferred_key)
+        self._show_selected_conversation()
+        logger.info("Conversation %d deleted", session_id)
+        self.statusBar().showMessage("Conversation deleted")
+
+    def _delete_all_conversations(self) -> None:
+        choice = QMessageBox.question(
+            self,
+            "Delete all history",
+            "Delete every completed and incomplete conversation?\n\n"
+            "An active live or paused conversation will be kept. "
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            deleted = self._history.delete_all_closed_sessions()
+        except sqlite3.Error as error:
+            QMessageBox.warning(self, "Delete failed", str(error))
+            return
+        if (
+            self._viewing_history_session_id is not None
+            and self._viewing_history_session_id != self._active_history_session_id
+        ):
+            self._viewing_history_session_id = None
+            self._showing_live_conversation = False
+        preferred_key = (
+            LIVE_ITEM_KEY if self._active_history_session_id is not None else None
+        )
+        self._refresh_conversation_sidebar(preferred_key)
+        self._show_selected_conversation()
+        logger.info("Deleted %d saved conversation(s)", deleted)
+        self.statusBar().showMessage(f"Deleted {deleted} conversation(s)")
+
+    def _maintain_history_database(self) -> None:
+        if self._runtime.state not in {RuntimeState.IDLE, RuntimeState.PAUSED}:
+            self.statusBar().showMessage(
+                "Pause or stop captioning before database maintenance"
+            )
+            return
+        try:
+            report = self._history.maintain()
+        except sqlite3.Error as error:
+            QMessageBox.warning(self, "Maintenance failed", str(error))
+            return
+        if not report.integrity_ok:
+            details = "\n".join(report.integrity_details)
+            QMessageBox.warning(
+                self,
+                "History database problem",
+                "The integrity check reported a problem. No automatic repair "
+                f"was attempted and the original database was kept.\n\n{details}",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "History database is healthy",
+            "The integrity check passed and unused database space was "
+            f"reclaimed.\n\nBefore: {format_mebibytes(report.size_before_bytes)}\n"
+            f"After: {format_mebibytes(report.size_after_bytes)}\n"
+            f"Reclaimed: {format_mebibytes(report.reclaimed_bytes)}",
+        )
+        logger.info(
+            "History maintenance completed: before=%d, after=%d, reclaimed=%d",
+            report.size_before_bytes,
+            report.size_after_bytes,
+            report.reclaimed_bytes,
+        )
+        self.statusBar().showMessage("History database is healthy")
 
     def _create_history_session(self, active_source: str) -> int:
         source_label = (

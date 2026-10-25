@@ -665,7 +665,7 @@ The current safe, lower-memory implementation releases the capture and processin
 
 **Game-audio stop result on 2026-10-25:** The interface stayed responsive while stopping, but one active Whisper call exceeded the 60-second finishing limit while the game was competing for CPU. Shutdown reported a clear error and preserved the conversation as `incomplete`. Stage 6 does not yet pass its clean-stop requirement under this load.
 
-**Automated verification:** Repeated pause/resume behavior, one-session reuse, durable pause/resume events, paused interface states, continuous caption offsets, stop-from-paused behavior, and invalid database transitions are covered. All 73 automated tests pass. Live tests for repeated pause/resume, audio-boundary behavior, and device removal while paused are intentionally deferred.
+**Automated verification:** Repeated pause/resume behavior, one-session reuse, durable pause/resume events, paused interface states, continuous caption offsets, stop-from-paused behavior, and invalid database transitions are covered. All 85 automated tests pass. Live tests for repeated pause/resume, audio-boundary behavior, and device removal while paused are intentionally deferred.
 
 **Finished when:** Session controls behave consistently without losing finished messages, duplicating audio, or creating unintended sessions.
 
@@ -689,13 +689,15 @@ The current safe, lower-memory implementation releases the capture and processin
 
 **Live layout check and fix (2026-10-25):** Testing on the target Windows display found that the 48-pixel Start/Stop button could extend below the Live audio group and overlap the conversation title and controls. The maximum speech-chunk slider was moved to the processing panel, the speech-status labels were combined into one row, and excess vertical spacing was removed. A geometry regression check now requires the Live audio panel to end before the conversation panel begins.
 
-**Current automated verification:** All 73 tests pass, including the fixed single-Whisper-worker pipeline, the French/English translation gate, unsupported-language preservation, overlay formatting, safe appearance limits, click-through flags, settings reset, saved appearance and geometry, collapsible-sidebar behavior, saved main-interface choices, window flags, show/hide integration, live-caption updates, and Stage 6 session controls.
+**Current automated verification:** All 85 tests pass, including the fixed single-Whisper-worker pipeline, the French/English translation gate, unsupported-language preservation, overlay formatting, safe appearance limits, click-through flags, settings reset, saved appearance and geometry, collapsible-sidebar behavior, saved main-interface choices, window flags, show/hide integration, live-caption updates, Stage 6 session controls, and the completed Stage 8 history work.
 
 Automatic Person labels and colours, temporary-to-final bubble replacement, and right alignment for a manually selected `You` remain in later stages. Stage 7 still needs real high-DPI, multiple-monitor, windowed-game, borderless-game, and busy-pipeline responsiveness tests.
 
 **Finished when:** Live captions remain readable and the interface stays responsive while audio processing runs in the background.
 
 ### Stage 8 — Local history and crash recovery
+
+**Status: Complete (2026-10-25).**
 
 - Create the SQLite schema for sessions, session events, session people, temporary session voice signatures, and messages.
 - Save every final message during the active session.
@@ -704,9 +706,15 @@ Automatic Person labels and colours, temporary-to-final bubble replacement, and 
 - Keep raw audio out of the database.
 - Test database recovery, long histories, and deletion rules.
 
-**Current implementation (first history slice, 2026-10-22):** A project-local SQLite database at `data/history.sqlite3` now stores sessions, session events, and every final or warning caption as it arrives; raw audio is never stored. The schema also creates the planned `persons`, `person_voice_signatures`, `session_persons`, and `session_voice_signatures` tables so later speaker stages can extend the data without replacing the history design. A session is created when capture starts, marked `completed` after a clean stop, marked `incomplete` after a stop error, and any `live` or `paused` rows left by an earlier process are recovered as `incomplete` on the next launch.
+**Current implementation:** A project-local SQLite database at `data/history.sqlite3` stores sessions, session events, and every final or warning caption as it arrives; raw audio is never stored. The schema also contains the planned `persons`, `person_voice_signatures`, `session_persons`, and `session_voice_signatures` tables so later speaker stages can extend the data without replacing the history design. A session is created when capture starts, marked `completed` after a clean stop, marked `incomplete` after a stop error, and any `live` or `paused` rows left by an earlier process are recovered as `incomplete` on the next launch.
 
-The left conversation list shows newest sessions first with a title, time, latest-caption preview, and status. Selecting a saved session loads its messages into the same chat view on the right. A **Live conversation** entry stays at the top during capture. The user can read an older session while new live captions continue saving in the background, then return to Live to see the newest messages. `data/` is excluded from Git. Pause and resume events are now stored. Search, rename, confirmed deletion, database maintenance controls, and long-history performance testing remain to be implemented.
+The left conversation list shows newest sessions first with a title, time, latest-caption preview, status, and Today/Yesterday/Older grouping. Selecting a saved session loads its messages into the same chat view on the right. Stored pause and resume events appear as centered timeline dividers. A **Live conversation** entry stays at the top during capture without duplicating the active database session in the saved list. The user can read an older session while new live captions continue saving in the background, then return to Live to see the newest messages.
+
+The sidebar now provides indexed search across titles, original captions, and translations; rename; confirmed delete-one; confirmed delete-all; right-click Rename/Delete actions; and a database-maintenance action. Delete-all preserves an active live or paused session. Conversation deletion cascades through messages, events, session people, and session-scoped voice signatures, while an approved saved-person signature remains and loses only its deleted provenance link.
+
+Schema version 2 adds FTS5 search, relationship and message-time indexes, WAL mode for the on-disk database, UTC storage for new timestamps, ordered migrations, and a consistent pre-migration backup of an existing database. Startup and manual maintenance run SQLite integrity checks. Maintenance optimizes the database and reclaims unused pages only when the check passes. If a database cannot be opened or fails its check, the application reports the problem and does not silently replace or repair the original file. User-managed backup/restore controls remain a distant-future feature.
+
+**Automated verification:** Tests cover interrupted-session recovery, pause/resume events, title and caption search, renaming, active-session deletion protection, delete-one and delete-all confirmation paths, cascade and `SET NULL` rules, migration backup, reopening a copied recovery database, damaged-file preservation, integrity maintenance, and indexed search through 2,000 messages. All 85 tests pass.
 
 **Finished when:** Completed and interrupted sessions can be reopened with their captions, translations, labels, timestamps, and pause events intact.
 

@@ -75,6 +75,17 @@ def test_clear_chat_removes_bubbles_and_restores_placeholder() -> None:
     assert not chat._placeholder.isHidden()
 
 
+def test_chat_view_shows_saved_session_event_divider() -> None:
+    create_application(["live-caption-translation-test"])
+    chat = CaptionChatView()
+
+    event = chat.add_event("Paused", "10:05")
+
+    assert event.text() == "Paused  ·  10:05"
+    assert event.objectName() == "conversationEvent"
+    assert chat._placeholder.isHidden()
+
+
 def test_scroll_to_bottom_moves_to_newest_message() -> None:
     application = create_application(["live-caption-translation-test"])
     chat = CaptionChatView()

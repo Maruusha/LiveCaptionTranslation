@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app import APP_NAME, APP_VERSION
 from app.core.log_setup import configure_logging
@@ -46,7 +47,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
     log_file = configure_logging()
     logger.info("Application starting; log file: %s", log_file)
     application = create_application(arguments)
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except sqlite3.DatabaseError as error:
+        logger.exception("History database could not be opened")
+        QMessageBox.critical(
+            None,
+            "History database could not be opened",
+            "The local history database is damaged or incompatible. It was "
+            "not replaced. Restore a known-good backup or move the original "
+            f"database aside before restarting.\n\n{error}",
+        )
+        return 1
     window.show()
     exit_code = application.exec()
     logger.info("Application stopped with exit code %s", exit_code)

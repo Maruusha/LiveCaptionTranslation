@@ -7,11 +7,12 @@ from pathlib import Path
 from threading import Event, Thread
 from time import monotonic, sleep
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
@@ -1055,6 +1056,132 @@ def test_idle_device_change_refreshes_automatically() -> None:
     assert window.microphone_selector.count() == 2
     assert window.device_status.text() == "Found 2 connected microphones."
 
+    window.close()
+
+
+def test_history_search_rename_delete_and_delete_all_controls() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    first_id = history.create_session(
+        title="First conversation",
+        audio_source="microphone",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+    history.add_message(
+        session_id=first_id,
+        speaker_label="Microphone",
+        start_offset_seconds=0.0,
+        end_offset_seconds=1.0,
+        source_language="en",
+        language_confidence=0.9,
+        original_text="Find this caption",
+        target_language="fr",
+        translated_text="Aiguille unique",
+    )
+    history.finish_session(first_id)
+    second_id = history.create_session(
+        title="Second conversation",
+        audio_source="computer_audio",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+    history.finish_session(second_id)
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        history_database=history,
+    )
+
+    window.conversation_sidebar.search_edit.setText("aiguille")
+    visible_ids = {
+        window.conversation_sidebar.list_widget.item(row).data(
+            Qt.ItemDataRole.UserRole
+        )
+        for row in range(window.conversation_sidebar.list_widget.count())
+    }
+    assert first_id in visible_ids
+    assert second_id not in visible_ids
+    assert "Find this caption" in window.caption_chat.messages[0].message_label.text()
+
+    with patch(
+        "app.ui.main_window.QInputDialog.getText",
+        return_value=("Renamed lesson", True),
+    ):
+        window.conversation_sidebar.rename_button.click()
+    assert history.get_session(first_id).title == "Renamed lesson"
+    assert "Renamed lesson" in window.chat_group.title()
+
+    with patch(
+        "app.ui.main_window.QMessageBox.question",
+        return_value=QMessageBox.StandardButton.Yes,
+    ):
+        window.conversation_sidebar.delete_button.click()
+    assert history.get_session(first_id) is None
+    assert window.caption_chat.messages == ()
+
+    with patch(
+        "app.ui.main_window.QMessageBox.question",
+        return_value=QMessageBox.StandardButton.Yes,
+    ):
+        window.conversation_sidebar.delete_all_button.click()
+    assert history.list_sessions() == []
+    window.close()
+
+
+def test_reopened_history_shows_pause_and_resume_events() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    session_id = history.create_session(
+        title="Paused conversation",
+        audio_source="microphone",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+    history.add_message(
+        session_id=session_id,
+        speaker_label="Microphone",
+        start_offset_seconds=0.0,
+        end_offset_seconds=1.0,
+        source_language="en",
+        language_confidence=0.9,
+        original_text="Before the pause",
+        target_language="fr",
+        translated_text="Avant la pause",
+    )
+    history.pause_session(session_id)
+    history.resume_session(session_id)
+    history.finish_session(session_id)
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        history_database=history,
+    )
+    event_texts = [
+        label.text()
+        for label in window.caption_chat.findChildren(QLabel, "conversationEvent")
+    ]
+
+    assert any(text.startswith("Paused") for text in event_texts)
+    assert any(text.startswith("Resumed") for text in event_texts)
+    window.close()
+
+
+def test_history_maintenance_control_reports_healthy_database() -> None:
+    create_application(["live-caption-translation-test"])
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        history_database=HistoryDatabase(":memory:"),
+    )
+
+    with patch("app.ui.main_window.QMessageBox.information") as information:
+        window.conversation_sidebar.maintenance_button.click()
+
+    information.assert_called_once()
+    assert "healthy" in information.call_args.args[1].lower()
+    assert window.statusBar().currentMessage() == "History database is healthy"
     window.close()
 
 
