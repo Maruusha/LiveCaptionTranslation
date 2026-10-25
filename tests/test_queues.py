@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from threading import Thread
 
 from app.core.queues import BoundedAudioFrameQueue
 
@@ -53,3 +54,17 @@ def test_audio_queue_clear_removes_all_queued_audio() -> None:
     assert queue.get_nowait() is None
     assert queue.stats.queued_frames == 0
     assert queue.stats.queued_seconds == 0.0
+
+
+def test_audio_queue_wakes_a_waiting_consumer() -> None:
+    queue = BoundedAudioFrameQueue()
+    received = []
+    consumer = Thread(target=lambda: received.append(queue.get(timeout=1.0)))
+
+    consumer.start()
+    queue.put(np.ones(160, dtype=np.float32), sample_rate=16_000)
+    consumer.join(timeout=1.0)
+
+    assert not consumer.is_alive()
+    assert received[0] is not None
+    assert received[0].samples.size == 160

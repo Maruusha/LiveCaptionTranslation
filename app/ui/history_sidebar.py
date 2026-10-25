@@ -179,9 +179,6 @@ class ConversationSidebar(QWidget):
         item = self.list_widget.currentItem()
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
-    def select_live(self) -> None:
-        self._select_key(LIVE_ITEM_KEY)
-
     def select_session(self, session_id: int) -> None:
         self._select_key(session_id)
 

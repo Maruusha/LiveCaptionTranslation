@@ -214,11 +214,10 @@ class VoiceActivityWorker:
             segment_sample_count = 0
 
             while True:
-                frame = self.source_queue.get_nowait()
+                frame = self.source_queue.get(timeout=0.05)
                 if frame is None:
                     if self._stop_event.is_set():
                         break
-                    self._stop_event.wait(0.005)
                     continue
 
                 if frame.sample_rate != VAD_SAMPLE_RATE:

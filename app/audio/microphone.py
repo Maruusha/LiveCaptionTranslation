@@ -81,7 +81,6 @@ class MicrophoneLevelMonitor:
         self._level_callback = level_callback
         self._warning_callback = warning_callback
         self._speech_segment_callback = speech_segment_callback
-        self._caption_callback = caption_callback
         self.audio_buffer = audio_buffer or BoundedAudioFrameQueue(
             max_seconds=5.0,
             max_frames=2_048,
@@ -307,10 +306,6 @@ class MicrophoneLevelMonitor:
     def _handle_recognition_result(self, result: RecognitionResult) -> None:
         if self.translation_worker is not None:
             self.translation_worker.submit(result)
-        elif self._caption_callback is not None:
-            self._caption_callback(
-                TranslationResult(result, None, None, 0.0)
-            )
 
     def _log_capture_summary(self, source_name: str = "Microphone") -> None:
         start = self._performance_start
