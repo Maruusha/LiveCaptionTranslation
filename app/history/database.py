@@ -251,6 +251,54 @@ class HistoryDatabase:
                 (session_id, ended_at),
             )
 
+    def pause_session(self, session_id: int) -> None:
+        """Mark one open session paused and record its pause boundary."""
+
+        self._set_open_session_status(
+            session_id,
+            expected_status="live",
+            new_status="paused",
+            event_type="pause",
+        )
+
+    def resume_session(self, session_id: int) -> None:
+        """Mark one paused session live and record its resume boundary."""
+
+        self._set_open_session_status(
+            session_id,
+            expected_status="paused",
+            new_status="live",
+            event_type="resume",
+        )
+
+    def _set_open_session_status(
+        self,
+        session_id: int,
+        expected_status: str,
+        new_status: str,
+        event_type: str,
+    ) -> None:
+        occurred_at = local_timestamp()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE sessions SET status = ?, ended_at = NULL
+                WHERE id = ? AND status = ?
+                """,
+                (new_status, session_id, expected_status),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"Session {session_id} is not {expected_status}."
+                )
+            self._connection.execute(
+                """
+                INSERT INTO session_events(session_id, event_type, occurred_at)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, event_type, occurred_at),
+            )
+
     def add_message(
         self,
         *,

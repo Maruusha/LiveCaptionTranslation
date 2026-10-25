@@ -1,3 +1,5 @@
+import pytest
+
 from app.history.database import HistoryDatabase
 
 
@@ -52,6 +54,57 @@ def test_interrupted_session_is_recovered_as_incomplete() -> None:
     assert session is not None
     assert session.status == "incomplete"
     assert session.ended_at is not None
+
+
+def test_pause_and_resume_keep_one_open_session_and_record_events() -> None:
+    database = HistoryDatabase(":memory:")
+    session_id = database.create_session(
+        title="One session",
+        audio_source="microphone",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+
+    database.pause_session(session_id)
+    paused = database.get_session(session_id)
+    assert paused is not None
+    assert paused.status == "paused"
+    assert paused.ended_at is None
+
+    database.resume_session(session_id)
+    resumed = database.get_session(session_id)
+    assert resumed is not None
+    assert resumed.status == "live"
+    assert resumed.ended_at is None
+
+    events = database._connection.execute(
+        "SELECT event_type FROM session_events WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    assert [str(event["event_type"]) for event in events] == [
+        "start",
+        "pause",
+        "resume",
+    ]
+
+
+def test_pause_and_resume_reject_duplicate_state_changes() -> None:
+    database = HistoryDatabase(":memory:")
+    session_id = database.create_session(
+        title="One session",
+        audio_source="microphone",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+
+    with pytest.raises(ValueError, match="not paused"):
+        database.resume_session(session_id)
+
+    database.pause_session(session_id)
+    with pytest.raises(ValueError, match="not live"):
+        database.pause_session(session_id)
 
 
 def test_schema_contains_future_person_and_voice_tables() -> None:

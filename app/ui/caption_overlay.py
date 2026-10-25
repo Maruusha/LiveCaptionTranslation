@@ -68,6 +68,7 @@ class CaptionOverlay(QWidget):
 
         self._display_mode = "both"
         self._message: dict[str, str | bool | None] | None = None
+        self._paused = False
         self._drag_offset: QPoint | None = None
         self._appearance = OverlayAppearance()
 
@@ -204,11 +205,28 @@ class CaptionOverlay(QWidget):
 
     def clear_message(self) -> None:
         self._message = None
+        self._paused = False
         self.header_label.setText("Live captions · drag to move")
         self.caption_label.setText("Waiting for a live caption…")
         self._render_colours()
 
+    def set_paused(self, paused: bool) -> None:
+        self._paused = paused
+        if paused:
+            self.header_label.setText("Paused")
+            self.caption_label.setText("Audio capture is paused.")
+            self._render_colours()
+            return
+        if self._message is None:
+            self.header_label.setText("Live captions · drag to move")
+            self.caption_label.setText("Waiting for a live caption…")
+            self._render_colours()
+            return
+        self._render_message()
+
     def _render_message(self) -> None:
+        if self._paused:
+            return
         message = self._message
         if message is None:
             return

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
 
 def format_caption_text(
@@ -217,6 +218,8 @@ class CaptionChatView(QScrollArea):
 
     def scroll_to_bottom(self) -> None:
         """Move the conversation view to its newest message."""
+        if not isValid(self):
+            return
         scrollbar = self.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 

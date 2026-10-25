@@ -21,18 +21,23 @@ from app.ui.main_window import MainWindow
 
 
 logger = logging.getLogger(__name__)
+_application_instance: QApplication | None = None
 
 
 def create_application(arguments: Sequence[str] | None = None) -> QApplication:
     """Create the Qt application, or return the existing test instance."""
+
+    global _application_instance
     existing_application = QApplication.instance()
     if existing_application is not None:
+        _application_instance = existing_application
         return existing_application
 
     application = QApplication(list(arguments) if arguments is not None else sys.argv)
     application.setApplicationName(APP_NAME)
     application.setApplicationVersion(APP_VERSION)
     application.setOrganizationName("LiveCaptionTranslation")
+    _application_instance = application
     return application
 
 

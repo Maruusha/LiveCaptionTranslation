@@ -61,12 +61,13 @@ class ConversationSidebar(QWidget):
         sessions: list[HistorySession],
         *,
         show_live: bool,
+        live_status: str = "Listening now",
         selected_key: str | int | None = None,
     ) -> None:
         self._loading = True
         self.list_widget.clear()
         if show_live:
-            live_item = QListWidgetItem("Live conversation\nListening now")
+            live_item = QListWidgetItem(f"Live conversation\n{live_status}")
             live_item.setData(Qt.ItemDataRole.UserRole, LIVE_ITEM_KEY)
             self.list_widget.addItem(live_item)
 

@@ -54,6 +54,9 @@ class FakeMicrophoneMonitor:
         self.recognition_language = recognition_language
         self.max_segment_seconds = max_segment_seconds
         self.speech_threshold = speech_threshold
+        self.processing_worker = SimpleNamespace(
+            stats=SimpleNamespace(output_seconds=3.2)
+        )
         self.performance_report = PerformanceReport(
             elapsed_seconds=65.0,
             average_cpu_percent=2.5,
@@ -168,6 +171,10 @@ def test_main_window_starts_ready() -> None:
         "Speech sensitivity: 5/9 (Balanced)"
     )
     assert window.start_stop_button.minimumHeight() == 48
+    assert window.pause_resume_button.minimumHeight() == 48
+    assert window.stop_button.minimumHeight() == 48
+    assert window.pause_resume_button.isHidden()
+    assert window.stop_button.isHidden()
     assert window.to_bottom_button.text() == "To bottom"
     assert window.overlay_toggle_button.text() == "Show overlay"
     assert window.overlay_settings_button.text() == "Overlay settings"
@@ -318,7 +325,10 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert monitors[0].speech_threshold == 0.35
     assert monitors[0].started
     assert window.runtime_state is RuntimeState.LIVE
-    assert window.start_stop_button.text() == "Stop microphone"
+    assert window.start_stop_button.isHidden()
+    assert window.pause_resume_button.text() == "Pause"
+    assert not window.pause_resume_button.isHidden()
+    assert not window.stop_button.isHidden()
     assert not window.microphone_selector.isEnabled()
     assert not window.speech_chunk_duration_slider.isEnabled()
     assert not window.speech_sensitivity_slider.isEnabled()
@@ -364,7 +374,7 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert saved_messages[0].original_text == "Bonjour le monde"
     assert saved_messages[0].translated_text == "Hello world"
 
-    window.start_stop_button.click()
+    window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     assert window.runtime_state is RuntimeState.IDLE
     assert window.start_stop_button.text() == "Start microphone"
@@ -424,7 +434,7 @@ def test_caption_completed_during_stop_is_shown_and_saved() -> None:
     session_id = window._active_history_session_id
     assert session_id is not None
 
-    window.start_stop_button.click()
+    window.stop_button.click()
     assert caption_emitted.wait(timeout=1.0)
     stop_thread = window._stop_thread
     assert isinstance(stop_thread, Thread)
@@ -440,6 +450,102 @@ def test_caption_completed_during_stop_is_shown_and_saved() -> None:
     assert len(saved_messages) == 1
     assert saved_messages[0].original_text == "Queued caption"
     assert window._history.get_session(session_id).status == "completed"
+    window.close()
+
+
+def test_pause_resume_reuses_session_and_preserves_audio_offsets() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+        history_database=history,
+    )
+    window.start_stop_button.click()
+    session_id = window._active_history_session_id
+    assert session_id is not None
+
+    window.caption_received.emit(
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="Before pause",
+                language="en",
+                language_probability=0.99,
+                processing_seconds=0.2,
+            ),
+            translated_text="Avant la pause",
+            target_language="fr",
+            processing_seconds=0.1,
+        )
+    )
+    window.pause_resume_button.click()
+    wait_until(lambda: window.runtime_state is RuntimeState.PAUSED)
+
+    assert monitors[0].stopped
+    assert history.get_session(session_id).status == "paused"
+    assert window._active_history_session_id == session_id
+    assert window.pause_resume_button.text() == "Resume"
+    assert window.stop_button.isEnabled()
+    assert window.caption_overlay.header_label.text() == "Paused"
+    assert "Paused" in window.conversation_sidebar.list_widget.item(0).text()
+
+    window.pause_resume_button.click()
+
+    assert len(monitors) == 2
+    assert monitors[1].started
+    assert window.runtime_state is RuntimeState.LIVE
+    assert history.get_session(session_id).status == "live"
+    assert window._active_history_session_id == session_id
+    assert window.pause_resume_button.text() == "Pause"
+
+    window.caption_received.emit(
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="After resume",
+                language="en",
+                language_probability=0.99,
+                processing_seconds=0.2,
+            ),
+            translated_text="Après la reprise",
+            target_language="fr",
+            processing_seconds=0.1,
+        )
+    )
+    saved_messages = history.get_messages(session_id)
+    assert len(saved_messages) == 2
+    assert saved_messages[0].start_offset_seconds == 0.0
+    assert saved_messages[1].start_offset_seconds == 3.2
+    assert saved_messages[1].end_offset_seconds == 4.2
+
+    window.pause_resume_button.click()
+    wait_until(lambda: window.runtime_state is RuntimeState.PAUSED)
+    window.stop_button.click()
+
+    assert window.runtime_state is RuntimeState.IDLE
+    assert history.get_session(session_id).status == "completed"
+    assert len(history.list_sessions()) == 1
+    events = history._connection.execute(
+        "SELECT event_type FROM session_events WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    assert [str(event["event_type"]) for event in events] == [
+        "start",
+        "pause",
+        "resume",
+        "pause",
+        "stop",
+    ]
     window.close()
 
 
@@ -527,7 +633,7 @@ def test_saved_conversation_can_stay_open_while_live_caption_is_saved() -> None:
     assert len(window.caption_chat.messages) == 1
     assert "Earlier message" in window.caption_chat.messages[0].message_label.text()
 
-    window.start_stop_button.click()
+    window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     window.close()
 
@@ -578,10 +684,11 @@ def test_computer_audio_source_uses_the_loopback_pipeline() -> None:
     window.start_stop_button.click()
     assert monitors[0].device_index.id == "speaker-1"
     assert monitors[0].started
-    assert window.start_stop_button.text() == "Stop computer audio"
+    assert window.start_stop_button.isHidden()
+    assert window.pause_resume_button.text() == "Pause"
     assert not window.computer_audio_source_button.isEnabled()
 
-    window.start_stop_button.click()
+    window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     assert window.start_stop_button.text() == "Start computer audio"
     assert window.computer_audio_source_button.isEnabled()
@@ -616,7 +723,7 @@ def test_computer_audio_pipeline_warning_is_visible_and_logged(caplog) -> None:
         in caplog.text
     )
 
-    window.start_stop_button.click()
+    window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     window.close()
 
@@ -851,10 +958,10 @@ def test_slow_stop_shows_caption_progress_without_blocking_the_window() -> None:
         monitor_factory=monitor_factory,
     )
     window.start_stop_button.click()
-    window.start_stop_button.click()
+    window.stop_button.click()
 
-    assert window.start_stop_button.text() == "Stopping…"
-    assert not window.start_stop_button.isEnabled()
+    assert window.stop_button.text() == "Stopping…"
+    assert not window.stop_button.isEnabled()
     wait_until(lambda: window._finishing_dialog is not None)
     dialog = window._finishing_dialog
     assert dialog is not None
@@ -868,6 +975,7 @@ def test_slow_stop_shows_caption_progress_without_blocking_the_window() -> None:
     release_stop.set()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     assert window.start_stop_button.isEnabled()
+    assert window.stop_button.isHidden()
     window.close()
 
 
