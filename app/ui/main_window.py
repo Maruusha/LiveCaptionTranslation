@@ -77,7 +77,6 @@ MonitorFactory = Callable[
         str | None,
         float,
         float,
-        int,
     ],
     MicrophoneLevelMonitor,
 ]
@@ -92,7 +91,6 @@ LoopbackMonitorFactory = Callable[
         str | None,
         float,
         float,
-        int,
     ],
     LoopbackCaptureMonitor,
 ]
@@ -291,26 +289,6 @@ class MainWindow(QMainWindow):
         sensitivity_layout.addWidget(self.speech_sensitivity_label)
         sensitivity_layout.addWidget(self.speech_sensitivity_slider, stretch=1)
 
-        self.whisper_workers_slider = QSlider(Qt.Orientation.Horizontal)
-        self.whisper_workers_slider.setObjectName("whisperWorkersSlider")
-        self.whisper_workers_slider.setRange(1, 2)
-        self.whisper_workers_slider.setValue(1)
-        self.whisper_workers_slider.setTickInterval(1)
-        self.whisper_workers_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.whisper_workers_slider.setToolTip(
-            "Two workers can process two chunks together, but use more RAM and CPU."
-        )
-        self.whisper_workers_label = QLabel()
-        self.whisper_workers_label.setObjectName("whisperWorkersLabel")
-        self.whisper_workers_slider.valueChanged.connect(
-            self._update_whisper_workers_label
-        )
-        self._update_whisper_workers_label()
-
-        whisper_workers_layout = QHBoxLayout()
-        whisper_workers_layout.addWidget(self.whisper_workers_label)
-        whisper_workers_layout.addWidget(self.whisper_workers_slider, stretch=1)
-
         self.speech_chunk_duration_slider = QSlider(
             Qt.Orientation.Horizontal
         )
@@ -352,19 +330,20 @@ class MainWindow(QMainWindow):
         self.microphone_group = QGroupBox("Live audio")
         self.microphone_group.setObjectName("liveAudioGroup")
         microphone_layout = QVBoxLayout()
-        microphone_layout.setContentsMargins(12, 18, 12, 16)
-        microphone_layout.setSpacing(8)
+        microphone_layout.setContentsMargins(12, 18, 12, 12)
+        microphone_layout.setSpacing(5)
         microphone_layout.addLayout(source_layout)
         microphone_layout.addLayout(language_layout)
         microphone_layout.addLayout(caption_view_layout)
-        microphone_layout.addLayout(chunk_duration_layout)
         microphone_layout.addLayout(selector_layout)
         microphone_layout.addWidget(self.device_status)
         microphone_layout.addWidget(self.input_level)
-        microphone_layout.addWidget(self.speech_status)
-        microphone_layout.addWidget(self.speech_turn_status)
+        speech_summary_layout = QHBoxLayout()
+        speech_summary_layout.addWidget(self.speech_status)
+        speech_summary_layout.addStretch()
+        speech_summary_layout.addWidget(self.speech_turn_status)
+        microphone_layout.addLayout(speech_summary_layout)
         microphone_layout.addWidget(self.start_stop_button)
-        microphone_layout.addSpacing(4)
         self.microphone_group.setLayout(microphone_layout)
         self.microphone_group.setMinimumHeight(
             self.microphone_group.minimumSizeHint().height()
@@ -461,8 +440,8 @@ class MainWindow(QMainWindow):
 
         performance_group = QGroupBox("Processing settings and performance")
         performance_layout = QVBoxLayout()
+        performance_layout.addLayout(chunk_duration_layout)
         performance_layout.addLayout(sensitivity_layout)
-        performance_layout.addLayout(whisper_workers_layout)
         performance_layout.addLayout(performance_selector_layout)
         performance_layout.addWidget(self.performance_summary)
         performance_layout.addStretch()
@@ -781,10 +760,6 @@ class MainWindow(QMainWindow):
             f"Speech sensitivity: {value}/9 ({description})"
         )
 
-    def _update_whisper_workers_label(self, _value: int | None = None) -> None:
-        count = self.whisper_workers_slider.value()
-        self.whisper_workers_label.setText(f"Whisper workers: {count}")
-
     def _speech_threshold(self) -> float:
         # Keep Silero's exit threshold (speech threshold - 0.15) positive.
         return round(0.875 - self.speech_sensitivity_slider.value() * 0.075, 3)
@@ -814,7 +789,6 @@ class MainWindow(QMainWindow):
                 self.language_selector.currentData(),
                 float(self.speech_chunk_duration_slider.value()),
                 self._speech_threshold(),
-                self.whisper_workers_slider.value(),
             )
             selected_name = selected_output.name
             active_source = "computer_audio"
@@ -833,7 +807,6 @@ class MainWindow(QMainWindow):
                 self.language_selector.currentData(),
                 float(self.speech_chunk_duration_slider.value()),
                 self._speech_threshold(),
-                self.whisper_workers_slider.value(),
             )
             selected_name = selected_device.name
             active_source = "microphone"
@@ -892,7 +865,6 @@ class MainWindow(QMainWindow):
         self.language_selector.setEnabled(False)
         self.speech_chunk_duration_slider.setEnabled(False)
         self.speech_sensitivity_slider.setEnabled(False)
-        self.whisper_workers_slider.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setText(
             "Stop computer audio" if computer_audio else "Stop microphone"
@@ -1157,7 +1129,6 @@ class MainWindow(QMainWindow):
         self.language_selector.setEnabled(True)
         self.speech_chunk_duration_slider.setEnabled(True)
         self.speech_sensitivity_slider.setEnabled(True)
-        self.whisper_workers_slider.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.start_stop_button.setEnabled(
             self.output_selector.isEnabled()
@@ -1440,12 +1411,6 @@ class MainWindow(QMainWindow):
                 5,
             )
         )
-        self.whisper_workers_slider.setValue(
-            self._safe_setting_int(
-                self._interface_settings.value("ui/whisper_workers", 1),
-                1,
-            )
-        )
         self._expanded_sidebar_width = max(
             230,
             min(
@@ -1479,9 +1444,6 @@ class MainWindow(QMainWindow):
         )
         self._interface_settings.setValue(
             "ui/speech_sensitivity", self.speech_sensitivity_slider.value()
-        )
-        self._interface_settings.setValue(
-            "ui/whisper_workers", self.whisper_workers_slider.value()
         )
         self._interface_settings.setValue(
             "ui/sidebar_width", self._expanded_sidebar_width

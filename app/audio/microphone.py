@@ -68,7 +68,6 @@ class MicrophoneLevelMonitor:
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
         speech_threshold: float = 0.5,
-        recognition_workers: int = 1,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -102,7 +101,6 @@ class MicrophoneLevelMonitor:
                 result_callback=self._handle_recognition_result,
                 warning_callback=self._warning_callback,
                 language=recognition_language,
-                worker_count=recognition_workers,
             )
             if caption_callback is not None
             else None

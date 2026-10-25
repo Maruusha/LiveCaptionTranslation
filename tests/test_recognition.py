@@ -1,6 +1,4 @@
 from types import SimpleNamespace
-from threading import Event
-
 import numpy as np
 
 from app.speech.recognition import RecognitionResult, RecognitionWorker
@@ -107,43 +105,3 @@ def test_recognition_worker_uses_a_manual_language() -> None:
     assert results[0].language == "fr"
 
 
-def test_two_recognition_workers_keep_results_in_audio_order() -> None:
-    results: list[RecognitionResult] = []
-    release_first = Event()
-    second_completed = Event()
-
-    class FakeModel:
-        def transcribe(self, audio, **_options):
-            marker = int(audio[0])
-            if marker == 1:
-                release_first.wait(timeout=1.0)
-                text = "First"
-            else:
-                text = "Second"
-                second_completed.set()
-            return iter([SimpleNamespace(text=text)]), SimpleNamespace(
-                language="en",
-                language_probability=0.99,
-            )
-
-    first_samples = np.ones(1_600, dtype=np.float32)
-    second_samples = np.full(1_600, 2.0, dtype=np.float32)
-    worker = RecognitionWorker(
-        result_callback=results.append,
-        warning_callback=lambda _warning: None,
-        model_factory=FakeModel,
-        worker_count=2,
-    )
-    worker.start()
-    worker.submit(SpeechSegment(first_samples, 0, 1_600))
-    worker.submit(SpeechSegment(second_samples, 2_000, 3_600))
-
-    assert second_completed.wait(timeout=1.0)
-    assert results == []
-    release_first.set()
-    worker.stop()
-
-    assert [result.text for result in results] == ["First", "Second"]
-    assert worker.stats.completed_segments == 2
-    assert worker.worker_count == 2
-    assert worker.cpu_threads_per_worker == 2
