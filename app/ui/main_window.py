@@ -1725,6 +1725,7 @@ class MainWindow(QMainWindow):
         if translation_stats is not None:
             summary += (
                 f"\nTranslation: {translation_stats.completed_captions} completed  |  "
+                f"{translation_stats.unsupported_captions} unsupported  |  "
                 f"{translation_stats.queued_captions} queued  |  "
                 f"{translation_stats.failed_captions} failed  |  "
                 f"{translation_stats.processing_seconds:.2f}s total"

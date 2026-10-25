@@ -39,9 +39,11 @@ def format_caption_text(
     if mode == "original":
         return original_line
     if mode == "translation":
-        return translated_line
+        return translated_line if target_language is not None else original_line
     if translated_text:
         return f"{original_line}\n{translated_line}"
+    if target_language is None:
+        return original_line
     return f"{original_line}\nTranslation unavailable"
 
 

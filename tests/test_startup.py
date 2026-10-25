@@ -87,6 +87,7 @@ class FakeMicrophoneMonitor:
             active_captions=0,
             active_elapsed_seconds=0.0,
             completed_captions=2,
+            unsupported_captions=0,
             failed_captions=0,
             processing_seconds=0.3,
         )

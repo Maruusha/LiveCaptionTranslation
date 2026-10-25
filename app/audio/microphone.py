@@ -372,10 +372,11 @@ class MicrophoneLevelMonitor:
         if translation_stats is not None:
             logger.info(
                 "Translation summary: queued=%d, active=%d, completed=%d, "
-                "failed=%d, processing time=%.3fs",
+                "unsupported=%d, failed=%d, processing time=%.3fs",
                 translation_stats.queued_captions,
                 translation_stats.active_captions,
                 translation_stats.completed_captions,
+                translation_stats.unsupported_captions,
                 translation_stats.failed_captions,
                 translation_stats.processing_seconds,
             )

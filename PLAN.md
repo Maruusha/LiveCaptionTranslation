@@ -604,6 +604,8 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 
 ### Stage 4 — French ↔ English translation
 
+**Status: Implementation complete; live quality testing pending (2026-10-25).**
+
 - Compare suitable local French ↔ English translation models on the target computer.
 - Translate final captions only, not every unstable partial result.
 - Add automatic and manual language modes.
@@ -614,9 +616,11 @@ Build the complete roadmap, but do it one verified step at a time. Do not implem
 
 Final recognition results now enter a bounded eight-caption translation queue. Recognition and audio capture are not blocked while translation runs. Queue overload or model errors preserve the original caption and show a visible translation warning. The interface provides **Automatic**, **French**, and **English** spoken-language modes and can show both texts, only the original, or only the translation. Translation queue counts, failures, and total processing time appear in the simple Performance view and diagnostic log.
 
+An explicit language gate now normalizes the detected language code before the translation queue. Only French (`fr`) and English (`en`) captions enter MarianMT. Korean and every other unsupported or unknown language bypass translation, remain visible as original-only captions in every display mode, and increase a separate `unsupported` counter instead of being reported as translation failures. The diagnostic log records the skipped detected language, and no translation model is loaded for it.
+
 An offline smoke check translated “Hello, how are you today?” to French and “Bonjour, comment allez-vous aujourd’hui ?” to English. Model loading took about `0.36–0.41 seconds`; translations took about `0.04 seconds` on this computer. These are development measurements, not a quality benchmark. All 34 automated tests passed after integration.
 
-**Remaining before completion:** The separate testing branch should check real recognized captions in both directions, accents, names, numbers, punctuation, longer speech, automatic-language mistakes, repeated direction switching, offline use, and live CPU/RAM/latency. Add and test an explicit language gate before the translation queue: send a caption to translation only when its normalized detected language is French (`fr`) or English (`en`); keep other-language captions as original-only results and count them as unsupported/skipped rather than translation failures. Consider a minimum language-confidence rule for short or uncertain captions during later tuning. Tune or replace the models only if those checks show unacceptable quality.
+**Remaining before completion:** The separate testing branch should check real recognized captions in both directions, accents, names, numbers, punctuation, longer speech, automatic-language mistakes, repeated direction switching, offline use, and live CPU/RAM/latency. Consider a minimum language-confidence rule for short or uncertain captions during later tuning. Tune or replace the models only if those checks show unacceptable quality.
 
 **Finished when:** Final French captions receive useful English translations and final English captions receive useful French translations without preventing live transcription.
 
@@ -661,7 +665,7 @@ The current safe, lower-memory implementation releases the capture and processin
 
 **Game-audio stop result on 2026-10-25:** The interface stayed responsive while stopping, but one active Whisper call exceeded the 60-second finishing limit while the game was competing for CPU. Shutdown reported a clear error and preserved the conversation as `incomplete`. Stage 6 does not yet pass its clean-stop requirement under this load.
 
-**Automated verification:** Repeated pause/resume behavior, one-session reuse, durable pause/resume events, paused interface states, continuous caption offsets, stop-from-paused behavior, and invalid database transitions are covered. All 72 automated tests pass. Live tests for repeated pause/resume, audio-boundary behavior, and device removal while paused are intentionally deferred.
+**Automated verification:** Repeated pause/resume behavior, one-session reuse, durable pause/resume events, paused interface states, continuous caption offsets, stop-from-paused behavior, and invalid database transitions are covered. All 73 automated tests pass. Live tests for repeated pause/resume, audio-boundary behavior, and device removal while paused are intentionally deferred.
 
 **Finished when:** Session controls behave consistently without losing finished messages, duplicating audio, or creating unintended sessions.
 
@@ -685,7 +689,7 @@ The current safe, lower-memory implementation releases the capture and processin
 
 **Live layout check and fix (2026-10-25):** Testing on the target Windows display found that the 48-pixel Start/Stop button could extend below the Live audio group and overlap the conversation title and controls. The maximum speech-chunk slider was moved to the processing panel, the speech-status labels were combined into one row, and excess vertical spacing was removed. A geometry regression check now requires the Live audio panel to end before the conversation panel begins.
 
-**Current automated verification:** All 72 tests pass, including the fixed single-Whisper-worker pipeline, overlay formatting, safe appearance limits, click-through flags, settings reset, saved appearance and geometry, collapsible-sidebar behavior, saved main-interface choices, window flags, show/hide integration, live-caption updates, and Stage 6 session controls.
+**Current automated verification:** All 73 tests pass, including the fixed single-Whisper-worker pipeline, the French/English translation gate, unsupported-language preservation, overlay formatting, safe appearance limits, click-through flags, settings reset, saved appearance and geometry, collapsible-sidebar behavior, saved main-interface choices, window flags, show/hide integration, live-caption updates, and Stage 6 session controls.
 
 Automatic Person labels and colours, temporary-to-final bubble replacement, and right alignment for a manually selected `You` remain in later stages. Stage 7 still needs real high-DPI, multiple-monitor, windowed-game, borderless-game, and busy-pipeline responsiveness tests.
 

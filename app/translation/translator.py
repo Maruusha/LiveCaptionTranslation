@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from app.speech.recognition import RecognitionResult
 
 MODEL_ROOT = Path(__file__).resolve().parents[2] / "models" / "translation"
 SUPPORTED_LANGUAGES = {"en", "fr"}
+logger = logging.getLogger(__name__)
 
 
 class TranslationError(RuntimeError):
@@ -43,6 +45,7 @@ class TranslationStats:
     active_captions: int
     active_elapsed_seconds: float
     completed_captions: int
+    unsupported_captions: int
     failed_captions: int
     processing_seconds: float
 
@@ -137,6 +140,7 @@ class TranslationWorker:
         self._thread: Thread | None = None
         self._stats_lock = Lock()
         self._completed_captions = 0
+        self._unsupported_captions = 0
         self._failed_captions = 0
         self._processing_seconds = 0.0
         self._active_started_at: float | None = None
@@ -158,6 +162,7 @@ class TranslationWorker:
                     else 0.0
                 ),
                 completed_captions=self._completed_captions,
+                unsupported_captions=self._unsupported_captions,
                 failed_captions=self._failed_captions,
                 processing_seconds=self._processing_seconds,
             )
@@ -183,16 +188,19 @@ class TranslationWorker:
 
         source_language = self._normalize_language(recognition.language)
         if source_language not in SUPPORTED_LANGUAGES:
-            message = "Translation is available only for French and English."
             with self._stats_lock:
-                self._failed_captions += 1
+                self._unsupported_captions += 1
+            logger.info(
+                "Translation skipped for unsupported detected language: %s",
+                source_language or "unknown",
+            )
             self._result_callback(
                 TranslationResult(
                     recognition,
                     None,
                     None,
                     0.0,
-                    error=message,
+                    skipped=True,
                 )
             )
             return False

@@ -56,17 +56,25 @@ def test_translation_worker_translates_both_directions() -> None:
 
 def test_translation_worker_preserves_an_unsupported_language_caption() -> None:
     results: list[TranslationResult] = []
+    loaded_directions: list[tuple[str, str]] = []
+
+    def model_factory(source: str, target: str) -> None:
+        loaded_directions.append((source, target))
+
     worker = TranslationWorker(
         result_callback=results.append,
         warning_callback=lambda _warning: None,
-        model_factory=lambda _source, _target: None,
+        model_factory=model_factory,
     )
 
     assert not worker.submit(recognition("Guten Tag", "de"))
     assert results[0].recognition.text == "Guten Tag"
     assert results[0].translated_text is None
-    assert results[0].error is not None
-    assert worker.stats.failed_captions == 1
+    assert results[0].error is None
+    assert results[0].skipped
+    assert worker.stats.unsupported_captions == 1
+    assert worker.stats.failed_captions == 0
+    assert loaded_directions == []
 
 
 def test_translation_queue_reports_overload_without_losing_original_text() -> None:
