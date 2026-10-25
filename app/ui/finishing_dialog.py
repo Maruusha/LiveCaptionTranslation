@@ -27,6 +27,7 @@ class FinishingCaptionsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         closing_application: bool = False,
+        pausing_session: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("finishingCaptionsDialog")
@@ -74,24 +75,47 @@ class FinishingCaptionsDialog(QDialog):
         layout.addWidget(buttons)
         self.setLayout(layout)
 
-        self.set_closing_application(closing_application)
+        self.set_operation(
+            closing_application=closing_application,
+            pausing_session=pausing_session,
+        )
         self.update_progress(remaining_captions=0, estimated_seconds=None)
 
     def set_closing_application(self, closing_application: bool) -> None:
+        self.set_operation(
+            closing_application=closing_application,
+            pausing_session=False,
+        )
+
+    def set_operation(
+        self,
+        *,
+        closing_application: bool,
+        pausing_session: bool,
+    ) -> None:
         if closing_application:
             self.setWindowTitle("Finishing captions before closing")
             self.message.setText(
-                "The microphone has stopped. Accepted captions are still being "
+                "Audio capture has stopped. Accepted captions are still being "
                 "processed before the application closes."
             )
             self.finish_now_button.setText("Skip queued captions")
+            self.finish_now_button.show()
+        elif pausing_session:
+            self.setWindowTitle("Pausing captions")
+            self.message.setText(
+                "Audio capture has paused. Captions accepted before the pause "
+                "are still being processed."
+            )
+            self.finish_now_button.hide()
         else:
             self.setWindowTitle("Finishing captions")
             self.message.setText(
-                "The microphone has stopped. Accepted captions are still being "
+                "Audio capture has stopped. Accepted captions are still being "
                 "processed."
             )
             self.finish_now_button.setText("Skip remaining")
+            self.finish_now_button.show()
 
     def update_progress(
         self,
@@ -100,7 +124,7 @@ class FinishingCaptionsDialog(QDialog):
         estimated_seconds: float | None,
     ) -> None:
         if remaining_captions <= 0:
-            self.detail.setText("Releasing the microphone and finishing cleanup…")
+            self.detail.setText("Releasing the audio device and finishing cleanup…")
             return
 
         noun = "caption" if remaining_captions == 1 else "captions"

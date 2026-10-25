@@ -10,6 +10,24 @@ def test_level_calculation_covers_silence_and_full_scale() -> None:
     assert microphone.calculate_input_level(np.ones((32, 1), dtype=np.float32)) == 100
 
 
+def test_monitor_passes_maximum_chunk_length_to_vad() -> None:
+    monitor = microphone.MicrophoneLevelMonitor(
+        12,
+        lambda _level: None,
+        lambda _warning: None,
+        speech_event_callback=lambda _event: None,
+        caption_callback=lambda _caption: None,
+        max_segment_seconds=45.0,
+        speech_threshold=0.35,
+    )
+
+    assert monitor.voice_activity_worker is not None
+    assert monitor.voice_activity_worker.max_segment_seconds == 45.0
+    assert monitor.voice_activity_worker.speech_threshold == 0.35
+    assert monitor.recognition_worker is not None
+    assert monitor.recognition_worker.is_running is False
+
+
 def test_monitor_starts_reports_level_and_stops(monkeypatch) -> None:
     levels: list[float] = []
     warnings: list[str] = []

@@ -53,7 +53,7 @@ class RecognitionStats:
     processing_seconds: float
 
 
-def create_faster_whisper_model() -> WhisperLikeModel:
+def create_faster_whisper_model(cpu_threads: int = 4) -> WhisperLikeModel:
     """Load the multilingual small model strictly from the project folder."""
     if not (MODEL_DIRECTORY / "model.bin").is_file():
         raise RecognitionError(
@@ -67,7 +67,7 @@ def create_faster_whisper_model() -> WhisperLikeModel:
         str(MODEL_DIRECTORY),
         device="cpu",
         compute_type="int8",
-        cpu_threads=4,
+        cpu_threads=cpu_threads,
         local_files_only=True,
     )
 
@@ -79,7 +79,7 @@ class RecognitionWorker:
         self,
         result_callback: Callable[[RecognitionResult], None],
         warning_callback: Callable[[str], None],
-        model_factory: Callable[[], WhisperLikeModel] = create_faster_whisper_model,
+        model_factory: Callable[[], WhisperLikeModel] | None = None,
         max_queued_segments: int = 8,
         language: str | None = None,
     ) -> None:
@@ -89,12 +89,18 @@ class RecognitionWorker:
             raise ValueError("language must be None, 'en', or 'fr'.")
         self._result_callback = result_callback
         self._warning_callback = warning_callback
-        self._model_factory = model_factory
+        self._model_factory = model_factory or create_faster_whisper_model
         self._language = language
-        self._queue: Queue[SpeechSegment] = Queue(maxsize=max_queued_segments)
+        self._queue: Queue[tuple[int, SpeechSegment]] = Queue(
+            maxsize=max_queued_segments
+        )
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._stats_lock = Lock()
+        self._result_lock = Lock()
+        self._next_sequence = 0
+        self._next_result_sequence = 0
+        self._pending_results: dict[int, RecognitionResult] = {}
         self._completed_segments = 0
         self._failed_segments = 0
         self._processing_seconds = 0.0
@@ -102,7 +108,8 @@ class RecognitionWorker:
 
     @property
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     @property
     def stats(self) -> RecognitionStats:
@@ -134,14 +141,18 @@ class RecognitionWorker:
 
     def submit(self, segment: SpeechSegment) -> bool:
         """Queue one final chunk, or report a visible overload result."""
+        with self._result_lock:
+            sequence = self._next_sequence
+            self._next_sequence += 1
         try:
-            self._queue.put_nowait(segment)
+            self._queue.put_nowait((sequence, segment))
             return True
         except Full:
             self._warning_callback(
                 "Speech recognition is behind; one completed audio chunk was skipped."
             )
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 RecognitionResult(
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
@@ -150,7 +161,7 @@ class RecognitionWorker:
                     language_probability=None,
                     processing_seconds=0.0,
                     skipped=True,
-                )
+                ),
             )
             with self._stats_lock:
                 self._failed_segments += 1
@@ -172,11 +183,12 @@ class RecognitionWorker:
         cancelled = 0
         while True:
             try:
-                segment = self._queue.get_nowait()
+                sequence, segment = self._queue.get_nowait()
             except Empty:
                 break
             cancelled += 1
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 RecognitionResult(
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
@@ -186,7 +198,7 @@ class RecognitionWorker:
                     processing_seconds=0.0,
                     error="The caption was cancelled while the application was closing.",
                     skipped=True,
-                )
+                ),
             )
         if cancelled:
             with self._stats_lock:
@@ -203,7 +215,7 @@ class RecognitionWorker:
 
         while True:
             try:
-                segment = self._queue.get(timeout=0.05)
+                sequence, segment = self._queue.get(timeout=0.05)
             except Empty:
                 if self._stop_event.is_set():
                     break
@@ -255,17 +267,18 @@ class RecognitionWorker:
             finally:
                 with self._stats_lock:
                     self._active_started_at = None
-            self._result_callback(result)
+            self._complete_result(sequence, result)
 
     def _fail_waiting_segments(self, message: str) -> None:
         while True:
             try:
-                segment = self._queue.get_nowait()
+                sequence, segment = self._queue.get_nowait()
             except Empty:
                 return
             with self._stats_lock:
                 self._failed_segments += 1
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 RecognitionResult(
                     start_sample=segment.start_sample,
                     end_sample=segment.end_sample,
@@ -274,5 +287,14 @@ class RecognitionWorker:
                     language_probability=None,
                     processing_seconds=0.0,
                     error=message,
-                )
+                ),
             )
+
+    def _complete_result(self, sequence: int, result: RecognitionResult) -> None:
+        """Emit results in audio order, including immediate queue skips."""
+        with self._result_lock:
+            self._pending_results[sequence] = result
+            while self._next_result_sequence in self._pending_results:
+                ready = self._pending_results.pop(self._next_result_sequence)
+                self._next_result_sequence += 1
+                self._result_callback(ready)

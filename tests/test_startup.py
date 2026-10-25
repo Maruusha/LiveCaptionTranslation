@@ -4,22 +4,30 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from time import monotonic, sleep
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication
 
 from app import APP_NAME, APP_VERSION
 from app.audio.devices import AudioDevice
+from app.audio.loopback import OutputAudioDevice
+from app.audio.microphone import MicrophoneCaptureError
 from app.core.performance import PerformanceReport
+from app.core.state import RuntimeState
+from app.history.database import HistoryDatabase
 from app.main import create_application
 from app.speech.recognition import RecognitionResult, RecognitionStats
 from app.speech.vad import VoiceActivityStats
 from app.translation.translator import TranslationResult, TranslationStats
+from app.ui.history_sidebar import LIVE_ITEM_KEY
 from app.ui.main_window import MainWindow
+from app.ui.caption_overlay import OverlayAppearance
+from app.ui.overlay_settings import MemorySettings
 
 
 class FakeMicrophoneMonitor:
@@ -32,6 +40,8 @@ class FakeMicrophoneMonitor:
         speech_segment_callback,
         caption_callback,
         recognition_language,
+        max_segment_seconds,
+        speech_threshold,
     ) -> None:
         self.device_index = device_index
         self.level_callback = level_callback
@@ -42,6 +52,11 @@ class FakeMicrophoneMonitor:
         self.speech_segment_callback = speech_segment_callback
         self.caption_callback = caption_callback
         self.recognition_language = recognition_language
+        self.max_segment_seconds = max_segment_seconds
+        self.speech_threshold = speech_threshold
+        self.processing_worker = SimpleNamespace(
+            stats=SimpleNamespace(output_seconds=3.2)
+        )
         self.performance_report = PerformanceReport(
             elapsed_seconds=65.0,
             average_cpu_percent=2.5,
@@ -108,6 +123,16 @@ def microphone_fixture() -> list[AudioDevice]:
     ]
 
 
+def output_fixture() -> list[OutputAudioDevice]:
+    return [
+        OutputAudioDevice(
+            id="speaker-1",
+            name="Test Headphones",
+            is_default=True,
+        )
+    ]
+
+
 def test_application_has_expected_metadata() -> None:
     application = create_application(["live-caption-translation-test"])
 
@@ -121,10 +146,10 @@ def test_main_window_starts_ready() -> None:
     window = MainWindow(device_provider=microphone_fixture)
 
     assert window.windowTitle() == APP_NAME
-    assert window.minimumWidth() == 820
-    assert window.minimumHeight() == 440
-    assert window.width() >= 940
-    assert window.height() >= 520
+    assert window.minimumWidth() == 900
+    assert window.minimumHeight() == 640
+    assert window.width() >= 1050
+    assert window.height() >= 760
     assert window.statusBar().currentMessage() == "Ready"
     assert window.centralWidget() is not None
     assert window.microphone_selector.count() == 1
@@ -135,9 +160,123 @@ def test_main_window_starts_ready() -> None:
     assert window.performance_summary.text() == "No capture measured yet."
     assert window.language_selector.currentText() == "Automatic"
     assert window.caption_view_selector.currentText() == "Original and translation"
+    assert window.speech_chunk_duration_slider.minimum() == 5
+    assert window.speech_chunk_duration_slider.maximum() == 60
+    assert window.speech_chunk_duration_slider.value() == 30
+    assert window.speech_chunk_duration_label.text() == (
+        "Maximum speech chunk: 30 seconds"
+    )
+    assert window.speech_sensitivity_slider.value() == 5
+    assert window.speech_sensitivity_label.text() == (
+        "Speech sensitivity: 5/9 (Balanced)"
+    )
     assert window.start_stop_button.minimumHeight() == 48
+    assert window.pause_resume_button.minimumHeight() == 48
+    assert window.stop_button.minimumHeight() == 48
+    assert window.pause_resume_button.isHidden()
+    assert window.stop_button.isHidden()
+    assert window.to_bottom_button.text() == "To bottom"
+    assert window.overlay_toggle_button.text() == "Show overlay"
+    assert window.overlay_settings_button.text() == "Overlay settings"
+    assert window.sidebar_toggle_button.text() == "Hide conversations"
+    assert window.sidebar_toggle_button.isChecked()
+    assert not window.caption_overlay.isVisible()
+    assert window.runtime_state is RuntimeState.IDLE
+
+    window.show()
+    QApplication.processEvents()
+    button_bottom = window.start_stop_button.mapTo(
+        window.microphone_group,
+        QPoint(0, window.start_stop_button.height()),
+    ).y()
+    assert button_bottom <= window.microphone_group.contentsRect().bottom()
+    live_panel_bottom = window.microphone_group.mapTo(
+        window,
+        QPoint(0, window.microphone_group.height()),
+    ).y()
+    conversation_top = window.conversation_splitter.mapTo(
+        window,
+        QPoint(0, 0),
+    ).y()
+    assert live_panel_bottom <= conversation_top
+
+    window.overlay_toggle_button.click()
+    QApplication.processEvents()
+    assert window.caption_overlay.isVisible()
+    assert window.overlay_toggle_button.text() == "Hide overlay"
+    window.overlay_toggle_button.click()
+    assert not window.caption_overlay.isVisible()
+
+    window.sidebar_toggle_button.click()
+    assert window.conversation_sidebar.isHidden()
+    assert window.sidebar_toggle_button.text() == "Show conversations"
+    window.sidebar_toggle_button.click()
+    assert not window.conversation_sidebar.isHidden()
+    assert window.sidebar_toggle_button.text() == "Hide conversations"
 
     window.close()
+
+
+def test_overlay_appearance_and_geometry_persist_between_windows() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+    expected = OverlayAppearance(
+        font_size=19,
+        text_colour="#aabbcc",
+        background_colour="#112233",
+        opacity_percent=70,
+        click_through=False,
+    )
+    window.caption_overlay.apply_appearance(expected)
+    window.caption_overlay.resize(640, 190)
+    window._save_overlay_settings()
+    window.close()
+
+    restored = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+
+    assert restored.caption_overlay.appearance == expected
+    assert restored.caption_overlay.size().width() == 640
+    assert restored.caption_overlay.size().height() == 190
+    restored.close()
+
+
+def test_main_interface_choices_persist_between_windows() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+    window.resize(1120, 810)
+    window.caption_view_selector.setCurrentIndex(1)
+    window.language_selector.setCurrentIndex(1)
+    window.speech_chunk_duration_slider.setValue(45)
+    window.speech_sensitivity_slider.setValue(8)
+    window.sidebar_toggle_button.setChecked(False)
+    window.close()
+
+    restored = MainWindow(
+        device_provider=microphone_fixture,
+        interface_settings=settings,
+    )
+
+    assert not settings.value("ui/main_geometry").isEmpty()
+    assert restored.width() >= restored.minimumWidth()
+    assert restored.height() >= restored.minimumHeight()
+    assert restored.caption_view_selector.currentData() == "original"
+    assert restored.language_selector.currentData() == "fr"
+    assert restored.speech_chunk_duration_slider.value() == 45
+    assert restored.speech_sensitivity_slider.value() == 8
+    assert restored.conversation_sidebar.isHidden()
+    assert restored.sidebar_toggle_button.text() == "Show conversations"
+    restored.close()
 
 
 def test_microphone_controls_start_update_and_stop() -> None:
@@ -152,6 +291,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
         speech_segment_callback,
         caption_callback,
         recognition_language,
+        max_segment_seconds,
+        speech_threshold,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -161,6 +302,8 @@ def test_microphone_controls_start_update_and_stop() -> None:
             speech_segment_callback,
             caption_callback,
             recognition_language,
+            max_segment_seconds,
+            speech_threshold,
         )
         monitors.append(monitor)
         return monitor
@@ -169,13 +312,29 @@ def test_microphone_controls_start_update_and_stop() -> None:
         device_provider=microphone_fixture,
         monitor_factory=monitor_factory,
     )
+    window.speech_chunk_duration_slider.setValue(45)
+    window.speech_sensitivity_slider.setValue(7)
+    assert window.speech_chunk_duration_label.text() == (
+        "Maximum speech chunk: 45 seconds"
+    )
 
     window.start_stop_button.click()
     assert monitors[0].device_index == (12,)
     assert monitors[0].recognition_language is None
+    assert monitors[0].max_segment_seconds == 45.0
+    assert monitors[0].speech_threshold == 0.35
     assert monitors[0].started
-    assert window.start_stop_button.text() == "Stop microphone"
+    assert window.runtime_state is RuntimeState.LIVE
+    assert window.start_stop_button.isHidden()
+    assert window.pause_resume_button.text() == "Pause"
+    assert not window.pause_resume_button.isHidden()
+    assert not window.stop_button.isHidden()
     assert not window.microphone_selector.isEnabled()
+    assert not window.speech_chunk_duration_slider.isEnabled()
+    assert not window.speech_sensitivity_slider.isEnabled()
+    assert window._active_history_session_id is not None
+    assert window.conversation_sidebar.selected_key() == LIVE_ITEM_KEY
+    assert window._history.list_sessions()[0].status == "live"
 
     window.microphone_level_received.emit(42.0)
     assert window.input_level.value() == 42
@@ -201,14 +360,29 @@ def test_microphone_controls_start_update_and_stop() -> None:
             processing_seconds=0.1,
         )
     )
-    assert window.latest_caption.text() == (
-        "Original [FR]: Bonjour le monde\nTranslation [EN]: Hello world"
+    assert len(window.caption_chat.messages) == 1
+    assert window.caption_chat.messages[0].message_label.text() == (
+        "FR: Bonjour le monde\nEN: Hello world"
     )
+    assert window.caption_overlay.caption_label.text() == (
+        "FR: Bonjour le monde\nEN: Hello world"
+    )
+    saved_messages = window._history.get_messages(
+        window._active_history_session_id
+    )
+    assert len(saved_messages) == 1
+    assert saved_messages[0].original_text == "Bonjour le monde"
+    assert saved_messages[0].translated_text == "Hello world"
 
-    window.start_stop_button.click()
+    window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.runtime_state is RuntimeState.IDLE
     assert window.start_stop_button.text() == "Start microphone"
     assert window.microphone_selector.isEnabled()
+    assert window.speech_chunk_duration_slider.isEnabled()
+    assert window.speech_sensitivity_slider.isEnabled()
+    assert window._active_history_session_id is None
+    assert window._history.list_sessions()[0].status == "completed"
     assert "Duration: 01:05" in window.performance_summary.text()
     assert "Average CPU: 2.5%" in window.performance_summary.text()
     assert "Memory: 104.0 MiB" in window.performance_summary.text()
@@ -219,6 +393,403 @@ def test_microphone_controls_start_update_and_stop() -> None:
     assert "Recognition: 2 completed" in window.performance_summary.text()
     assert "Translation: 2 completed" in window.performance_summary.text()
 
+    window.close()
+
+
+def test_caption_completed_during_stop_is_shown_and_saved() -> None:
+    create_application(["live-caption-translation-test"])
+    caption_emitted = Event()
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    class CaptionOnStopMonitor(FakeMicrophoneMonitor):
+        def stop(self) -> None:
+            self.caption_callback(
+                TranslationResult(
+                    recognition=RecognitionResult(
+                        start_sample=0,
+                        end_sample=16_000,
+                        text="Queued caption",
+                        language="en",
+                        language_probability=0.98,
+                        processing_seconds=0.4,
+                    ),
+                    translated_text="Sous-titre en attente",
+                    target_language="fr",
+                    processing_seconds=0.1,
+                )
+            )
+            self.stopped = True
+            caption_emitted.set()
+
+    def monitor_factory(*arguments):
+        monitor = CaptionOnStopMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+    )
+    window.start_stop_button.click()
+    session_id = window._active_history_session_id
+    assert session_id is not None
+
+    window.stop_button.click()
+    assert caption_emitted.wait(timeout=1.0)
+    stop_thread = window._stop_thread
+    assert isinstance(stop_thread, Thread)
+    stop_thread.join(timeout=1.0)
+
+    # Finish immediately, before Qt has to deliver the worker's wake-up signal.
+    window._poll_microphone_stop()
+
+    assert window._stop_thread is None
+    assert len(window.caption_chat.messages) == 1
+    assert "Queued caption" in window.caption_chat.messages[0].message_label.text()
+    saved_messages = window._history.get_messages(session_id)
+    assert len(saved_messages) == 1
+    assert saved_messages[0].original_text == "Queued caption"
+    assert window._history.get_session(session_id).status == "completed"
+    window.close()
+
+
+def test_pause_resume_reuses_session_and_preserves_audio_offsets() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+        history_database=history,
+    )
+    window.start_stop_button.click()
+    session_id = window._active_history_session_id
+    assert session_id is not None
+
+    window.caption_received.emit(
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="Before pause",
+                language="en",
+                language_probability=0.99,
+                processing_seconds=0.2,
+            ),
+            translated_text="Avant la pause",
+            target_language="fr",
+            processing_seconds=0.1,
+        )
+    )
+    window.pause_resume_button.click()
+    wait_until(lambda: window.runtime_state is RuntimeState.PAUSED)
+
+    assert monitors[0].stopped
+    assert history.get_session(session_id).status == "paused"
+    assert window._active_history_session_id == session_id
+    assert window.pause_resume_button.text() == "Resume"
+    assert window.stop_button.isEnabled()
+    assert window.caption_overlay.header_label.text() == "Paused"
+    assert "Paused" in window.conversation_sidebar.list_widget.item(0).text()
+
+    window.pause_resume_button.click()
+
+    assert len(monitors) == 2
+    assert monitors[1].started
+    assert window.runtime_state is RuntimeState.LIVE
+    assert history.get_session(session_id).status == "live"
+    assert window._active_history_session_id == session_id
+    assert window.pause_resume_button.text() == "Pause"
+
+    window.caption_received.emit(
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="After resume",
+                language="en",
+                language_probability=0.99,
+                processing_seconds=0.2,
+            ),
+            translated_text="Après la reprise",
+            target_language="fr",
+            processing_seconds=0.1,
+        )
+    )
+    saved_messages = history.get_messages(session_id)
+    assert len(saved_messages) == 2
+    assert saved_messages[0].start_offset_seconds == 0.0
+    assert saved_messages[1].start_offset_seconds == 3.2
+    assert saved_messages[1].end_offset_seconds == 4.2
+
+    window.pause_resume_button.click()
+    wait_until(lambda: window.runtime_state is RuntimeState.PAUSED)
+    window.stop_button.click()
+
+    assert window.runtime_state is RuntimeState.IDLE
+    assert history.get_session(session_id).status == "completed"
+    assert len(history.list_sessions()) == 1
+    events = history._connection.execute(
+        "SELECT event_type FROM session_events WHERE session_id = ? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    assert [str(event["event_type"]) for event in events] == [
+        "start",
+        "pause",
+        "resume",
+        "pause",
+        "stop",
+    ]
+    window.close()
+
+
+def test_capture_start_failure_enters_error_state() -> None:
+    create_application(["live-caption-translation-test"])
+
+    class FailingMonitor(FakeMicrophoneMonitor):
+        def start(self) -> None:
+            raise MicrophoneCaptureError("Test capture could not start.")
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=lambda *arguments: FailingMonitor(*arguments),
+    )
+
+    window.start_stop_button.click()
+
+    assert window.runtime_state is RuntimeState.ERROR
+    assert window._microphone_monitor is None
+    assert window.statusBar().currentMessage() == "Audio capture could not start"
+    assert window.device_status.text() == "Test capture could not start."
+    window.close()
+
+
+def test_saved_conversation_can_stay_open_while_live_caption_is_saved() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    old_session_id = history.create_session(
+        title="Earlier conversation",
+        audio_source="microphone",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+    history.add_message(
+        session_id=old_session_id,
+        speaker_label="Microphone",
+        start_offset_seconds=0.0,
+        end_offset_seconds=1.0,
+        source_language="en",
+        language_confidence=0.9,
+        original_text="Earlier message",
+        target_language="fr",
+        translated_text="Message précédent",
+    )
+    history.finish_session(old_session_id)
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+        history_database=history,
+    )
+    assert "Earlier message" in window.caption_chat.messages[0].message_label.text()
+
+    window.start_stop_button.click()
+    live_session_id = window._active_history_session_id
+    assert live_session_id is not None
+    window.conversation_sidebar.select_session(old_session_id)
+    assert window._viewing_history_session_id == old_session_id
+
+    window.caption_received.emit(
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="Live message",
+                language="en",
+                language_probability=0.99,
+                processing_seconds=0.4,
+            ),
+            translated_text="Message en direct",
+            target_language="fr",
+            processing_seconds=0.1,
+        )
+    )
+
+    assert len(history.get_messages(live_session_id)) == 1
+    assert history.get_messages(live_session_id)[0].original_text == "Live message"
+    assert len(window.caption_chat.messages) == 1
+    assert "Earlier message" in window.caption_chat.messages[0].message_label.text()
+
+    window.stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    window.close()
+
+
+def test_computer_audio_source_uses_the_loopback_pipeline() -> None:
+    create_application(["live-caption-translation-test"])
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def loopback_monitor_factory(
+        output_device,
+        level_callback,
+        warning_callback,
+        speech_event_callback,
+        speech_segment_callback,
+        caption_callback,
+        recognition_language,
+        max_segment_seconds,
+        speech_threshold,
+    ):
+        monitor = FakeMicrophoneMonitor(
+            output_device,
+            level_callback,
+            warning_callback,
+            speech_event_callback,
+            speech_segment_callback,
+            caption_callback,
+            recognition_language,
+            max_segment_seconds,
+            speech_threshold,
+        )
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=output_fixture,
+        loopback_monitor_factory=loopback_monitor_factory,
+    )
+    window.computer_audio_source_button.click()
+
+    assert window.microphone_selector.isHidden()
+    assert not window.output_selector.isHidden()
+    assert window.output_selector.count() == 1
+    assert window.output_selector.currentData().id == "speaker-1"
+    assert "Test Headphones" in window.output_selector.currentText()
+    assert window.start_stop_button.text() == "Start computer audio"
+
+    window.start_stop_button.click()
+    assert monitors[0].device_index.id == "speaker-1"
+    assert monitors[0].started
+    assert window.start_stop_button.isHidden()
+    assert window.pause_resume_button.text() == "Pause"
+    assert not window.computer_audio_source_button.isEnabled()
+
+    window.stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.start_stop_button.text() == "Start computer audio"
+    assert window.computer_audio_source_button.isEnabled()
+    window.close()
+
+
+def test_computer_audio_pipeline_warning_is_visible_and_logged(caplog) -> None:
+    create_application(["live-caption-translation-test"])
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def loopback_monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=output_fixture,
+        loopback_monitor_factory=loopback_monitor_factory,
+    )
+    window.computer_audio_source_button.click()
+    window.start_stop_button.click()
+
+    with caplog.at_level("WARNING"):
+        monitors[0].warning_callback("recognition queue is full")
+
+    assert window.statusBar().currentMessage() == (
+        "Computer audio warning: recognition queue is full"
+    )
+    assert (
+        "Computer audio pipeline warning: recognition queue is full"
+        in caplog.text
+    )
+
+    window.stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    window.close()
+
+
+def test_refresh_keeps_selected_computer_output_when_connected() -> None:
+    create_application(["live-caption-translation-test"])
+    headphones = output_fixture()[0]
+    speakers = OutputAudioDevice(
+        id="speaker-2",
+        name="Test Speakers",
+        is_default=False,
+    )
+    provider_calls = 0
+
+    def changing_output_provider() -> list[OutputAudioDevice]:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            return [headphones, speakers]
+        return [speakers, headphones]
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=changing_output_provider,
+    )
+    window.computer_audio_source_button.click()
+    window.output_selector.setCurrentIndex(1)
+    assert window.output_selector.currentData().id == "speaker-2"
+
+    window.refresh_devices_button.click()
+
+    assert window.output_selector.currentData().id == "speaker-2"
+    assert window.output_selector.currentText() == "Test Speakers"
+    window.close()
+
+
+def test_active_computer_output_disconnect_stops_capture_and_refreshes() -> None:
+    create_application(["live-caption-translation-test"])
+    outputs = output_fixture()
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def connected_output_provider() -> list[OutputAudioDevice]:
+        return list(outputs)
+
+    def loopback_monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=connected_output_provider,
+        loopback_monitor_factory=loopback_monitor_factory,
+    )
+    window.computer_audio_source_button.click()
+    window.start_stop_button.click()
+    assert monitors[0].started
+
+    outputs.clear()
+    window._handle_connected_outputs_changed()
+
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.start_stop_button.text() == "Start computer audio"
+    assert not window.start_stop_button.isEnabled()
+    assert window.statusBar().currentMessage() == "Computer audio disconnected"
+    assert "was disconnected" in window.device_status.text()
     window.close()
 
 
@@ -313,6 +884,8 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
         speech_segment_callback,
         caption_callback,
         recognition_language,
+        max_segment_seconds,
+        speech_threshold,
     ):
         monitor = FakeMicrophoneMonitor(
             device_indices,
@@ -322,6 +895,8 @@ def test_active_microphone_disconnect_stops_capture_and_refreshes() -> None:
             speech_segment_callback,
             caption_callback,
             recognition_language,
+            max_segment_seconds,
+            speech_threshold,
         )
         monitors.append(monitor)
         return monitor
@@ -383,10 +958,10 @@ def test_slow_stop_shows_caption_progress_without_blocking_the_window() -> None:
         monitor_factory=monitor_factory,
     )
     window.start_stop_button.click()
-    window.start_stop_button.click()
+    window.stop_button.click()
 
-    assert window.start_stop_button.text() == "Stopping…"
-    assert not window.start_stop_button.isEnabled()
+    assert window.stop_button.text() == "Stopping…"
+    assert not window.stop_button.isEnabled()
     wait_until(lambda: window._finishing_dialog is not None)
     dialog = window._finishing_dialog
     assert dialog is not None
@@ -400,6 +975,7 @@ def test_slow_stop_shows_caption_progress_without_blocking_the_window() -> None:
     release_stop.set()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     assert window.start_stop_button.isEnabled()
+    assert window.stop_button.isHidden()
     window.close()
 
 

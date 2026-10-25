@@ -1,5 +1,4 @@
 from types import SimpleNamespace
-
 import numpy as np
 
 from app.speech.recognition import RecognitionResult, RecognitionWorker
@@ -56,8 +55,11 @@ def test_recognition_queue_reports_visible_overload() -> None:
     assert worker.submit(speech_segment())
     assert not worker.submit(speech_segment(start=2_000))
 
-    assert results[0].skipped
-    assert results[0].text == "[caption skipped: processing too slow]"
+    # The overload result waits behind the older caption to preserve time order.
+    assert results == []
+    assert worker.cancel_pending() == 1
+    assert results[1].skipped
+    assert results[1].text == "[caption skipped: processing too slow]"
     assert "behind" in warnings[0]
 
 
@@ -101,3 +103,5 @@ def test_recognition_worker_uses_a_manual_language() -> None:
     worker.stop()
 
     assert results[0].language == "fr"
+
+

@@ -66,6 +66,8 @@ class MicrophoneLevelMonitor:
         speech_segment_callback: Callable[[SpeechSegment], None] | None = None,
         caption_callback: Callable[[TranslationResult], None] | None = None,
         recognition_language: str | None = None,
+        max_segment_seconds: float = 30.0,
+        speech_threshold: float = 0.5,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -117,6 +119,8 @@ class MicrophoneLevelMonitor:
                 event_callback=speech_event_callback,
                 warning_callback=self._warning_callback,
                 segment_callback=self._handle_speech_segment,
+                max_segment_seconds=max_segment_seconds,
+                speech_threshold=speech_threshold,
             )
             if speech_event_callback is not None
             else None
@@ -188,15 +192,7 @@ class MicrophoneLevelMonitor:
                 device_index,
                 self._active_sample_rate,
             )
-            self._performance_start = take_process_snapshot()
-            self.last_performance_report = None
-            if self.translation_worker is not None:
-                self.translation_worker.start()
-            if self.recognition_worker is not None:
-                self.recognition_worker.start()
-            if self.voice_activity_worker is not None:
-                self.voice_activity_worker.start()
-            self.processing_worker.start()
+            self._start_pipeline()
             return
 
         raise MicrophoneCaptureError(
@@ -224,28 +220,8 @@ class MicrophoneLevelMonitor:
         except Exception as error:
             stop_error = stop_error or error
 
-        try:
-            self.processing_worker.stop()
-        except AudioProcessingError as error:
-            stop_error = stop_error or error
-
-        if self.voice_activity_worker is not None:
-            try:
-                self.voice_activity_worker.stop()
-            except VoiceActivityError as error:
-                stop_error = stop_error or error
-
-        if self.recognition_worker is not None:
-            try:
-                self.recognition_worker.stop()
-            except RecognitionError as error:
-                stop_error = stop_error or error
-
-        if self.translation_worker is not None:
-            try:
-                self.translation_worker.stop()
-            except TranslationError as error:
-                stop_error = stop_error or error
+        pipeline_error = self._stop_pipeline()
+        stop_error = stop_error or pipeline_error
 
         self._log_capture_summary()
 
@@ -267,16 +243,60 @@ class MicrophoneLevelMonitor:
         if status:
             self._warning_callback(str(status))
 
-        level = calculate_input_level(input_data)
-        self._level_callback(float(level))
-
         sample_rate = self._active_sample_rate
-        if sample_rate is None:
-            return
+        if sample_rate is not None:
+            self._accept_audio(input_data, sample_rate)
 
+    def _accept_audio(self, input_data: object, sample_rate: int) -> None:
+        """Downmix one capture block and submit it to the shared pipeline."""
         samples = np.asarray(input_data, dtype=np.float32)
-        mono_samples = samples[:, 0] if samples.ndim == 2 else samples
+        if samples.size == 0:
+            return
+        mono_samples = (
+            np.mean(samples, axis=1, dtype=np.float32)
+            if samples.ndim == 2
+            else samples.reshape(-1)
+        )
+        level = calculate_input_level(mono_samples)
+        self._level_callback(float(level))
         self.audio_buffer.put(mono_samples, sample_rate=sample_rate)
+
+    def _start_pipeline(self) -> None:
+        self._performance_start = take_process_snapshot()
+        self.last_performance_report = None
+        if self.translation_worker is not None:
+            self.translation_worker.start()
+        if self.recognition_worker is not None:
+            self.recognition_worker.start()
+        if self.voice_activity_worker is not None:
+            self.voice_activity_worker.start()
+        self.processing_worker.start()
+
+    def _stop_pipeline(self) -> Exception | None:
+        stop_error: Exception | None = None
+        try:
+            self.processing_worker.stop()
+        except AudioProcessingError as error:
+            stop_error = error
+
+        if self.voice_activity_worker is not None:
+            try:
+                self.voice_activity_worker.stop()
+            except VoiceActivityError as error:
+                stop_error = stop_error or error
+
+        if self.recognition_worker is not None:
+            try:
+                self.recognition_worker.stop()
+            except RecognitionError as error:
+                stop_error = stop_error or error
+
+        if self.translation_worker is not None:
+            try:
+                self.translation_worker.stop()
+            except TranslationError as error:
+                stop_error = stop_error or error
+        return stop_error
 
     def _handle_speech_segment(self, segment: SpeechSegment) -> None:
         if self._speech_segment_callback is not None:
@@ -292,7 +312,7 @@ class MicrophoneLevelMonitor:
                 TranslationResult(result, None, None, 0.0)
             )
 
-    def _log_capture_summary(self) -> None:
+    def _log_capture_summary(self, source_name: str = "Microphone") -> None:
         start = self._performance_start
         self._performance_start = None
         if start is None:
@@ -304,10 +324,11 @@ class MicrophoneLevelMonitor:
         output_queue = self.processed_audio_buffer.stats
         processing = self.processing_worker.stats
         logger.info(
-            "Microphone capture stopped: duration=%.1fs, average CPU=%.1f%%, "
+            "%s capture stopped: duration=%.1fs, average CPU=%.1f%%, "
             "memory start=%s, end=%s, change=%s, process peak=%s, "
             "processed input=%.1fs, output=%.1fs, capture queue dropped=%.3fs, "
             "processed queue dropped=%.3fs",
+            source_name,
             report.elapsed_seconds,
             report.average_cpu_percent,
             format_mebibytes(report.memory_start_bytes),

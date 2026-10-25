@@ -1,13 +1,17 @@
 """Main desktop window for the application shell."""
 
 from collections.abc import Callable
+from datetime import datetime
 import logging
+from queue import Empty, SimpleQueue
+import sqlite3
 from threading import Thread
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QFont, QStandardItemModel
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -15,6 +19,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QRadioButton,
+    QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -27,11 +34,36 @@ from app.audio.devices import (
     refresh_input_devices,
 )
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
+from app.audio.loopback import (
+    LoopbackCaptureMonitor,
+    OutputAudioDevice,
+    list_output_devices,
+    refresh_output_devices,
+)
 from app.core.performance import PerformanceReport, format_mebibytes
+from app.core.state import RuntimeState, RuntimeStateMachine
+from app.history.database import HistoryDatabase, local_timestamp
 from app.speech.recognition import RecognitionStats
-from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityStats
+from app.speech.vad import (
+    VAD_SAMPLE_RATE,
+    SpeechEvent,
+    SpeechSegment,
+    VoiceActivityStats,
+)
 from app.translation.translator import TranslationResult, TranslationStats
+from app.ui.caption_overlay import CaptionOverlay
+from app.ui.chat_view import CaptionChatView
 from app.ui.finishing_dialog import FinishingCaptionsDialog
+from app.ui.history_sidebar import ConversationSidebar, LIVE_ITEM_KEY
+from app.ui.overlay_settings import (
+    OverlaySettingsDialog,
+    SettingsBackend,
+    create_interface_settings,
+    load_overlay_appearance,
+    load_overlay_geometry,
+    save_overlay_appearance,
+    save_overlay_geometry,
+)
 
 
 MonitorFactory = Callable[
@@ -43,8 +75,24 @@ MonitorFactory = Callable[
         Callable[[SpeechSegment], None],
         Callable[[TranslationResult], None],
         str | None,
+        float,
+        float,
     ],
     MicrophoneLevelMonitor,
+]
+LoopbackMonitorFactory = Callable[
+    [
+        OutputAudioDevice,
+        Callable[[float], None],
+        Callable[[str], None],
+        Callable[[SpeechEvent], None],
+        Callable[[SpeechSegment], None],
+        Callable[[TranslationResult], None],
+        str | None,
+        float,
+        float,
+    ],
+    LoopbackCaptureMonitor,
 ]
 
 logger = logging.getLogger(__name__)
@@ -58,48 +106,83 @@ class MainWindow(QMainWindow):
     speech_event_received = Signal(object)
     speech_segment_received = Signal(object)
     caption_received = Signal(object)
+    queued_captions_ready = Signal()
 
     def __init__(
         self,
         device_provider: Callable[[], list[AudioDevice]] | None = None,
         monitor_factory: MonitorFactory | None = None,
         connected_name_provider: Callable[[], set[str]] | None = None,
+        output_device_provider: Callable[[], list[OutputAudioDevice]] | None = None,
+        loopback_monitor_factory: LoopbackMonitorFactory | None = None,
+        history_database: HistoryDatabase | None = None,
+        interface_settings: SettingsBackend | None = None,
     ) -> None:
         super().__init__()
+        self._runtime = RuntimeStateMachine()
+        self._history = history_database or HistoryDatabase()
+        self._interface_settings = interface_settings or create_interface_settings()
+        recovered_sessions = self._history.recover_interrupted_sessions()
+        if recovered_sessions:
+            logger.info(
+                "Recovered %d interrupted caption session(s)",
+                recovered_sessions,
+            )
+        self._active_history_session_id: int | None = None
+        self._viewing_history_session_id: int | None = None
+        self._showing_live_conversation = False
         self._device_provider = device_provider or list_input_devices
         self._refresh_device_provider = device_provider or refresh_input_devices
         self._monitor_factory = monitor_factory or MicrophoneLevelMonitor
+        self._output_device_provider = output_device_provider or list_output_devices
+        self._refresh_output_device_provider = (
+            output_device_provider or refresh_output_devices
+        )
+        self._loopback_monitor_factory = (
+            loopback_monitor_factory or LoopbackCaptureMonitor
+        )
         self._connected_name_provider = (
             connected_name_provider or self._qt_connected_microphone_names
         )
         self._microphone_monitor: MicrophoneLevelMonitor | None = None
+        self._active_source: str | None = None
         self._active_microphone_name: str | None = None
+        self._active_output_id: str | None = None
+        self._caption_source_label = "Speaker"
         self._device_refresh_pending = False
+        self._outputs_loaded = False
         self._completed_speech_chunks = 0
         self._stopping_monitor: MicrophoneLevelMonitor | None = None
         self._stop_thread: Thread | None = None
         self._stop_error: MicrophoneCaptureError | None = None
         self._show_ready_after_stop = True
         self._close_after_stop = False
+        self._stop_operation = "stop"
         self._allow_window_close = False
         self._after_stop: Callable[[], None] | None = None
         self._finishing_dialog: FinishingCaptionsDialog | None = None
+        self._pending_caption_results: SimpleQueue[TranslationResult] = SimpleQueue()
+        self._session_audio_offset_seconds = 0.0
 
         self.microphone_level_received.connect(self._set_microphone_level)
         self.microphone_warning_received.connect(self._show_microphone_warning)
         self.speech_event_received.connect(self._show_speech_event)
         self.speech_segment_received.connect(self._show_speech_segment)
         self.caption_received.connect(self._show_caption)
+        self.queued_captions_ready.connect(self._drain_queued_captions)
 
         self._media_devices = QMediaDevices(self)
         self._media_devices.audioInputsChanged.connect(
             self._handle_connected_microphones_changed
         )
+        self._media_devices.audioOutputsChanged.connect(
+            self._handle_connected_outputs_changed
+        )
 
         self.setObjectName("mainWindow")
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(820, 440)
-        self.resize(940, 520)
+        self.setMinimumSize(900, 640)
+        self.resize(1050, 760)
 
         title = QLabel(APP_NAME)
         title.setObjectName("applicationTitle")
@@ -110,20 +193,44 @@ class MainWindow(QMainWindow):
         title_font.setBold(True)
         title.setFont(title_font)
 
-        message = QLabel("Choose the microphone that will provide live speech.")
+        message = QLabel("Choose where the live speech will come from.")
         message.setObjectName("welcomeMessage")
         message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.microphone_source_button = QRadioButton("Microphone")
+        self.microphone_source_button.setObjectName("microphoneSourceButton")
+        self.computer_audio_source_button = QRadioButton("Computer audio")
+        self.computer_audio_source_button.setObjectName("computerAudioSourceButton")
+        self.microphone_source_button.setChecked(True)
+        self.source_button_group = QButtonGroup(self)
+        self.source_button_group.addButton(self.microphone_source_button)
+        self.source_button_group.addButton(self.computer_audio_source_button)
+        self.source_button_group.buttonToggled.connect(self._handle_source_changed)
+
+        source_layout = QHBoxLayout()
+        source_layout.addWidget(QLabel("Audio source:"))
+        source_layout.addWidget(self.microphone_source_button)
+        source_layout.addWidget(self.computer_audio_source_button)
+        source_layout.addStretch()
 
         self.microphone_selector = QComboBox()
         self.microphone_selector.setObjectName("microphoneSelector")
         self.microphone_selector.setMinimumWidth(360)
 
+        self.output_selector = QComboBox()
+        self.output_selector.setObjectName("computerAudioSelector")
+        self.output_selector.setMinimumWidth(360)
+        self.output_selector.addItem("Select Computer audio to load devices")
+        self.output_selector.setEnabled(False)
+        self.output_selector.setVisible(False)
+
         self.refresh_devices_button = QPushButton("Refresh")
         self.refresh_devices_button.setObjectName("refreshMicrophonesButton")
-        self.refresh_devices_button.clicked.connect(self.refresh_connected_microphones)
+        self.refresh_devices_button.clicked.connect(self.refresh_selected_devices)
 
         selector_layout = QHBoxLayout()
         selector_layout.addWidget(self.microphone_selector, stretch=1)
+        selector_layout.addWidget(self.output_selector, stretch=1)
         selector_layout.addWidget(self.refresh_devices_button)
 
         self.device_status = QLabel()
@@ -141,11 +248,6 @@ class MainWindow(QMainWindow):
 
         self.speech_turn_status = QLabel("Completed speech chunks: 0")
         self.speech_turn_status.setObjectName("speechTurnStatus")
-
-        self.latest_caption = QLabel("Latest caption: waiting for microphone")
-        self.latest_caption.setObjectName("latestCaption")
-        self.latest_caption.setWordWrap(True)
-        self.latest_caption.setMinimumHeight(76)
 
         self.language_selector = QComboBox()
         self.language_selector.setObjectName("speechLanguageSelector")
@@ -167,23 +269,169 @@ class MainWindow(QMainWindow):
         caption_view_layout.addWidget(QLabel("Caption view:"))
         caption_view_layout.addWidget(self.caption_view_selector, stretch=1)
 
+        self.speech_sensitivity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speech_sensitivity_slider.setObjectName("speechSensitivitySlider")
+        self.speech_sensitivity_slider.setRange(1, 9)
+        self.speech_sensitivity_slider.setValue(5)
+        self.speech_sensitivity_slider.setTickInterval(1)
+        self.speech_sensitivity_slider.setTickPosition(
+            QSlider.TickPosition.TicksBelow
+        )
+        self.speech_sensitivity_slider.setToolTip(
+            "Higher sensitivity accepts quieter speech but may accept more noise."
+        )
+        self.speech_sensitivity_label = QLabel()
+        self.speech_sensitivity_label.setObjectName("speechSensitivityLabel")
+        self.speech_sensitivity_slider.valueChanged.connect(
+            self._update_speech_sensitivity_label
+        )
+        self._update_speech_sensitivity_label()
+
+        sensitivity_layout = QHBoxLayout()
+        sensitivity_layout.addWidget(self.speech_sensitivity_label)
+        sensitivity_layout.addWidget(self.speech_sensitivity_slider, stretch=1)
+
+        self.speech_chunk_duration_slider = QSlider(
+            Qt.Orientation.Horizontal
+        )
+        self.speech_chunk_duration_slider.setObjectName(
+            "speechChunkDurationSlider"
+        )
+        self.speech_chunk_duration_slider.setRange(5, 60)
+        self.speech_chunk_duration_slider.setSingleStep(5)
+        self.speech_chunk_duration_slider.setPageStep(5)
+        self.speech_chunk_duration_slider.setTickInterval(5)
+        self.speech_chunk_duration_slider.setTickPosition(
+            QSlider.TickPosition.TicksBelow
+        )
+        self.speech_chunk_duration_slider.setValue(30)
+        self.speech_chunk_duration_slider.setToolTip(
+            "Maximum length of uninterrupted speech. Silence can end a chunk earlier."
+        )
+        self.speech_chunk_duration_label = QLabel()
+        self.speech_chunk_duration_label.setObjectName(
+            "speechChunkDurationLabel"
+        )
+        self.speech_chunk_duration_slider.valueChanged.connect(
+            self._update_speech_chunk_duration_label
+        )
+        self._update_speech_chunk_duration_label()
+
+        chunk_duration_layout = QHBoxLayout()
+        chunk_duration_layout.addWidget(self.speech_chunk_duration_label)
+        chunk_duration_layout.addWidget(
+            self.speech_chunk_duration_slider,
+            stretch=1,
+        )
+
         self.start_stop_button = QPushButton("Start microphone")
         self.start_stop_button.setObjectName("startStopMicrophoneButton")
         self.start_stop_button.setMinimumHeight(48)
         self.start_stop_button.clicked.connect(self.toggle_microphone)
+        self.pause_resume_button = QPushButton("Pause")
+        self.pause_resume_button.setObjectName("pauseResumeButton")
+        self.pause_resume_button.setMinimumHeight(48)
+        self.pause_resume_button.setVisible(False)
+        self.pause_resume_button.clicked.connect(self._toggle_pause_resume)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("stopCaptureButton")
+        self.stop_button.setMinimumHeight(48)
+        self.stop_button.setVisible(False)
+        self.stop_button.clicked.connect(self._stop_session)
 
-        microphone_group = QGroupBox("Microphone")
+        live_control_layout = QHBoxLayout()
+        live_control_layout.setSpacing(8)
+        live_control_layout.addWidget(self.start_stop_button, stretch=1)
+        live_control_layout.addWidget(self.pause_resume_button, stretch=1)
+        live_control_layout.addWidget(self.stop_button, stretch=1)
+
+        self.microphone_group = QGroupBox("Live audio")
+        self.microphone_group.setObjectName("liveAudioGroup")
         microphone_layout = QVBoxLayout()
+        microphone_layout.setContentsMargins(12, 18, 12, 12)
+        microphone_layout.setSpacing(5)
+        microphone_layout.addLayout(source_layout)
         microphone_layout.addLayout(language_layout)
         microphone_layout.addLayout(caption_view_layout)
         microphone_layout.addLayout(selector_layout)
         microphone_layout.addWidget(self.device_status)
         microphone_layout.addWidget(self.input_level)
-        microphone_layout.addWidget(self.speech_status)
-        microphone_layout.addWidget(self.speech_turn_status)
-        microphone_layout.addWidget(self.latest_caption)
-        microphone_layout.addWidget(self.start_stop_button)
-        microphone_group.setLayout(microphone_layout)
+        speech_summary_layout = QHBoxLayout()
+        speech_summary_layout.addWidget(self.speech_status)
+        speech_summary_layout.addStretch()
+        speech_summary_layout.addWidget(self.speech_turn_status)
+        microphone_layout.addLayout(speech_summary_layout)
+        microphone_layout.addLayout(live_control_layout)
+        self.microphone_group.setLayout(microphone_layout)
+        self.microphone_group.setMinimumHeight(
+            self.microphone_group.minimumSizeHint().height()
+        )
+
+        self.caption_chat = CaptionChatView()
+        self.caption_overlay = CaptionOverlay(self)
+        self.caption_overlay.apply_appearance(
+            load_overlay_appearance(self._interface_settings)
+        )
+        overlay_geometry = load_overlay_geometry(self._interface_settings)
+        if overlay_geometry is not None:
+            self.caption_overlay.restoreGeometry(overlay_geometry)
+        self.caption_overlay.hidden_by_user.connect(
+            self._handle_overlay_hidden_by_user
+        )
+        self.caption_view_selector.currentIndexChanged.connect(
+            self._update_caption_display_mode
+        )
+        self.overlay_toggle_button = QPushButton("Show overlay")
+        self.overlay_toggle_button.setObjectName("overlayToggleButton")
+        self.overlay_toggle_button.setCheckable(True)
+        self.overlay_toggle_button.toggled.connect(self._toggle_caption_overlay)
+        self.overlay_settings_button = QPushButton("Overlay settings")
+        self.overlay_settings_button.setObjectName("overlaySettingsButton")
+        self.overlay_settings_button.clicked.connect(self._open_overlay_settings)
+        self.clear_captions_button = QPushButton("Clear screen")
+        self.clear_captions_button.setObjectName("clearCaptionsButton")
+        self.clear_captions_button.clicked.connect(self._clear_caption_screen)
+        self.to_bottom_button = QPushButton("To bottom")
+        self.to_bottom_button.setObjectName("toBottomButton")
+        self.to_bottom_button.clicked.connect(self.caption_chat.scroll_to_bottom)
+        self.sidebar_toggle_button = QPushButton("Hide conversations")
+        self.sidebar_toggle_button.setObjectName("sidebarToggleButton")
+        self.sidebar_toggle_button.setCheckable(True)
+        self.sidebar_toggle_button.setChecked(True)
+        self.sidebar_toggle_button.toggled.connect(
+            self._set_conversation_sidebar_visible
+        )
+
+        chat_actions = QHBoxLayout()
+        chat_actions.addWidget(self.overlay_toggle_button)
+        chat_actions.addWidget(self.overlay_settings_button)
+        chat_actions.addWidget(self.sidebar_toggle_button)
+        chat_actions.addStretch()
+        chat_actions.addWidget(self.to_bottom_button)
+        chat_actions.addWidget(self.clear_captions_button)
+
+        self.chat_group = QGroupBox("Live conversation")
+        chat_layout = QVBoxLayout(self.chat_group)
+        chat_layout.addLayout(chat_actions)
+        chat_layout.addWidget(self.caption_chat, stretch=1)
+
+        self.conversation_sidebar = ConversationSidebar()
+        self.conversation_sidebar.live_selected.connect(
+            self._show_live_conversation
+        )
+        self.conversation_sidebar.session_selected.connect(
+            self._show_saved_conversation
+        )
+
+        self.conversation_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.conversation_splitter.setObjectName("conversationSplitter")
+        self.conversation_splitter.setChildrenCollapsible(False)
+        self.conversation_splitter.addWidget(self.conversation_sidebar)
+        self.conversation_splitter.addWidget(self.chat_group)
+        self.conversation_splitter.setStretchFactor(0, 0)
+        self.conversation_splitter.setStretchFactor(1, 1)
+        self.conversation_splitter.setSizes([260, 790])
+        self._expanded_sidebar_width = 260
 
         self.performance_view_selector = QComboBox()
         self.performance_view_selector.setObjectName("performanceViewSelector")
@@ -208,8 +456,10 @@ class MainWindow(QMainWindow):
             stretch=1,
         )
 
-        performance_group = QGroupBox("Performance")
+        performance_group = QGroupBox("Processing settings and performance")
         performance_layout = QVBoxLayout()
+        performance_layout.addLayout(chunk_duration_layout)
+        performance_layout.addLayout(sensitivity_layout)
         performance_layout.addLayout(performance_selector_layout)
         performance_layout.addWidget(self.performance_summary)
         performance_layout.addStretch()
@@ -226,7 +476,7 @@ class MainWindow(QMainWindow):
         panels_layout = QHBoxLayout()
         panels_layout.setSpacing(16)
         panels_layout.addWidget(
-            microphone_group,
+            self.microphone_group,
             stretch=3,
             alignment=Qt.AlignmentFlag.AlignTop,
         )
@@ -243,13 +493,108 @@ class MainWindow(QMainWindow):
         layout.addWidget(message)
         layout.addSpacing(4)
         layout.addLayout(panels_layout)
-        layout.addStretch()
+        layout.addWidget(self.conversation_splitter, stretch=1)
 
         content = QWidget()
         content.setLayout(layout)
         self.setCentralWidget(content)
 
+        self._restore_interface_settings()
         self.refresh_microphones()
+        self._refresh_conversation_sidebar()
+
+    @property
+    def runtime_state(self) -> RuntimeState:
+        """Return the current processing state for UI and diagnostics."""
+        return self._runtime.state
+
+    def _refresh_conversation_sidebar(
+        self,
+        selected_key: str | int | None = None,
+    ) -> None:
+        if selected_key is None:
+            selected_key = self.conversation_sidebar.selected_key()
+        self.conversation_sidebar.set_sessions(
+            self._history.list_sessions(),
+            show_live=self._active_history_session_id is not None,
+            live_status=(
+                "Paused"
+                if self._runtime.state
+                in {RuntimeState.PAUSING, RuntimeState.PAUSED}
+                else "Listening now"
+            ),
+            selected_key=selected_key,
+        )
+        if self._viewing_history_session_id is None:
+            current_key = self.conversation_sidebar.selected_key()
+            if current_key == LIVE_ITEM_KEY:
+                self._show_live_conversation()
+            elif isinstance(current_key, int):
+                self._show_saved_conversation(current_key)
+
+    def _show_live_conversation(self) -> None:
+        session_id = self._active_history_session_id
+        if session_id is None:
+            return
+        self._showing_live_conversation = True
+        self._viewing_history_session_id = session_id
+        self.chat_group.setTitle("Live conversation")
+        self._load_history_messages(session_id)
+
+    def _show_saved_conversation(self, session_id: int) -> None:
+        session = self._history.get_session(session_id)
+        if session is None:
+            return
+        self._showing_live_conversation = False
+        self._viewing_history_session_id = session_id
+        status = session.status.capitalize()
+        self.chat_group.setTitle(f"{session.title} · {status}")
+        self._load_history_messages(session_id)
+
+    def _load_history_messages(self, session_id: int) -> None:
+        self.caption_chat.clear_messages()
+        for message in self._history.get_messages(session_id):
+            self.caption_chat.add_message(
+                original_text=message.original_text,
+                source_language=message.source_language,
+                translated_text=message.translated_text,
+                target_language=message.target_language,
+                speaker=message.speaker_label,
+                timestamp=self._history_message_time(message.created_at),
+                warning=message.warning,
+            )
+        QTimer.singleShot(
+            0,
+            self.caption_chat,
+            self.caption_chat.scroll_to_bottom,
+        )
+
+    @staticmethod
+    def _history_message_time(timestamp: str) -> str:
+        try:
+            return datetime.fromisoformat(timestamp).astimezone().strftime("%H:%M")
+        except ValueError:
+            return timestamp
+
+    def _create_history_session(self, active_source: str) -> int:
+        source_label = (
+            "Computer audio" if active_source == "computer_audio" else "Microphone"
+        )
+        preferred_language = self.language_selector.currentData()
+        language_mode = preferred_language or "automatic"
+        target_language = (
+            "en" if preferred_language == "fr" else "fr"
+            if preferred_language == "en"
+            else None
+        )
+        title_time = datetime.now().astimezone().strftime("%d %b %Y %H:%M")
+        return self._history.create_session(
+            title=f"{source_label} · {title_time}",
+            audio_source=active_source,
+            language_mode=str(language_mode),
+            preferred_source_language=preferred_language,
+            target_language=target_language,
+        )
 
     def refresh_microphones(
         self,
@@ -310,7 +655,7 @@ class MainWindow(QMainWindow):
 
     def refresh_connected_microphones(self) -> None:
         """Restart device discovery and rebuild the visible microphone list."""
-        if self._microphone_monitor is not None:
+        if self._microphone_monitor is not None or self._stop_thread is not None:
             return
 
         self.refresh_devices_button.setEnabled(False)
@@ -325,52 +670,353 @@ class MainWindow(QMainWindow):
             self.refresh_devices_button.setText("Refresh")
             self.refresh_devices_button.setEnabled(True)
 
-    def toggle_microphone(self) -> None:
-        """Start or stop the caption pipeline for the selected microphone."""
-        if self._microphone_monitor is not None:
-            self._stop_microphone()
+    def refresh_outputs(
+        self,
+        provider: Callable[[], list[OutputAudioDevice]] | None = None,
+        refreshed: bool = False,
+    ) -> None:
+        """Reload connected Windows speaker and headphone endpoints."""
+        selected = self.output_selector.currentData()
+        selected_id = selected.id if isinstance(selected, OutputAudioDevice) else None
+        self.output_selector.clear()
+        try:
+            devices = (provider or self._output_device_provider)()
+        except MicrophoneCaptureError as error:
+            logger.exception("Computer audio device discovery failed")
+            self.output_selector.addItem("Computer audio check failed")
+            self.output_selector.setEnabled(False)
+            self.start_stop_button.setEnabled(False)
+            self.device_status.setText(str(error))
+            self.statusBar().showMessage("Computer audio discovery failed")
+            self._outputs_loaded = True
             return
 
-        selected_device = self.microphone_selector.currentData()
-        if not isinstance(selected_device, AudioDevice):
-            self.statusBar().showMessage("Select a microphone first")
+        self._outputs_loaded = True
+        if not devices:
+            self.output_selector.addItem("No output devices found")
+            self.output_selector.setEnabled(False)
+            self.start_stop_button.setEnabled(False)
+            self.device_status.setText(
+                "Connect speakers or headphones, then refresh."
+            )
+            self.statusBar().showMessage("No computer audio device found")
             return
 
-        monitor = self._monitor_factory(
-            selected_device.input_indices,
+        for device in devices:
+            self.output_selector.addItem(device.display_name, userData=device)
+        if selected_id is not None:
+            for index, device in enumerate(devices):
+                if device.id == selected_id:
+                    self.output_selector.setCurrentIndex(index)
+                    break
+
+        self.output_selector.setEnabled(True)
+        self.start_stop_button.setEnabled(True)
+        noun = "device" if len(devices) == 1 else "devices"
+        self.device_status.setText(
+            f"Found {len(devices)} connected computer audio {noun}."
+        )
+        self.statusBar().showMessage("Ready")
+        if refreshed:
+            logger.info(
+                "Computer audio list refreshed: %d connected device(s): %s",
+                len(devices),
+                ", ".join(device.name for device in devices),
+            )
+
+    def refresh_connected_outputs(self) -> None:
+        if self._microphone_monitor is not None or self._stop_thread is not None:
+            return
+        self.refresh_devices_button.setEnabled(False)
+        self.refresh_devices_button.setText("Refreshing…")
+        self.statusBar().showMessage("Refreshing computer audio list…")
+        try:
+            self.refresh_outputs(
+                provider=self._refresh_output_device_provider,
+                refreshed=True,
+            )
+        finally:
+            self.refresh_devices_button.setText("Refresh")
+            self.refresh_devices_button.setEnabled(True)
+
+    def refresh_selected_devices(self) -> None:
+        if self.computer_audio_source_button.isChecked():
+            self.refresh_connected_outputs()
+        else:
+            self.refresh_connected_microphones()
+
+    def _handle_source_changed(self, _button, checked: bool) -> None:
+        if not checked or self._microphone_monitor is not None:
+            return
+        computer_audio = self.computer_audio_source_button.isChecked()
+        self.microphone_selector.setVisible(not computer_audio)
+        self.output_selector.setVisible(computer_audio)
+        if computer_audio and not self._outputs_loaded:
+            self.refresh_outputs()
+        elif computer_audio:
+            self.start_stop_button.setEnabled(self.output_selector.isEnabled())
+            self.device_status.setText(
+                f"Selected computer audio: {self.output_selector.currentText()}."
+            )
+            self.statusBar().showMessage("Ready")
+        else:
+            self.start_stop_button.setEnabled(self.microphone_selector.isEnabled())
+            self.device_status.setText(
+                f"Found {self.microphone_selector.count()} connected "
+                f"{'microphone' if self.microphone_selector.count() == 1 else 'microphones'}."
+            )
+            self.statusBar().showMessage("Ready")
+        self.start_stop_button.setText(
+            "Start computer audio" if computer_audio else "Start microphone"
+        )
+
+    def _update_speech_chunk_duration_label(self, _value: int | None = None) -> None:
+        seconds = self.speech_chunk_duration_slider.value()
+        self.speech_chunk_duration_label.setText(
+            f"Maximum speech chunk: {seconds} seconds"
+        )
+
+    def _update_speech_sensitivity_label(self, _value: int | None = None) -> None:
+        value = self.speech_sensitivity_slider.value()
+        if value < 5:
+            description = "Less sensitive"
+        elif value > 5:
+            description = "More sensitive"
+        else:
+            description = "Balanced"
+        self.speech_sensitivity_label.setText(
+            f"Speech sensitivity: {value}/9 ({description})"
+        )
+
+    def _speech_threshold(self) -> float:
+        # Keep Silero's exit threshold (speech threshold - 0.15) positive.
+        return round(0.875 - self.speech_sensitivity_slider.value() * 0.075, 3)
+
+    def _create_selected_monitor(
+        self,
+    ) -> tuple[MicrophoneLevelMonitor, str, str, str | None, str | None]:
+        """Build a fresh capture pipeline for the currently selected source."""
+
+        computer_audio = self.computer_audio_source_button.isChecked()
+        common_arguments = (
             self.microphone_level_received.emit,
             self.microphone_warning_received.emit,
             self.speech_event_received.emit,
             self.speech_segment_received.emit,
-            self.caption_received.emit,
+            self._queue_caption_from_worker,
             self.language_selector.currentData(),
+            float(self.speech_chunk_duration_slider.value()),
+            self._speech_threshold(),
+        )
+        if computer_audio:
+            selected_output = self.output_selector.currentData()
+            if not isinstance(selected_output, OutputAudioDevice):
+                raise MicrophoneCaptureError(
+                    "Select a computer audio device first."
+                )
+            monitor = self._loopback_monitor_factory(
+                selected_output,
+                *common_arguments,
+            )
+            return (
+                monitor,
+                selected_output.name,
+                "computer_audio",
+                None,
+                selected_output.id,
+            )
+
+        selected_device = self.microphone_selector.currentData()
+        if not isinstance(selected_device, AudioDevice):
+            raise MicrophoneCaptureError("Select a microphone first.")
+        monitor = self._monitor_factory(
+            selected_device.input_indices,
+            *common_arguments,
+        )
+        return (
+            monitor,
+            selected_device.name,
+            "microphone",
+            selected_device.name,
+            None,
         )
 
+    def toggle_microphone(self) -> None:
+        """Start a new caption session for the selected audio source."""
+        if (
+            self._runtime.state is RuntimeState.ERROR
+            and self._active_history_session_id is None
+        ):
+            self._runtime.transition(RuntimeState.IDLE)
+        if self._runtime.state is not RuntimeState.IDLE:
+            return
+
+        try:
+            (
+                monitor,
+                selected_name,
+                active_source,
+                active_microphone_name,
+                active_output_id,
+            ) = self._create_selected_monitor()
+        except MicrophoneCaptureError as error:
+            self.statusBar().showMessage(str(error))
+            return
+
+        self._runtime.transition(RuntimeState.STARTING)
+        try:
+            history_session_id = self._create_history_session(active_source)
+        except sqlite3.Error as error:
+            self._runtime.transition(RuntimeState.ERROR)
+            logger.exception("Caption history session could not be created")
+            self.device_status.setText(
+                "Local conversation history could not be started."
+            )
+            self.statusBar().showMessage("History database error")
+            return
+
+        self._active_history_session_id = history_session_id
         try:
             monitor.start()
         except MicrophoneCaptureError as error:
+            try:
+                self._history.finish_session(
+                    history_session_id,
+                    status="incomplete",
+                )
+            except sqlite3.Error:
+                logger.exception("Failed to close unsuccessful history session")
+            self._active_history_session_id = None
+            self._refresh_conversation_sidebar(history_session_id)
+            self._runtime.transition(RuntimeState.ERROR)
             self.input_level.setValue(0)
             self.device_status.setText(str(error))
-            self.statusBar().showMessage("Microphone could not start")
+            self.statusBar().showMessage("Audio capture could not start")
             return
 
         self._microphone_monitor = monitor
-        self._active_microphone_name = selected_device.name
-        self.microphone_selector.setEnabled(False)
-        self.language_selector.setEnabled(False)
-        self.refresh_devices_button.setEnabled(False)
-        self.start_stop_button.setText("Stop microphone")
-        self.device_status.setText(
-            f"Listening to {self.microphone_selector.currentText()}. Audio is not saved."
+        self._active_source = active_source
+        self._active_microphone_name = active_microphone_name
+        self._active_output_id = active_output_id
+        self._session_audio_offset_seconds = 0.0
+        self._caption_source_label = (
+            "Computer audio" if active_source == "computer_audio" else "Microphone"
         )
-        self.statusBar().showMessage("Microphone active")
+        self._runtime.transition(RuntimeState.LIVE)
+        self._showing_live_conversation = True
+        self._viewing_history_session_id = history_session_id
+        self.chat_group.setTitle("Live conversation")
+        self._refresh_conversation_sidebar(LIVE_ITEM_KEY)
+        self.microphone_source_button.setEnabled(False)
+        self.computer_audio_source_button.setEnabled(False)
+        self.microphone_selector.setEnabled(False)
+        self.output_selector.setEnabled(False)
+        self.language_selector.setEnabled(False)
+        self.speech_chunk_duration_slider.setEnabled(False)
+        self.speech_sensitivity_slider.setEnabled(False)
+        self.refresh_devices_button.setEnabled(False)
+        self.start_stop_button.setVisible(False)
+        self.pause_resume_button.setText("Pause")
+        self.pause_resume_button.setEnabled(True)
+        self.pause_resume_button.setVisible(True)
+        self.stop_button.setEnabled(True)
+        self.stop_button.setVisible(True)
+        self.device_status.setText(
+            f"Listening to {selected_name}. Audio is not saved."
+        )
+        self.statusBar().showMessage(
+            "Computer audio active"
+            if active_source == "computer_audio"
+            else "Microphone active"
+        )
         self.speech_status.setText("Speech detection: listening…")
         self._completed_speech_chunks = 0
         self.speech_turn_status.setText("Completed speech chunks: 0")
-        self.latest_caption.setText("Latest caption: listening…")
+        self.caption_chat.clear_messages()
+        self.caption_overlay.clear_message()
         self.performance_summary.setText("Measuring performance…")
         self._performance_timer.start()
         self._update_performance_stats()
+
+    def _toggle_pause_resume(self) -> None:
+        if self._runtime.state is RuntimeState.LIVE:
+            self._stop_microphone(pause_after_stop=True)
+        elif self._runtime.state is RuntimeState.PAUSED:
+            self._resume_microphone()
+
+    def _stop_session(self) -> None:
+        if self._runtime.state is RuntimeState.LIVE:
+            self._stop_microphone()
+            return
+        if self._runtime.state in {RuntimeState.PAUSED, RuntimeState.ERROR}:
+            self._runtime.transition(RuntimeState.STOPPING)
+            self._stop_operation = "stop"
+            self._show_ready_after_stop = True
+            self._close_after_stop = False
+            self._after_stop = None
+            self._finish_microphone_stop()
+
+    def _resume_microphone(self) -> None:
+        """Resume capture without creating another history session."""
+
+        session_id = self._active_history_session_id
+        if session_id is None:
+            return
+        self._runtime.transition(RuntimeState.RESUMING)
+        self.pause_resume_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.speech_status.setText("Speech detection: resuming…")
+        self.statusBar().showMessage("Resuming audio capture…")
+
+        try:
+            (
+                monitor,
+                selected_name,
+                active_source,
+                active_microphone_name,
+                active_output_id,
+            ) = self._create_selected_monitor()
+            monitor.start()
+        except MicrophoneCaptureError as error:
+            self._runtime.transition(RuntimeState.ERROR)
+            self.pause_resume_button.setText("Resume")
+            self.pause_resume_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.device_status.setText(str(error))
+            self.statusBar().showMessage("Audio capture could not resume")
+            return
+
+        try:
+            self._history.resume_session(session_id)
+        except (sqlite3.Error, ValueError):
+            logger.exception("Caption history session could not be resumed")
+            self._microphone_monitor = monitor
+            self._runtime.transition(RuntimeState.ERROR)
+            self._stop_microphone(show_ready=False)
+            return
+
+        self._microphone_monitor = monitor
+        self._active_source = active_source
+        self._active_microphone_name = active_microphone_name
+        self._active_output_id = active_output_id
+        self._runtime.transition(RuntimeState.LIVE)
+        self.pause_resume_button.setText("Pause")
+        self.pause_resume_button.setEnabled(True)
+        self.stop_button.setEnabled(True)
+        self.speech_status.setText("Speech detection: listening…")
+        self.device_status.setText(
+            f"Listening to {selected_name}. Audio is not saved."
+        )
+        self.statusBar().showMessage(
+            "Computer audio active"
+            if active_source == "computer_audio"
+            else "Microphone active"
+        )
+        self.chat_group.setTitle("Live conversation")
+        self.caption_overlay.set_paused(False)
+        self._refresh_conversation_sidebar(LIVE_ITEM_KEY)
+        self._performance_timer.start()
+        logger.info("Caption session resumed")
 
     def _stop_microphone(
         self,
@@ -378,6 +1024,7 @@ class MainWindow(QMainWindow):
         *,
         close_after_stop: bool = False,
         after_stop: Callable[[], None] | None = None,
+        pause_after_stop: bool = False,
     ) -> None:
         """Stop capture in the background so the interface remains responsive."""
         if self._stop_thread is not None:
@@ -397,16 +1044,36 @@ class MainWindow(QMainWindow):
                 self.close()
             return
 
+        if pause_after_stop:
+            self._runtime.transition(RuntimeState.PAUSING)
+            self._stop_operation = "pause"
+        else:
+            if self._runtime.state in {RuntimeState.LIVE, RuntimeState.ERROR}:
+                self._runtime.transition(RuntimeState.STOPPING)
+            self._stop_operation = "stop"
+
         self._microphone_monitor = None
-        self._active_microphone_name = None
+        if not pause_after_stop:
+            self._active_source = None
+            self._active_microphone_name = None
+            self._active_output_id = None
         self._performance_timer.stop()
         self.input_level.setValue(0)
         self.speech_status.setText("Speech detection: finishing captions…")
         self.microphone_selector.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setEnabled(False)
-        self.start_stop_button.setText("Stopping…")
-        self.statusBar().showMessage("Finishing accepted captions…")
+        self.pause_resume_button.setEnabled(False)
+        self.pause_resume_button.setText(
+            "Pausing…" if pause_after_stop else "Pause"
+        )
+        self.stop_button.setEnabled(False)
+        self.stop_button.setText("Stopping…" if not pause_after_stop else "Stop")
+        self.statusBar().showMessage(
+            "Pausing and finishing accepted captions…"
+            if pause_after_stop
+            else "Finishing accepted captions…"
+        )
 
         self._stopping_monitor = monitor
         self._stop_error = None
@@ -437,6 +1104,7 @@ class MainWindow(QMainWindow):
         dialog = FinishingCaptionsDialog(
             self,
             closing_application=self._close_after_stop,
+            pausing_session=self._stop_operation == "pause",
         )
         dialog.finish_now_requested.connect(self._skip_remaining_captions)
         self._finishing_dialog = dialog
@@ -525,7 +1193,9 @@ class MainWindow(QMainWindow):
         average_seconds = max(1.0, average_seconds)
         active_elapsed = float(getattr(stats, elapsed_name, 0.0))
         active_remaining = (
-            max(1.0, average_seconds - active_elapsed) if active else 0.0
+            max(float(active), active * average_seconds - active_elapsed)
+            if active
+            else 0.0
         )
         return remaining, queued * average_seconds + active_remaining, average_seconds
 
@@ -544,10 +1214,15 @@ class MainWindow(QMainWindow):
     def _finish_microphone_stop(self) -> None:
         monitor = self._stopping_monitor
         dialog = self._finishing_dialog
+        stop_operation = self._stop_operation
         after_stop = self._after_stop
         close_after_stop = self._close_after_stop
         show_ready = self._show_ready_after_stop
         stop_error = self._stop_error
+
+        # The processing workers are now stopped, so every accepted result is in
+        # this handoff queue. Drain it before closing the active history session.
+        self._drain_queued_captions()
 
         self._stop_poll_timer.stop()
         self._stop_thread = None
@@ -555,6 +1230,7 @@ class MainWindow(QMainWindow):
         self._stop_error = None
         self._after_stop = None
         self._finishing_dialog = None
+        self._stop_operation = "stop"
         if dialog is not None:
             dialog.accept()
             dialog.deleteLater()
@@ -567,34 +1243,145 @@ class MainWindow(QMainWindow):
                 monitor.translation_stats,
             )
 
+        if stop_operation == "pause" and stop_error is None:
+            history_session_id = self._active_history_session_id
+            if history_session_id is not None:
+                try:
+                    self._history.pause_session(history_session_id)
+                except (sqlite3.Error, ValueError) as error:
+                    logger.exception("Caption history session could not be paused")
+                    stop_error = MicrophoneCaptureError(
+                        "The session history could not be paused safely."
+                    )
+                    stop_error.__cause__ = error
+
+        if stop_operation == "pause" and stop_error is None:
+            self._session_audio_offset_seconds += self._monitor_audio_duration(
+                monitor
+            )
+            self._runtime.transition(RuntimeState.PAUSED)
+            self.speech_status.setText("Speech detection: paused")
+            self.device_status.setText(
+                "Paused. No audio is being captured or buffered."
+            )
+            self.statusBar().showMessage("Caption session paused")
+            self.chat_group.setTitle("Live conversation · Paused")
+            self.caption_overlay.set_paused(True)
+            self.start_stop_button.setVisible(False)
+            self.pause_resume_button.setText("Resume")
+            self.pause_resume_button.setEnabled(True)
+            self.pause_resume_button.setVisible(True)
+            self.stop_button.setText("Stop")
+            self.stop_button.setEnabled(True)
+            self.stop_button.setVisible(True)
+            self._refresh_conversation_sidebar(LIVE_ITEM_KEY)
+            logger.info("Caption session paused")
+            if after_stop is not None:
+                after_stop()
+            if close_after_stop:
+                self._allow_window_close = True
+                self.close()
+            return
+
+        history_session_id = self._active_history_session_id
+        if history_session_id is not None:
+            history_status = "incomplete" if stop_error is not None else "completed"
+            try:
+                self._history.finish_session(
+                    history_session_id,
+                    status=history_status,
+                )
+            except sqlite3.Error:
+                logger.exception("Caption history session could not be finished")
+                self.statusBar().showMessage("History database error")
+            self._active_history_session_id = None
+            if self._showing_live_conversation:
+                self._showing_live_conversation = False
+                self._viewing_history_session_id = history_session_id
+                session = self._history.get_session(history_session_id)
+                if session is not None:
+                    self.chat_group.setTitle(
+                        f"{session.title} · {session.status.capitalize()}"
+                    )
+            self._refresh_conversation_sidebar(
+                self._viewing_history_session_id
+            )
+
         self.speech_status.setText("Speech detection: stopped")
-        self.microphone_selector.setEnabled(True)
+        self._active_source = None
+        self._active_microphone_name = None
+        self._active_output_id = None
+        self._session_audio_offset_seconds = 0.0
+        computer_audio = self.computer_audio_source_button.isChecked()
+        self.microphone_source_button.setEnabled(True)
+        self.computer_audio_source_button.setEnabled(True)
+        self.microphone_selector.setEnabled(
+            not computer_audio
+            and isinstance(self.microphone_selector.currentData(), AudioDevice)
+        )
+        self.output_selector.setEnabled(
+            computer_audio
+            and isinstance(self.output_selector.currentData(), OutputAudioDevice)
+        )
         self.language_selector.setEnabled(True)
+        self.speech_chunk_duration_slider.setEnabled(True)
+        self.speech_sensitivity_slider.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
-        self.start_stop_button.setEnabled(True)
-        self.start_stop_button.setText("Start microphone")
+        self.start_stop_button.setEnabled(
+            self.output_selector.isEnabled()
+            if computer_audio
+            else self.microphone_selector.isEnabled()
+        )
+        self.start_stop_button.setText(
+            "Start computer audio" if computer_audio else "Start microphone"
+        )
+        self.start_stop_button.setVisible(True)
+        self.pause_resume_button.setVisible(False)
+        self.pause_resume_button.setText("Pause")
+        self.stop_button.setVisible(False)
+        self.stop_button.setText("Stop")
 
         if stop_error is not None:
+            self._runtime.transition(RuntimeState.ERROR)
             self.device_status.setText(str(stop_error))
             self.statusBar().showMessage("Microphone stop warning")
         elif show_ready:
-            self.device_status.setText("Microphone stopped. Audio was not saved.")
+            self._runtime.transition(RuntimeState.IDLE)
+            self.device_status.setText("Audio capture stopped. Audio was not saved.")
             self.statusBar().showMessage("Ready")
+        else:
+            self._runtime.transition(RuntimeState.IDLE)
 
         if self._device_refresh_pending and show_ready:
             self._device_refresh_pending = False
-            self.refresh_connected_microphones()
+            self.refresh_selected_devices()
         if after_stop is not None:
             after_stop()
         if close_after_stop:
             self._allow_window_close = True
             self.close()
 
+    @staticmethod
+    def _monitor_audio_duration(
+        monitor: MicrophoneLevelMonitor | None,
+    ) -> float:
+        if monitor is None:
+            return 0.0
+        processing_worker = getattr(monitor, "processing_worker", None)
+        stats = getattr(processing_worker, "stats", None)
+        return max(0.0, float(getattr(stats, "output_seconds", 0.0)))
+
     def _set_microphone_level(self, level: float) -> None:
         self.input_level.setValue(int(round(level)))
 
     def _show_microphone_warning(self, warning: str) -> None:
-        self.statusBar().showMessage(f"Microphone warning: {warning}")
+        source_name = (
+            "Computer audio"
+            if self._active_source == "computer_audio"
+            else "Microphone"
+        )
+        logger.warning("%s pipeline warning: %s", source_name, warning)
+        self.statusBar().showMessage(f"{source_name} warning: {warning}")
 
     def _show_speech_event(self, event: object) -> None:
         kind = getattr(event, "kind", None)
@@ -610,7 +1397,11 @@ class MainWindow(QMainWindow):
         duration_seconds = float(getattr(segment, "duration_seconds", 0.0))
         forced_split = bool(getattr(segment, "forced_split", False))
         self._completed_speech_chunks += 1
-        split_note = " (30-second split)" if forced_split else ""
+        split_note = (
+            f" ({self.speech_chunk_duration_slider.value()}-second split)"
+            if forced_split
+            else ""
+        )
         self.speech_turn_status.setText(
             f"Completed speech chunks: {self._completed_speech_chunks}  |  "
             f"Last turn: {duration_seconds:.1f}s{split_note}"
@@ -621,33 +1412,65 @@ class MainWindow(QMainWindow):
             forced_split,
         )
 
+    def _queue_caption_from_worker(self, result: TranslationResult) -> None:
+        """Hand a worker result to the UI without losing it during shutdown."""
+        self._pending_caption_results.put(result)
+        self.queued_captions_ready.emit()
+
+    def _drain_queued_captions(self) -> None:
+        """Display all worker results currently waiting for the UI thread."""
+        while True:
+            try:
+                result = self._pending_caption_results.get_nowait()
+            except Empty:
+                return
+            self._show_caption(result)
+
     def _show_caption(self, result: TranslationResult) -> None:
         recognition = result.recognition
+        created_at = local_timestamp()
+        self._save_caption_to_history(result, created_at)
         if recognition.skipped or recognition.error:
-            self.latest_caption.setText(recognition.text)
+            timestamp = self._history_message_time(created_at)
+            if self._showing_live_conversation:
+                self.caption_chat.add_message(
+                    original_text=recognition.text,
+                    source_language=recognition.language,
+                    speaker=self._caption_source_label,
+                    timestamp=timestamp,
+                    warning=True,
+                )
+            self.caption_overlay.set_message(
+                original_text=recognition.text,
+                source_language=recognition.language,
+                speaker=self._caption_source_label,
+                timestamp=timestamp,
+                warning=True,
+            )
             self.statusBar().showMessage("Caption warning")
             return
 
         original_text = recognition.text or "[no speech recognized]"
-        source_language = (recognition.language or "unknown").upper()
-        original_line = f"Original [{source_language}]: {original_text}"
-        translated_line = None
-        if result.translated_text:
-            target_language = (result.target_language or "unknown").upper()
-            translated_line = (
-                f"Translation [{target_language}]: {result.translated_text}"
+        timestamp = self._history_message_time(created_at)
+        if self._showing_live_conversation:
+            self.caption_chat.add_message(
+                original_text=original_text,
+                source_language=recognition.language,
+                translated_text=result.translated_text,
+                target_language=result.target_language,
+                speaker=self._caption_source_label,
+                timestamp=timestamp,
+                warning=bool(result.error),
             )
-
-        view = self.caption_view_selector.currentData()
-        if view == "translation" and translated_line is not None:
-            caption = translated_line
-        elif view == "original":
-            caption = original_line
-        elif translated_line is not None:
-            caption = f"{original_line}\n{translated_line}"
-        else:
-            caption = f"{original_line}\nTranslation unavailable"
-        self.latest_caption.setText(caption)
+        self.caption_overlay.set_message(
+            original_text=original_text,
+            source_language=recognition.language,
+            translated_text=result.translated_text,
+            target_language=result.target_language,
+            speaker=self._caption_source_label,
+            timestamp=timestamp,
+            warning=bool(result.error),
+        )
 
         if result.error:
             self.statusBar().showMessage("Translation warning")
@@ -661,6 +1484,198 @@ class MainWindow(QMainWindow):
             recognition.processing_seconds,
             result.processing_seconds,
         )
+
+    def _save_caption_to_history(
+        self,
+        result: TranslationResult,
+        created_at: str,
+    ) -> None:
+        session_id = self._active_history_session_id
+        if session_id is None:
+            return
+        recognition = result.recognition
+        try:
+            self._history.add_message(
+                session_id=session_id,
+                speaker_label=self._caption_source_label,
+                start_offset_seconds=(
+                    self._session_audio_offset_seconds
+                    + recognition.start_sample / VAD_SAMPLE_RATE
+                ),
+                end_offset_seconds=(
+                    self._session_audio_offset_seconds
+                    + recognition.end_sample / VAD_SAMPLE_RATE
+                ),
+                source_language=recognition.language,
+                language_confidence=recognition.language_probability,
+                original_text=recognition.text or "[no speech recognized]",
+                target_language=result.target_language,
+                translated_text=result.translated_text,
+                warning=bool(
+                    recognition.skipped or recognition.error or result.error
+                ),
+                error_text=recognition.error or result.error,
+                created_at=created_at,
+            )
+        except sqlite3.Error:
+            logger.exception("Caption could not be saved to local history")
+            self.statusBar().showMessage("Caption history save failed")
+            return
+
+        selected_key: str | int | None = (
+            LIVE_ITEM_KEY
+            if self._showing_live_conversation
+            else self._viewing_history_session_id
+        )
+        self._refresh_conversation_sidebar(selected_key)
+
+    def _update_caption_display_mode(self) -> None:
+        mode = str(self.caption_view_selector.currentData())
+        self.caption_chat.set_display_mode(mode)
+        self.caption_overlay.set_display_mode(mode)
+
+    def _toggle_caption_overlay(self, visible: bool) -> None:
+        self.overlay_toggle_button.setText(
+            "Hide overlay" if visible else "Show overlay"
+        )
+        if visible:
+            self.caption_overlay.ensure_visible_on_screen()
+            self.caption_overlay.show()
+            self.caption_overlay.raise_()
+        else:
+            self._save_overlay_settings()
+            self.caption_overlay.hide()
+
+    def _open_overlay_settings(self) -> None:
+        dialog = OverlaySettingsDialog(self.caption_overlay.appearance, self)
+        if not dialog.exec():
+            return
+        self.caption_overlay.apply_appearance(dialog.appearance)
+        save_overlay_appearance(
+            self._interface_settings,
+            self.caption_overlay.appearance,
+        )
+        self._interface_settings.sync()
+
+    def _save_overlay_settings(self) -> None:
+        save_overlay_appearance(
+            self._interface_settings,
+            self.caption_overlay.appearance,
+        )
+        save_overlay_geometry(
+            self._interface_settings,
+            self.caption_overlay.saveGeometry(),
+        )
+
+    def _handle_overlay_hidden_by_user(self) -> None:
+        self.overlay_toggle_button.setChecked(False)
+
+    def _set_conversation_sidebar_visible(self, visible: bool) -> None:
+        if visible:
+            self.conversation_sidebar.show()
+            total_width = max(1, self.conversation_splitter.width())
+            sidebar_width = min(self._expanded_sidebar_width, total_width - 1)
+            self.conversation_splitter.setSizes(
+                [sidebar_width, max(1, total_width - sidebar_width)]
+            )
+            self.sidebar_toggle_button.setText("Hide conversations")
+            return
+
+        sizes = self.conversation_splitter.sizes()
+        if sizes and sizes[0] > 0:
+            self._expanded_sidebar_width = sizes[0]
+        self.conversation_sidebar.hide()
+        self.sidebar_toggle_button.setText("Show conversations")
+
+    @staticmethod
+    def _safe_setting_int(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_setting_bool(value: object, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _restore_interface_settings(self) -> None:
+        geometry = self._interface_settings.value("ui/main_geometry")
+        if hasattr(geometry, "isEmpty") and not geometry.isEmpty():
+            self.restoreGeometry(geometry)
+
+        caption_mode = self._interface_settings.value("ui/caption_view", "both")
+        caption_index = self.caption_view_selector.findData(caption_mode)
+        if caption_index >= 0:
+            self.caption_view_selector.setCurrentIndex(caption_index)
+
+        language = self._interface_settings.value("ui/spoken_language", None)
+        language_index = self.language_selector.findData(language)
+        if language_index >= 0:
+            self.language_selector.setCurrentIndex(language_index)
+
+        self.speech_chunk_duration_slider.setValue(
+            self._safe_setting_int(
+                self._interface_settings.value("ui/max_speech_chunk", 30),
+                30,
+            )
+        )
+        self.speech_sensitivity_slider.setValue(
+            self._safe_setting_int(
+                self._interface_settings.value("ui/speech_sensitivity", 5),
+                5,
+            )
+        )
+        self._expanded_sidebar_width = max(
+            230,
+            min(
+                320,
+                self._safe_setting_int(
+                    self._interface_settings.value("ui/sidebar_width", 260),
+                    260,
+                ),
+            ),
+        )
+        sidebar_visible = self._safe_setting_bool(
+            self._interface_settings.value("ui/sidebar_visible", True),
+            True,
+        )
+        self.sidebar_toggle_button.setChecked(sidebar_visible)
+        self._set_conversation_sidebar_visible(sidebar_visible)
+
+    def _save_interface_settings(self) -> None:
+        sizes = self.conversation_splitter.sizes()
+        if self.conversation_sidebar.isVisible() and sizes and sizes[0] > 0:
+            self._expanded_sidebar_width = sizes[0]
+        self._interface_settings.setValue("ui/main_geometry", self.saveGeometry())
+        self._interface_settings.setValue(
+            "ui/caption_view", self.caption_view_selector.currentData()
+        )
+        self._interface_settings.setValue(
+            "ui/spoken_language", self.language_selector.currentData()
+        )
+        self._interface_settings.setValue(
+            "ui/max_speech_chunk", self.speech_chunk_duration_slider.value()
+        )
+        self._interface_settings.setValue(
+            "ui/speech_sensitivity", self.speech_sensitivity_slider.value()
+        )
+        self._interface_settings.setValue(
+            "ui/sidebar_width", self._expanded_sidebar_width
+        )
+        self._interface_settings.setValue(
+            "ui/sidebar_visible", self.sidebar_toggle_button.isChecked()
+        )
+        self._save_overlay_settings()
+
+    def _clear_caption_screen(self) -> None:
+        self.caption_chat.clear_messages()
+        self.caption_overlay.clear_message()
+        logger.info("Visible caption messages cleared")
+        self.statusBar().showMessage("Caption screen cleared")
 
     def _update_performance_stats(self) -> None:
         monitor = self._microphone_monitor
@@ -734,9 +1749,12 @@ class MainWindow(QMainWindow):
 
     def _handle_connected_microphones_changed(self) -> None:
         """React to microphone connection changes reported by Windows and Qt."""
+        if self._active_source == "computer_audio":
+            return
         active_name = self._active_microphone_name
         if active_name is None:
-            self.refresh_connected_microphones()
+            if self.microphone_source_button.isChecked():
+                self.refresh_connected_microphones()
             return
 
         connected_names = {
@@ -768,9 +1786,53 @@ class MainWindow(QMainWindow):
             "Audio devices changed; the list will refresh after capture stops"
         )
 
+    def _handle_connected_outputs_changed(self) -> None:
+        """React to speaker and headphone connection changes reported by Qt."""
+        if self._active_source == "microphone":
+            return
+        active_output_id = self._active_output_id
+        if active_output_id is None:
+            if self.computer_audio_source_button.isChecked() and self._outputs_loaded:
+                self.refresh_connected_outputs()
+            return
+
+        try:
+            connected_ids = {
+                device.id for device in self._output_device_provider()
+            }
+        except MicrophoneCaptureError as error:
+            logger.warning("Could not verify computer audio devices: %s", error)
+            self.statusBar().showMessage("Computer audio device check failed")
+            return
+        if active_output_id not in connected_ids:
+            logger.warning("Active computer audio device disconnected")
+            self._device_refresh_pending = False
+
+            def finish_disconnect() -> None:
+                self.refresh_connected_outputs()
+                self.device_status.setText(
+                    "The selected computer audio device was disconnected. "
+                    "Capture stopped."
+                )
+                self.statusBar().showMessage("Computer audio disconnected")
+
+            self._stop_microphone(
+                show_ready=False,
+                after_stop=finish_disconnect,
+            )
+            return
+
+        self._device_refresh_pending = True
+        logger.info("Computer audio devices changed while capture is active")
+        self.statusBar().showMessage(
+            "Computer audio devices changed; the list will refresh after capture stops"
+        )
+
     def closeEvent(self, event: QCloseEvent) -> None:
         """Release audio asynchronously before allowing the window to close."""
         if self._allow_window_close:
+            self._save_interface_settings()
+            self.caption_overlay.hide()
             super().closeEvent(event)
             return
         if self._microphone_monitor is not None or self._stop_thread is not None:
@@ -780,6 +1842,8 @@ class MainWindow(QMainWindow):
                 close_after_stop=True,
             )
             return
+        self._save_interface_settings()
+        self.caption_overlay.hide()
         super().closeEvent(event)
 
 

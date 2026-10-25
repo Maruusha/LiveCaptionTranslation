@@ -55,11 +55,23 @@ def _windows_memory_usage() -> tuple[int | None, int | None]:
     if sys.platform != "win32":
         return None, None
 
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        get_process_memory_info = kernel32.K32GetProcessMemoryInfo
+        get_process_memory_info.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(_ProcessMemoryCounters),
+            wintypes.DWORD,
+        )
+        get_process_memory_info.restype = wintypes.BOOL
+    except (AttributeError, OSError):
+        return None, None
+
     counters = _ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(counters)
-    process = ctypes.windll.kernel32.GetCurrentProcess()
-    succeeded = ctypes.windll.psapi.GetProcessMemoryInfo(
-        process,
+    succeeded = get_process_memory_info(
+        kernel32.GetCurrentProcess(),
         ctypes.byref(counters),
         counters.cb,
     )

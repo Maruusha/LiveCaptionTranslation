@@ -31,6 +31,23 @@ def test_vad_worker_emits_speech_boundaries() -> None:
     assert warnings == []
 
 
+def test_vad_worker_keeps_selected_speech_threshold() -> None:
+    source = BoundedAudioFrameQueue(max_seconds=1.0)
+    source.put(np.zeros(512, dtype=np.float32), sample_rate=16_000)
+    worker = VoiceActivityWorker(
+        source_queue=source,
+        event_callback=lambda _event: None,
+        warning_callback=lambda _warning: None,
+        detector_factory=lambda: lambda _samples: None,
+        speech_threshold=0.3,
+    )
+
+    worker.start()
+    worker.stop()
+
+    assert worker.speech_threshold == 0.3
+
+
 def test_vad_worker_closes_active_speech_when_capture_stops() -> None:
     source = BoundedAudioFrameQueue()
     source.put(np.ones(512, dtype=np.float32), sample_rate=16_000)
