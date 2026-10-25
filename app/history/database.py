@@ -14,7 +14,7 @@ from threading import RLock
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "history.sqlite3"
 VALID_SESSION_STATUSES = {"live", "paused", "incomplete", "completed"}
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def local_timestamp() -> str:
@@ -42,6 +42,7 @@ class HistorySession:
 class HistoryMessage:
     id: int
     session_id: int
+    session_person_id: int | None
     created_at: str
     speaker_label: str
     start_offset_seconds: float
@@ -61,6 +62,40 @@ class HistoryEvent:
     session_id: int
     event_type: str
     occurred_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PersonVoiceSignature:
+    embedding: bytes
+    model_name: str
+    model_version: str
+    dimensions: int
+    quality_score: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class PersonProfile:
+    id: int
+    name: str
+    signatures: tuple[PersonVoiceSignature, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionPerson:
+    id: int
+    session_id: int
+    person_id: int | None
+    session_label: str
+    display_name: str | None
+    confidence: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSpeakerProfile:
+    session_label: str
+    person_id: int | None
+    display_name: str | None
+    signatures: tuple[PersonVoiceSignature, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +265,10 @@ class HistoryDatabase:
                 f"supported version {SCHEMA_VERSION}."
             )
 
-        migrations = {2: self._migrate_to_version_2}
+        migrations = {
+            2: self._migrate_to_version_2,
+            3: self._migrate_to_version_3,
+        }
         while current_version < SCHEMA_VERSION:
             next_version = current_version + 1
             if self._database_preexisted:
@@ -311,6 +349,17 @@ class HistoryDatabase:
             )
             self._connection.execute(
                 "INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')"
+            )
+
+    def _migrate_to_version_3(self) -> None:
+        """Guarantee one row for each temporary label in a session."""
+
+        with self._connection:
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS session_persons_label_index
+                ON session_persons(session_id, session_label)
+                """
             )
 
     def _create_pre_migration_backup(self, target_version: int) -> Path:
@@ -443,6 +492,7 @@ class HistoryDatabase:
         self,
         *,
         session_id: int,
+        session_person_id: int | None = None,
         speaker_label: str,
         start_offset_seconds: float,
         end_offset_seconds: float,
@@ -459,14 +509,15 @@ class HistoryDatabase:
             cursor = self._connection.execute(
                 """
                 INSERT INTO messages(
-                    session_id, speaker_label, start_offset_seconds,
+                    session_id, session_person_id, speaker_label, start_offset_seconds,
                     end_offset_seconds, created_at, source_language,
                     language_confidence, original_text, target_language,
                     translated_text, warning, error_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
+                    session_person_id,
                     speaker_label,
                     start_offset_seconds,
                     end_offset_seconds,
@@ -637,6 +688,7 @@ class HistoryDatabase:
             HistoryMessage(
                 id=int(row["id"]),
                 session_id=int(row["session_id"]),
+                session_person_id=row["session_person_id"],
                 created_at=str(row["created_at"]),
                 speaker_label=str(row["speaker_label"]),
                 start_offset_seconds=float(row["start_offset_seconds"]),
@@ -650,6 +702,334 @@ class HistoryDatabase:
                 error_text=row["error_text"],
             )
             for row in rows
+        ]
+
+    def upsert_session_person(
+        self,
+        *,
+        session_id: int,
+        session_label: str,
+        person_id: int | None,
+        confidence: float | None,
+    ) -> int:
+        """Create or update one session-local speaker without duplicating it."""
+
+        with self._lock, self._connection:
+            display_name = None
+            if person_id is not None:
+                row = self._connection.execute(
+                    "SELECT name FROM persons WHERE id = ?",
+                    (person_id,),
+                ).fetchone()
+                display_name = row["name"] if row is not None else None
+            self._connection.execute(
+                """
+                INSERT INTO session_persons(
+                    session_id, person_id, session_label,
+                    session_display_name, confidence
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, session_label) DO UPDATE SET
+                    person_id = COALESCE(
+                        excluded.person_id,
+                        session_persons.person_id
+                    ),
+                    session_display_name = COALESCE(
+                        excluded.session_display_name,
+                        session_persons.session_display_name
+                    ),
+                    confidence = excluded.confidence
+                """,
+                (
+                    session_id,
+                    person_id,
+                    session_label,
+                    display_name,
+                    confidence,
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT id FROM session_persons
+                WHERE session_id = ? AND session_label = ?
+                """,
+                (session_id, session_label),
+            ).fetchone()
+            return int(row["id"])
+
+    def add_session_voice_signature(
+        self,
+        *,
+        session_person_id: int,
+        embedding: bytes,
+        model_name: str,
+        model_version: str,
+        dimensions: int,
+        quality_score: float | None,
+        max_signatures: int = 5,
+    ) -> int:
+        if max_signatures <= 0:
+            raise ValueError("max_signatures must be greater than zero.")
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id FROM session_voice_signatures
+                WHERE session_person_id = ? ORDER BY id
+                """,
+                (session_person_id,),
+            ).fetchall()
+            excess = len(rows) - max_signatures + 1
+            if excess > 0:
+                self._connection.executemany(
+                    "DELETE FROM session_voice_signatures WHERE id = ?",
+                    ((int(row["id"]),) for row in rows[:excess]),
+                )
+            cursor = self._connection.execute(
+                """
+                INSERT INTO session_voice_signatures(
+                    session_person_id, embedding, model_name, model_version,
+                    dimensions, quality_score, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_person_id,
+                    embedding,
+                    model_name,
+                    model_version,
+                    dimensions,
+                    quality_score,
+                    local_timestamp(),
+                ),
+            )
+            signature_id = int(cursor.lastrowid)
+            person_row = self._connection.execute(
+                "SELECT person_id FROM session_persons WHERE id = ?",
+                (session_person_id,),
+            ).fetchone()
+            person_id = person_row["person_id"] if person_row is not None else None
+            if person_id is not None:
+                saved_rows = self._connection.execute(
+                    """
+                    SELECT id FROM person_voice_signatures
+                    WHERE person_id = ? ORDER BY id
+                    """,
+                    (person_id,),
+                ).fetchall()
+                duplicate = self._connection.execute(
+                    """
+                    SELECT 1 FROM person_voice_signatures
+                    WHERE person_id = ? AND embedding = ?
+                      AND model_name = ? AND model_version = ?
+                    """,
+                    (person_id, embedding, model_name, model_version),
+                ).fetchone()
+                if duplicate is None:
+                    excess = len(saved_rows) - max_signatures + 1
+                    if excess > 0:
+                        self._connection.executemany(
+                            "DELETE FROM person_voice_signatures WHERE id = ?",
+                            ((int(row["id"]),) for row in saved_rows[:excess]),
+                        )
+                    self._connection.execute(
+                        """
+                        INSERT INTO person_voice_signatures(
+                            person_id, embedding, model_name, model_version,
+                            dimensions, quality_score, created_at,
+                            source_session_person_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            person_id,
+                            embedding,
+                            model_name,
+                            model_version,
+                            dimensions,
+                            quality_score,
+                            local_timestamp(),
+                            session_person_id,
+                        ),
+                    )
+            return signature_id
+
+    def get_session_person(self, session_person_id: int) -> SessionPerson | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT id, session_id, person_id, session_label,
+                       session_display_name, confidence
+                FROM session_persons WHERE id = ?
+                """,
+                (session_person_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SessionPerson(
+            id=int(row["id"]),
+            session_id=int(row["session_id"]),
+            person_id=row["person_id"],
+            session_label=str(row["session_label"]),
+            display_name=row["session_display_name"],
+            confidence=row["confidence"],
+        )
+
+    def remember_session_person(self, session_person_id: int, name: str) -> int:
+        """Create or update one user-approved person and copy voice signatures."""
+
+        normalized_name = " ".join(name.split())
+        if not normalized_name:
+            raise ValueError("Person name cannot be empty.")
+        if len(normalized_name) > 120:
+            raise ValueError("Person name cannot exceed 120 characters.")
+        now = local_timestamp()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT person_id FROM session_persons WHERE id = ?",
+                (session_person_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("The selected session speaker does not exist.")
+            person_id = row["person_id"]
+            if person_id is None:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO persons(name, created_at, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (normalized_name, now, now),
+                )
+                person_id = int(cursor.lastrowid)
+            else:
+                self._connection.execute(
+                    "UPDATE persons SET name = ?, updated_at = ? WHERE id = ?",
+                    (normalized_name, now, person_id),
+                )
+            self._connection.execute(
+                """
+                UPDATE session_persons
+                SET person_id = ?, session_display_name = ?
+                WHERE id = ?
+                """,
+                (person_id, normalized_name, session_person_id),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO person_voice_signatures(
+                    person_id, embedding, model_name, model_version,
+                    dimensions, quality_score, created_at,
+                    source_session_person_id
+                )
+                SELECT ?, source.embedding, source.model_name,
+                       source.model_version, source.dimensions,
+                       source.quality_score, ?, source.session_person_id
+                FROM session_voice_signatures AS source
+                WHERE source.session_person_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM person_voice_signatures AS saved
+                      WHERE saved.person_id = ?
+                        AND saved.embedding = source.embedding
+                        AND saved.model_name = source.model_name
+                        AND saved.model_version = source.model_version
+                  )
+                """,
+                (person_id, now, session_person_id, person_id),
+            )
+            self._connection.execute(
+                """
+                UPDATE messages SET speaker_label = ?
+                WHERE session_person_id = ?
+                """,
+                (normalized_name, session_person_id),
+            )
+            return int(person_id)
+
+    def list_person_profiles(self) -> list[PersonProfile]:
+        """Return only enabled, named profiles with approved signatures."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT persons.id, persons.name, signatures.embedding,
+                       signatures.model_name, signatures.model_version,
+                       signatures.dimensions, signatures.quality_score
+                FROM persons
+                JOIN person_voice_signatures AS signatures
+                  ON signatures.person_id = persons.id
+                WHERE persons.recognition_enabled = 1
+                  AND persons.name IS NOT NULL
+                  AND TRIM(persons.name) != ''
+                ORDER BY persons.id, signatures.id
+                """
+            ).fetchall()
+        grouped: dict[int, tuple[str, list[PersonVoiceSignature]]] = {}
+        for row in rows:
+            person_id = int(row["id"])
+            name, signatures = grouped.setdefault(
+                person_id,
+                (str(row["name"]), []),
+            )
+            signatures.append(
+                PersonVoiceSignature(
+                    embedding=bytes(row["embedding"]),
+                    model_name=str(row["model_name"]),
+                    model_version=str(row["model_version"]),
+                    dimensions=int(row["dimensions"]),
+                    quality_score=row["quality_score"],
+                )
+            )
+        return [
+            PersonProfile(person_id, name, tuple(signatures))
+            for person_id, (name, signatures) in grouped.items()
+        ]
+
+    def list_session_speaker_profiles(
+        self,
+        session_id: int,
+    ) -> list[SessionSpeakerProfile]:
+        """Load temporary signatures needed to resume stable session labels."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT session_persons.id, session_persons.person_id,
+                       session_persons.session_label,
+                       session_persons.session_display_name,
+                       signatures.embedding, signatures.model_name,
+                       signatures.model_version, signatures.dimensions,
+                       signatures.quality_score
+                FROM session_persons
+                JOIN session_voice_signatures AS signatures
+                  ON signatures.session_person_id = session_persons.id
+                WHERE session_persons.session_id = ?
+                ORDER BY session_persons.id, signatures.id
+                """,
+                (session_id,),
+            ).fetchall()
+        grouped: dict[
+            int,
+            tuple[str, int | None, str | None, list[PersonVoiceSignature]],
+        ] = {}
+        for row in rows:
+            session_person_id = int(row["id"])
+            label, person_id, display_name, signatures = grouped.setdefault(
+                session_person_id,
+                (
+                    str(row["session_label"]),
+                    row["person_id"],
+                    row["session_display_name"],
+                    [],
+                ),
+            )
+            signatures.append(
+                PersonVoiceSignature(
+                    embedding=bytes(row["embedding"]),
+                    model_name=str(row["model_name"]),
+                    model_version=str(row["model_version"]),
+                    dimensions=int(row["dimensions"]),
+                    quality_score=row["quality_score"],
+                )
+            )
+        return [
+            SessionSpeakerProfile(label, person_id, display_name, tuple(signatures))
+            for label, person_id, display_name, signatures in grouped.values()
         ]
 
     def get_events(self, session_id: int) -> list[HistoryEvent]:

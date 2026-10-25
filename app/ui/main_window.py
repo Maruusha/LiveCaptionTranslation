@@ -7,11 +7,13 @@ from queue import Empty, SimpleQueue
 import sqlite3
 from threading import Thread
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QFont, QStandardItemModel
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -51,6 +53,13 @@ from app.history.database import (
     local_timestamp,
 )
 from app.speech.recognition import RecognitionStats
+from app.speakers.diarization import person_index, person_label
+from app.speakers.identification import (
+    SPEAKER_MODEL_NAME,
+    SPEAKER_MODEL_VERSION,
+    RememberedSpeakerProfile,
+    SessionSpeakerProfile,
+)
 from app.speech.vad import (
     VAD_SAMPLE_RATE,
     SpeechEvent,
@@ -299,6 +308,17 @@ class MainWindow(QMainWindow):
         sensitivity_layout.addWidget(self.speech_sensitivity_label)
         sensitivity_layout.addWidget(self.speech_sensitivity_slider, stretch=1)
 
+        self.speaker_identification_checkbox = QCheckBox(
+            "Detect speakers (right-click a message to remember)"
+        )
+        self.speaker_identification_checkbox.setObjectName(
+            "speakerIdentificationCheckbox"
+        )
+        self.speaker_identification_checkbox.setToolTip(
+            "Uses additional CPU. Voice signatures stay session-only unless "
+            "you explicitly remember a speaker from a message bubble."
+        )
+
         self.speech_chunk_duration_slider = QSlider(
             Qt.Orientation.Horizontal
         )
@@ -376,6 +396,7 @@ class MainWindow(QMainWindow):
         )
 
         self.caption_chat = CaptionChatView()
+        self.caption_chat.remember_requested.connect(self._remember_speaker)
         self.caption_overlay = CaptionOverlay(self)
         self.caption_overlay.apply_appearance(
             load_overlay_appearance(self._interface_settings)
@@ -483,6 +504,7 @@ class MainWindow(QMainWindow):
         performance_layout = QVBoxLayout()
         performance_layout.addLayout(chunk_duration_layout)
         performance_layout.addLayout(sensitivity_layout)
+        performance_layout.addWidget(self.speaker_identification_checkbox)
         performance_layout.addLayout(performance_selector_layout)
         performance_layout.addWidget(self.performance_summary)
         performance_layout.addStretch()
@@ -641,6 +663,7 @@ class MainWindow(QMainWindow):
                     speaker=item.speaker_label,
                     timestamp=self._history_message_time(item.created_at),
                     warning=item.warning,
+                    session_person_id=item.session_person_id,
                 )
         QTimer.singleShot(
             0,
@@ -1016,12 +1039,71 @@ class MainWindow(QMainWindow):
         # Keep Silero's exit threshold (speech threshold - 0.15) positive.
         return round(0.875 - self.speech_sensitivity_slider.value() * 0.075, 3)
 
+    def _remembered_speaker_profiles(
+        self,
+    ) -> tuple[RememberedSpeakerProfile, ...]:
+        profiles = []
+        for profile in self._history.list_person_profiles():
+            embeddings = []
+            for signature in profile.signatures:
+                if (
+                    signature.model_name != SPEAKER_MODEL_NAME
+                    or signature.model_version != SPEAKER_MODEL_VERSION
+                ):
+                    continue
+                embedding = np.frombuffer(signature.embedding, dtype="<f4")
+                if embedding.size == signature.dimensions:
+                    embeddings.append(embedding.copy())
+            if embeddings:
+                profiles.append(
+                    RememberedSpeakerProfile(
+                        profile.id,
+                        profile.name,
+                        tuple(embeddings),
+                    )
+                )
+        return tuple(profiles)
+
+    def _current_session_speaker_profiles(
+        self,
+    ) -> tuple[SessionSpeakerProfile, ...]:
+        session_id = self._active_history_session_id
+        if session_id is None:
+            return ()
+        profiles = []
+        for profile in self._history.list_session_speaker_profiles(session_id):
+            embeddings = []
+            for signature in profile.signatures:
+                if (
+                    signature.model_name != SPEAKER_MODEL_NAME
+                    or signature.model_version != SPEAKER_MODEL_VERSION
+                ):
+                    continue
+                embedding = np.frombuffer(signature.embedding, dtype="<f4")
+                if embedding.size == signature.dimensions:
+                    embeddings.append(embedding.copy())
+            if embeddings:
+                profiles.append(
+                    SessionSpeakerProfile(
+                        person_index(profile.session_label),
+                        profile.person_id,
+                        profile.display_name,
+                        tuple(embeddings),
+                    )
+                )
+        return tuple(profiles)
+
     def _create_selected_monitor(
         self,
     ) -> tuple[MicrophoneLevelMonitor, str, str, str | None, str | None]:
         """Build a fresh capture pipeline for the currently selected source."""
 
         computer_audio = self.computer_audio_source_button.isChecked()
+        speaker_profiles = (
+            self._remembered_speaker_profiles()
+            if self.speaker_identification_checkbox.isChecked()
+            else None
+        )
         common_arguments = (
             self.microphone_level_received.emit,
             self.microphone_warning_received.emit,
@@ -1038,9 +1120,20 @@ class MainWindow(QMainWindow):
                 raise MicrophoneCaptureError(
                     "Select a computer audio device first."
                 )
-            monitor = self._loopback_monitor_factory(
-                selected_output,
-                *common_arguments,
+            monitor = (
+                self._loopback_monitor_factory(
+                    selected_output,
+                    *common_arguments,
+                    speaker_profiles=speaker_profiles,
+                    session_speaker_profiles=(
+                        self._current_session_speaker_profiles()
+                    ),
+                )
+                if speaker_profiles is not None
+                else self._loopback_monitor_factory(
+                    selected_output,
+                    *common_arguments,
+                )
             )
             return (
                 monitor,
@@ -1053,9 +1146,20 @@ class MainWindow(QMainWindow):
         selected_device = self.microphone_selector.currentData()
         if not isinstance(selected_device, AudioDevice):
             raise MicrophoneCaptureError("Select a microphone first.")
-        monitor = self._monitor_factory(
-            selected_device.input_indices,
-            *common_arguments,
+        monitor = (
+            self._monitor_factory(
+                selected_device.input_indices,
+                *common_arguments,
+                speaker_profiles=speaker_profiles,
+                session_speaker_profiles=(
+                    self._current_session_speaker_profiles()
+                ),
+            )
+            if speaker_profiles is not None
+            else self._monitor_factory(
+                selected_device.input_indices,
+                *common_arguments,
+            )
         )
         return (
             monitor,
@@ -1138,6 +1242,7 @@ class MainWindow(QMainWindow):
         self.language_selector.setEnabled(False)
         self.speech_chunk_duration_slider.setEnabled(False)
         self.speech_sensitivity_slider.setEnabled(False)
+        self.speaker_identification_checkbox.setEnabled(False)
         self.refresh_devices_button.setEnabled(False)
         self.start_stop_button.setVisible(False)
         self.pause_resume_button.setText("Pause")
@@ -1550,6 +1655,7 @@ class MainWindow(QMainWindow):
         self.language_selector.setEnabled(True)
         self.speech_chunk_duration_slider.setEnabled(True)
         self.speech_sensitivity_slider.setEnabled(True)
+        self.speaker_identification_checkbox.setEnabled(True)
         self.refresh_devices_button.setEnabled(True)
         self.start_stop_button.setEnabled(
             self.output_selector.isEnabled()
@@ -1653,21 +1759,25 @@ class MainWindow(QMainWindow):
     def _show_caption(self, result: TranslationResult) -> None:
         recognition = result.recognition
         created_at = local_timestamp()
-        self._save_caption_to_history(result, created_at)
+        speaker_label, session_person_id = self._save_caption_to_history(
+            result,
+            created_at,
+        )
         if recognition.skipped or recognition.error:
             timestamp = self._history_message_time(created_at)
             if self._showing_live_conversation:
                 self.caption_chat.add_message(
                     original_text=recognition.text,
                     source_language=recognition.language,
-                    speaker=self._caption_source_label,
+                    speaker=speaker_label,
                     timestamp=timestamp,
                     warning=True,
+                    session_person_id=session_person_id,
                 )
             self.caption_overlay.set_message(
                 original_text=recognition.text,
                 source_language=recognition.language,
-                speaker=self._caption_source_label,
+                speaker=speaker_label,
                 timestamp=timestamp,
                 warning=True,
             )
@@ -1682,16 +1792,17 @@ class MainWindow(QMainWindow):
                 source_language=recognition.language,
                 translated_text=result.translated_text,
                 target_language=result.target_language,
-                speaker=self._caption_source_label,
+                speaker=speaker_label,
                 timestamp=timestamp,
                 warning=bool(result.error),
+                session_person_id=session_person_id,
             )
         self.caption_overlay.set_message(
             original_text=original_text,
             source_language=recognition.language,
             translated_text=result.translated_text,
             target_language=result.target_language,
-            speaker=self._caption_source_label,
+            speaker=speaker_label,
             timestamp=timestamp,
             warning=bool(result.error),
         )
@@ -1713,15 +1824,45 @@ class MainWindow(QMainWindow):
         self,
         result: TranslationResult,
         created_at: str,
-    ) -> None:
+    ) -> tuple[str, int | None]:
         session_id = self._active_history_session_id
+        speaker = result.speaker
+        speaker_label = speaker.label if speaker is not None else self._caption_source_label
+        session_person_id: int | None = None
         if session_id is None:
-            return
+            return speaker_label, None
         recognition = result.recognition
+        if speaker is not None and speaker.session_speaker_index is not None:
+            try:
+                session_person_id = self._history.upsert_session_person(
+                    session_id=session_id,
+                    session_label=person_label(speaker.session_speaker_index),
+                    person_id=speaker.remembered_person_id,
+                    confidence=speaker.confidence,
+                )
+                if speaker.embedding is not None:
+                    embedding = np.asarray(speaker.embedding, dtype="<f4")
+                    self._history.add_session_voice_signature(
+                        session_person_id=session_person_id,
+                        embedding=embedding.tobytes(),
+                        model_name=SPEAKER_MODEL_NAME,
+                        model_version=SPEAKER_MODEL_VERSION,
+                        dimensions=embedding.size,
+                        quality_score=speaker.confidence,
+                    )
+                session_person = self._history.get_session_person(
+                    session_person_id
+                )
+                if session_person and session_person.display_name:
+                    speaker_label = session_person.display_name
+            except (sqlite3.Error, ValueError):
+                logger.exception("Speaker signature could not be saved")
+                session_person_id = None
         try:
             self._history.add_message(
                 session_id=session_id,
-                speaker_label=self._caption_source_label,
+                session_person_id=session_person_id,
+                speaker_label=speaker_label,
                 start_offset_seconds=(
                     self._session_audio_offset_seconds
                     + recognition.start_sample / VAD_SAMPLE_RATE
@@ -1744,7 +1885,7 @@ class MainWindow(QMainWindow):
         except sqlite3.Error:
             logger.exception("Caption could not be saved to local history")
             self.statusBar().showMessage("Caption history save failed")
-            return
+            return speaker_label, session_person_id
 
         selected_key: str | int | None = (
             LIVE_ITEM_KEY
@@ -1752,6 +1893,35 @@ class MainWindow(QMainWindow):
             else self._viewing_history_session_id
         )
         self._refresh_conversation_sidebar(selected_key)
+        return speaker_label, session_person_id
+
+    def _remember_speaker(self, session_person_id: int) -> None:
+        session_person = self._history.get_session_person(session_person_id)
+        if session_person is None:
+            self.statusBar().showMessage("Speaker is no longer available")
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Remember speaker",
+            "Name for this voice:",
+            text=session_person.display_name or "",
+        )
+        if not accepted:
+            return
+        try:
+            self._history.remember_session_person(session_person_id, name)
+        except (sqlite3.Error, ValueError) as error:
+            QMessageBox.warning(self, "Remember speaker failed", str(error))
+            return
+        if self._viewing_history_session_id == session_person.session_id:
+            self._load_history_messages(session_person.session_id)
+        self._refresh_conversation_sidebar(
+            LIVE_ITEM_KEY
+            if self._showing_live_conversation
+            else self._viewing_history_session_id
+        )
+        logger.info("Session speaker remembered with user-approved name")
+        self.statusBar().showMessage("Speaker remembered for future sessions")
 
     def _update_caption_display_mode(self) -> None:
         mode = str(self.caption_view_selector.currentData())
@@ -1853,6 +2023,15 @@ class MainWindow(QMainWindow):
                 5,
             )
         )
+        self.speaker_identification_checkbox.setChecked(
+            self._safe_setting_bool(
+                self._interface_settings.value(
+                    "ui/speaker_identification",
+                    False,
+                ),
+                False,
+            )
+        )
         self._expanded_sidebar_width = max(
             230,
             min(
@@ -1886,6 +2065,10 @@ class MainWindow(QMainWindow):
         )
         self._interface_settings.setValue(
             "ui/speech_sensitivity", self.speech_sensitivity_slider.value()
+        )
+        self._interface_settings.setValue(
+            "ui/speaker_identification",
+            self.speaker_identification_checkbox.isChecked(),
         )
         self._interface_settings.setValue(
             "ui/sidebar_width", self._expanded_sidebar_width

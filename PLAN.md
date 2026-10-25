@@ -98,7 +98,7 @@ Microphone or computer output
   → display and SQLite history
 ```
 
-Target speaker path for Stage 9:
+Optional speaker path, enabled by the user:
 
 ```text
 Timestamped audio
@@ -107,7 +107,7 @@ Timestamped audio
                                   ┘
 ```
 
-Speaker analysis must not wait for recognition. Join the two results by audio timestamps.
+Speaker analysis does not wait for recognition. The two results are joined by audio timestamps before translation and saving. It is disabled by default because it adds CPU work.
 
 ### Bounded queues and stopping
 
@@ -269,17 +269,19 @@ Remaining: high-DPI, multiple-monitor, windowed/borderless game, and full-pipeli
 
 ### Stage 8 — Local history and recovery
 
-**Complete (2026-10-25).** Schema version 2 provides immediate caption persistence, crash recovery, pause/resume events, sidebar/history reading, indexed search, rename, confirmed deletion, maintenance, migrations, backups, cascade rules, and large-history tests.
+**Complete (2026-10-25).** Schema version 3 provides immediate caption persistence, crash recovery, pause/resume events, sidebar/history reading, indexed search, rename, confirmed deletion, maintenance, migrations, backups, cascade rules, speaker-profile links, and large-history tests.
 
 ### Stage 9 — Multiple speakers in one session
 
-**In progress; isolated model slice complete (2026-10-25).** sherpa-onnx 1.12.33 and project-local INT8 segmentation plus TitaNet embedding models are installed. The isolated wrapper provides unlimited labels, diarization, timestamp assignment, and conservative unknown/overlap results. The 16-second public two-speaker sample found two speakers and four turns in 0.488 seconds after a 0.231-second load, ending near 171 MiB.
+**In progress; first live integration implemented.** sherpa-onnx 1.12.33 and project-local INT8 segmentation plus TitaNet embedding models are installed. The isolated wrapper provides unlimited labels, diarization, timestamp assignment, and conservative unknown/overlap results. The 16-second public two-speaker sample found two speakers and four turns in 0.488 seconds after a 0.231-second load, ending near 171 MiB.
 
-Next: add a bounded speaker worker beside Whisper, retain several session signatures, join by sample timestamps, persist session people/signatures, and test combined CPU/RAM, delay, merges, splits, overlap, and 2/3/4+ speakers. Keep it experimental and disabled by default until those checks pass.
+An optional, bounded speaker-embedding worker now runs beside Whisper, keeps up to five signatures per session speaker, joins results by sample timestamps, and saves session people/signatures. Pause/resume restores the existing clusters and Person indices. It remains disabled by default. Next: test combined CPU/RAM, delay, merges, splits, overlap, and 2/3/4+ real speakers before treating live diarization as complete.
 
 ### Stage 10 — Remembered people
 
-Planned after stable session diarization: opt-in profiles, approved signatures, naming, merging, forgetting, deleting, uncertain matches, and false-accept/false-reject tests.
+**Initial opt-in slice implemented.** When speaker detection is enabled, the user can right-click a labelled message and choose **Remember or rename speaker…**. Only that explicit action creates a permanent person and copies up to five session signatures. Later sessions load approved profiles and can show the saved name for a strong, unambiguous voice match. Short speech stays `Unknown`, and the feature is disabled by default.
+
+Remaining: a remembered-people management screen, merge/forget/delete controls, adjustable thresholds, quality filtering beyond minimum duration, and real false-accept/false-reject testing with similar voices.
 
 ### Stage 11 — Packaging and offline setup
 
@@ -300,7 +302,7 @@ Planned: Windows package, first-run model downloader, file verification, disk-sp
 - High-DPI and multiple-monitor overlay behavior.
 - Offline operation, CPU-only operation, and later a supported GPU computer.
 
-Current automated baseline after Stage 9’s isolated slice and queue cleanup: 90 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
+Current automated baseline after the first remembered-speaker slice: 97 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
 
 ## Deferred and distant-future work
 

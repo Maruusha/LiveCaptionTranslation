@@ -9,6 +9,8 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt
@@ -23,6 +25,7 @@ from app.core.state import RuntimeState
 from app.history.database import HistoryDatabase
 from app.main import create_application
 from app.speech.recognition import RecognitionResult, RecognitionStats
+from app.speakers.identification import SpeakerIdentification
 from app.speech.vad import VoiceActivityStats
 from app.translation.translator import TranslationResult, TranslationStats
 from app.ui.history_sidebar import LIVE_ITEM_KEY
@@ -172,6 +175,7 @@ def test_main_window_starts_ready() -> None:
     assert window.speech_sensitivity_label.text() == (
         "Speech sensitivity: 5/9 (Balanced)"
     )
+    assert not window.speaker_identification_checkbox.isChecked()
     assert window.start_stop_button.minimumHeight() == 48
     assert window.pause_resume_button.minimumHeight() == 48
     assert window.stop_button.minimumHeight() == 48
@@ -261,6 +265,7 @@ def test_main_interface_choices_persist_between_windows() -> None:
     window.language_selector.setCurrentIndex(1)
     window.speech_chunk_duration_slider.setValue(45)
     window.speech_sensitivity_slider.setValue(8)
+    window.speaker_identification_checkbox.setChecked(True)
     window.sidebar_toggle_button.setChecked(False)
     window.close()
 
@@ -276,6 +281,7 @@ def test_main_interface_choices_persist_between_windows() -> None:
     assert restored.language_selector.currentData() == "fr"
     assert restored.speech_chunk_duration_slider.value() == 45
     assert restored.speech_sensitivity_slider.value() == 8
+    assert restored.speaker_identification_checkbox.isChecked()
     assert restored.conversation_sidebar.isHidden()
     assert restored.sidebar_toggle_button.text() == "Show conversations"
     restored.close()
@@ -452,6 +458,66 @@ def test_caption_completed_during_stop_is_shown_and_saved() -> None:
     assert len(saved_messages) == 1
     assert saved_messages[0].original_text == "Queued caption"
     assert window._history.get_session(session_id).status == "completed"
+    window.close()
+
+
+def test_detected_session_speaker_can_be_remembered_with_user_approval() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    monitors: list[FakeMicrophoneMonitor] = []
+
+    def monitor_factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        monitor_factory=monitor_factory,
+        history_database=history,
+    )
+    window.start_stop_button.click()
+    embedding = np.array([1.0, 0.0], dtype=np.float32)
+    window.caption_received.emit(
+        TranslationResult(
+            recognition=RecognitionResult(
+                start_sample=0,
+                end_sample=16_000,
+                text="Hello",
+                language="en",
+                language_probability=0.99,
+                processing_seconds=0.2,
+            ),
+            translated_text="Bonjour",
+            target_language="fr",
+            processing_seconds=0.1,
+            speaker=SpeakerIdentification(
+                0,
+                16_000,
+                "Person A",
+                0,
+                None,
+                0.93,
+                embedding,
+            ),
+        )
+    )
+    message = history.get_messages(window._active_history_session_id)[0]
+    assert message.session_person_id is not None
+    assert window.caption_chat.messages[0].speaker_label.text() == "Person A"
+
+    with patch(
+        "app.ui.main_window.QInputDialog.getText",
+        return_value=("Alice", True),
+    ):
+        window.caption_chat.remember_requested.emit(message.session_person_id)
+
+    assert history.list_person_profiles()[0].name == "Alice"
+    assert window.caption_chat.messages[0].speaker_label.text() == "Alice"
+    assert window._remembered_speaker_profiles()[0].name == "Alice"
+
+    window.stop_button.click()
+    wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
     window.close()
 
 

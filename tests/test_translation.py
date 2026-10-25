@@ -1,4 +1,5 @@
 from app.speech.recognition import RecognitionResult
+from app.speakers.identification import SpeakerIdentification
 from app.translation.translator import TranslationResult, TranslationWorker
 
 
@@ -111,3 +112,31 @@ def test_pending_translation_can_be_cancelled_during_shutdown() -> None:
     assert worker.stats.failed_captions == 2
     assert all(result.skipped for result in results)
     assert all(result.recognition.text in {"First", "Second"} for result in results)
+
+
+def test_translation_preserves_speaker_identification() -> None:
+    results: list[TranslationResult] = []
+    speaker = SpeakerIdentification(
+        start_sample=0,
+        end_sample=16_000,
+        label="Alice",
+        session_speaker_index=0,
+        remembered_person_id=7,
+        confidence=0.92,
+        embedding=None,
+    )
+
+    worker = TranslationWorker(
+        result_callback=results.append,
+        warning_callback=lambda _warning: None,
+        model_factory=lambda _source, _target: type(
+            "Model",
+            (),
+            {"translate": lambda self, _text: "Bonjour"},
+        )(),
+    )
+    worker.start()
+    worker.submit(recognition("Hello", "en"), speaker)
+    worker.stop()
+
+    assert results[0].speaker is speaker

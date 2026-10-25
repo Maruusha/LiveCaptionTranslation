@@ -88,6 +88,21 @@ def person_label(speaker_index: int) -> str:
     return f"Person {letters}"
 
 
+def person_index(label: str) -> int:
+    """Convert a Person A/AA style session label back to its index."""
+
+    prefix = "Person "
+    if not label.startswith(prefix):
+        raise ValueError(f"Invalid session speaker label: {label}")
+    letters = label[len(prefix) :].strip().upper()
+    if not letters or not letters.isalpha() or not letters.isascii():
+        raise ValueError(f"Invalid session speaker label: {label}")
+    value = 0
+    for letter in letters:
+        value = value * 26 + ord(letter) - ord("A") + 1
+    return value - 1
+
+
 def assign_caption_speaker(
     turns: tuple[SpeakerTurn, ...] | list[SpeakerTurn],
     start_seconds: float,

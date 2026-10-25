@@ -7,6 +7,7 @@ from app.speakers.diarization import (
     SpeakerDiarizer,
     SpeakerTurn,
     assign_caption_speaker,
+    person_index,
     person_label,
 )
 
@@ -17,8 +18,13 @@ def test_person_labels_continue_after_z_without_a_fixed_cap() -> None:
     assert person_label(26) == "Person AA"
     assert person_label(27) == "Person AB"
     assert person_label(701) == "Person ZZ"
+    assert person_index("Person A") == 0
+    assert person_index("Person AA") == 26
+    assert person_index("Person ZZ") == 701
     with pytest.raises(ValueError):
         person_label(-1)
+    with pytest.raises(ValueError):
+        person_index("Alice")
 
 
 def test_caption_assignment_uses_timeline_overlap_and_marks_uncertainty() -> None:

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QScrollArea,
     QSizePolicy,
     QVBoxLayout,
@@ -50,6 +51,8 @@ def format_caption_text(
 class CaptionMessageBubble(QFrame):
     """One completed caption and its optional translation."""
 
+    remember_requested = Signal(int)
+
     def __init__(
         self,
         *,
@@ -60,6 +63,7 @@ class CaptionMessageBubble(QFrame):
         target_language: str | None,
         timestamp: str,
         warning: bool = False,
+        session_person_id: int | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -68,6 +72,7 @@ class CaptionMessageBubble(QFrame):
         self.translated_text = translated_text
         self.target_language = target_language
         self.warning = warning
+        self.session_person_id = session_person_id
 
         self.setObjectName("captionMessageBubble")
         self.setMaximumWidth(720)
@@ -81,6 +86,9 @@ class CaptionMessageBubble(QFrame):
             "border-radius: 10px;"
             "}"
         )
+        if session_person_id is not None:
+            self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.customContextMenuRequested.connect(self._open_context_menu)
 
         self.speaker_label = QLabel(speaker)
         self.speaker_label.setObjectName("captionSpeaker")
@@ -122,9 +130,19 @@ class CaptionMessageBubble(QFrame):
             )
         )
 
+    def _open_context_menu(self, position: QPoint) -> None:
+        if self.session_person_id is None:
+            return
+        menu = QMenu(self)
+        remember = menu.addAction("Remember or rename speaker…")
+        if menu.exec(self.mapToGlobal(position)) is remember:
+            self.remember_requested.emit(self.session_person_id)
+
 
 class CaptionChatView(QScrollArea):
     """Scrollable caption bubbles that remain still while reading older text."""
+
+    remember_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -174,6 +192,7 @@ class CaptionChatView(QScrollArea):
         speaker: str = "Speaker",
         timestamp: str | None = None,
         warning: bool = False,
+        session_person_id: int | None = None,
     ) -> CaptionMessageBubble:
         scrollbar = self.verticalScrollBar()
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
@@ -187,8 +206,10 @@ class CaptionChatView(QScrollArea):
             target_language=target_language,
             timestamp=timestamp or datetime.now().strftime("%H:%M"),
             warning=warning,
+            session_person_id=session_person_id,
         )
         bubble.set_display_mode(self._display_mode)
+        bubble.remember_requested.connect(self.remember_requested.emit)
 
         row = QWidget()
         row_layout = QHBoxLayout(row)

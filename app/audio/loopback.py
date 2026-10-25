@@ -10,6 +10,10 @@ from threading import Event, Thread
 import soundcard as sc
 
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
+from app.speakers.identification import (
+    RememberedSpeakerProfile,
+    SessionSpeakerProfile,
+)
 from app.speech.vad import SpeechEvent, SpeechSegment
 from app.translation.translator import TranslationResult
 
@@ -83,6 +87,8 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
         speech_threshold: float = 0.5,
+        speaker_profiles: tuple[RememberedSpeakerProfile, ...] | None = None,
+        session_speaker_profiles: tuple[SessionSpeakerProfile, ...] = (),
     ) -> None:
         super().__init__(
             0,
@@ -94,6 +100,8 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
             recognition_language,
             max_segment_seconds,
             speech_threshold,
+            speaker_profiles=speaker_profiles,
+            session_speaker_profiles=session_speaker_profiles,
         )
         self.output_device = output_device
         self._capture_stop = Event()

@@ -3,6 +3,8 @@
 import numpy as np
 
 from app.audio import microphone
+from app.speakers.identification import SpeakerIdentification
+from app.speech.recognition import RecognitionResult
 
 
 def test_level_calculation_covers_silence_and_full_scale() -> None:
@@ -111,4 +113,46 @@ def test_monitor_falls_back_to_another_backend(monkeypatch) -> None:
     assert monitor.active_device_index == 17
 
     monitor.stop()
+
+
+def test_monitor_joins_recognition_and_speaker_results_by_timestamp() -> None:
+    monitor = microphone.MicrophoneLevelMonitor(
+        12,
+        lambda _level: None,
+        lambda _warning: None,
+        speech_event_callback=lambda _event: None,
+        caption_callback=lambda _caption: None,
+        speaker_profiles=(),
+    )
+    submitted = []
+    monitor.translation_worker = type(
+        "TranslationSink",
+        (),
+        {"submit": lambda self, recognition, speaker: submitted.append(
+            (recognition, speaker)
+        )},
+    )()
+    recognition = RecognitionResult(
+        0,
+        16_000,
+        "Hello",
+        "en",
+        0.99,
+        0.2,
+    )
+    speaker = SpeakerIdentification(
+        0,
+        16_000,
+        "Person A",
+        0,
+        None,
+        1.0,
+        np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+    monitor._handle_recognition_result(recognition)
+    assert submitted == []
+    monitor._handle_speaker_result(speaker)
+
+    assert submitted == [(recognition, speaker)]
 

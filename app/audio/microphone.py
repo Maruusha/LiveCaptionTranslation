@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
+from threading import Lock
 
 import numpy as np
 import sounddevice as sd
@@ -28,6 +29,13 @@ from app.speech.vad import (
     VoiceActivityError,
     VoiceActivityStats,
     VoiceActivityWorker,
+)
+from app.speakers.identification import (
+    RememberedSpeakerProfile,
+    SessionSpeakerProfile,
+    SpeakerIdentification,
+    SpeakerIdentificationError,
+    SpeakerIdentificationWorker,
 )
 from app.translation.translator import (
     TranslationError,
@@ -68,6 +76,8 @@ class MicrophoneLevelMonitor:
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
         speech_threshold: float = 0.5,
+        speaker_profiles: tuple[RememberedSpeakerProfile, ...] | None = None,
+        session_speaker_profiles: tuple[SessionSpeakerProfile, ...] = (),
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -112,6 +122,23 @@ class MicrophoneLevelMonitor:
             if caption_callback is not None
             else None
         )
+        self.speaker_worker = (
+            SpeakerIdentificationWorker(
+                result_callback=self._handle_speaker_result,
+                warning_callback=self._warning_callback,
+                remembered_profiles=speaker_profiles,
+                session_profiles=session_speaker_profiles,
+            )
+            if caption_callback is not None and speaker_profiles is not None
+            else None
+        )
+        self._speaker_join_lock = Lock()
+        self._pending_recognition_results: dict[
+            tuple[int, int], RecognitionResult
+        ] = {}
+        self._pending_speaker_results: dict[
+            tuple[int, int], SpeakerIdentification
+        ] = {}
         self.voice_activity_worker = (
             VoiceActivityWorker(
                 source_queue=self.processed_audio_buffer,
@@ -234,6 +261,8 @@ class MicrophoneLevelMonitor:
         cancelled = 0
         if self.recognition_worker is not None:
             cancelled += self.recognition_worker.cancel_pending()
+        if self.speaker_worker is not None:
+            self.speaker_worker.cancel_pending()
         if self.translation_worker is not None:
             cancelled += self.translation_worker.cancel_pending()
         return cancelled
@@ -267,6 +296,8 @@ class MicrophoneLevelMonitor:
             self.translation_worker.start()
         if self.recognition_worker is not None:
             self.recognition_worker.start()
+        if self.speaker_worker is not None:
+            self.speaker_worker.start()
         if self.voice_activity_worker is not None:
             self.voice_activity_worker.start()
         self.processing_worker.start()
@@ -290,6 +321,12 @@ class MicrophoneLevelMonitor:
             except RecognitionError as error:
                 stop_error = stop_error or error
 
+        if self.speaker_worker is not None:
+            try:
+                self.speaker_worker.stop()
+            except SpeakerIdentificationError as error:
+                stop_error = stop_error or error
+
         if self.translation_worker is not None:
             try:
                 self.translation_worker.stop()
@@ -300,12 +337,34 @@ class MicrophoneLevelMonitor:
     def _handle_speech_segment(self, segment: SpeechSegment) -> None:
         if self._speech_segment_callback is not None:
             self._speech_segment_callback(segment)
+        if self.speaker_worker is not None:
+            self.speaker_worker.submit(segment)
         if self.recognition_worker is not None:
             self.recognition_worker.submit(segment)
 
     def _handle_recognition_result(self, result: RecognitionResult) -> None:
-        if self.translation_worker is not None:
+        if self.translation_worker is None:
+            return
+        if self.speaker_worker is None:
             self.translation_worker.submit(result)
+            return
+        key = (result.start_sample, result.end_sample)
+        with self._speaker_join_lock:
+            speaker = self._pending_speaker_results.pop(key, None)
+            if speaker is None:
+                self._pending_recognition_results[key] = result
+                return
+        self.translation_worker.submit(result, speaker)
+
+    def _handle_speaker_result(self, result: SpeakerIdentification) -> None:
+        key = (result.start_sample, result.end_sample)
+        with self._speaker_join_lock:
+            recognition = self._pending_recognition_results.pop(key, None)
+            if recognition is None:
+                self._pending_speaker_results[key] = result
+                return
+        if self.translation_worker is not None:
+            self.translation_worker.submit(recognition, result)
 
     def _log_capture_summary(self, source_name: str = "Microphone") -> None:
         start = self._performance_start

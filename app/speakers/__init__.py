@@ -6,7 +6,14 @@ from app.speakers.diarization import (
     SpeakerDiarizer,
     SpeakerTurn,
     assign_caption_speaker,
+    person_index,
     person_label,
+)
+from app.speakers.identification import (
+    RememberedSpeakerProfile,
+    SessionSpeakerProfile,
+    SpeakerIdentification,
+    SpeakerIdentificationWorker,
 )
 
 __all__ = [
@@ -14,6 +21,11 @@ __all__ = [
     "SpeakerDiarizationResult",
     "SpeakerDiarizer",
     "SpeakerTurn",
+    "RememberedSpeakerProfile",
+    "SessionSpeakerProfile",
+    "SpeakerIdentification",
+    "SpeakerIdentificationWorker",
     "assign_caption_speaker",
+    "person_index",
     "person_label",
 ]

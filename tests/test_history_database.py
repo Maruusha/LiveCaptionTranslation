@@ -326,7 +326,7 @@ def test_version_one_database_is_backed_up_and_migrated(tmp_path) -> None:
     version = migrated._connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()[0]
-    assert version == "2"
+    assert version == "3"
     assert migrated.list_sessions("searchable")[0].id == session_id
     assert list(tmp_path.glob("history.sqlite3.pre-v2.backup*"))
     migrated.close()
@@ -386,4 +386,73 @@ def test_damaged_database_is_not_silently_replaced(tmp_path) -> None:
         HistoryDatabase(database_path)
 
     assert database_path.read_bytes() == original_contents
+
+
+def test_remembered_person_copies_approved_signature_and_renames_messages() -> None:
+    database = HistoryDatabase(":memory:")
+    session_id = create_session(database, "Speaker memory")
+    session_person_id = database.upsert_session_person(
+        session_id=session_id,
+        session_label="Person A",
+        person_id=None,
+        confidence=0.91,
+    )
+    embedding = b"\x00\x00\x80?\x00\x00\x00\x00"
+    database.add_session_voice_signature(
+        session_person_id=session_person_id,
+        embedding=embedding,
+        model_name="test-model",
+        model_version="1",
+        dimensions=2,
+        quality_score=0.91,
+    )
+    database.add_message(
+        session_id=session_id,
+        session_person_id=session_person_id,
+        speaker_label="Person A",
+        start_offset_seconds=0.0,
+        end_offset_seconds=1.0,
+        source_language="en",
+        language_confidence=0.9,
+        original_text="Remember me",
+        target_language="fr",
+        translated_text="Souviens-toi de moi",
+    )
+
+    person_id = database.remember_session_person(session_person_id, "  Alice  ")
+    profiles = database.list_person_profiles()
+
+    assert profiles[0].id == person_id
+    assert profiles[0].name == "Alice"
+    assert profiles[0].signatures[0].embedding == embedding
+    assert database.get_messages(session_id)[0].speaker_label == "Alice"
+    assert database.get_session_person(session_person_id).person_id == person_id
+    session_profiles = database.list_session_speaker_profiles(session_id)
+    assert session_profiles[0].session_label == "Person A"
+    assert session_profiles[0].display_name == "Alice"
+    assert session_profiles[0].signatures[0].embedding == embedding
+
+    # Repeating the action renames the profile without copying duplicates.
+    assert database.remember_session_person(session_person_id, "Alicia") == person_id
+    assert database.list_person_profiles()[0].name == "Alicia"
+    count = database._connection.execute(
+        "SELECT COUNT(*) FROM person_voice_signatures WHERE person_id = ?",
+        (person_id,),
+    ).fetchone()[0]
+    assert count == 1
+
+    second_embedding = b"\x00\x00\x00\x00\x00\x00\x80?"
+    database.add_session_voice_signature(
+        session_person_id=session_person_id,
+        embedding=second_embedding,
+        model_name="test-model",
+        model_version="1",
+        dimensions=2,
+        quality_score=0.95,
+    )
+    refreshed = database.list_person_profiles()[0]
+    assert {item.embedding for item in refreshed.signatures} == {
+        embedding,
+        second_embedding,
+    }
 
