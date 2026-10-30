@@ -13,7 +13,6 @@ from app.core.queues import BoundedAudioFrameQueue
 from app.speech.vad import (
     SpeechEvent,
     SpeechSegment,
-    StreamingDetector,
     VAD_SAMPLE_RATE,
     VoiceActivityWorker,
     create_silero_detector,

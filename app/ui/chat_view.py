@@ -91,6 +91,7 @@ class CaptionMessageBubble(QFrame):
             self.customContextMenuRequested.connect(self._open_context_menu)
 
         self.speaker_label = QLabel(speaker)
+        self.speaker_label.setTextFormat(Qt.TextFormat.PlainText)
         self.speaker_label.setObjectName("captionSpeaker")
         speaker_font = self.speaker_label.font()
         speaker_font.setBold(True)
@@ -106,6 +107,7 @@ class CaptionMessageBubble(QFrame):
         header.addWidget(self.time_label)
 
         self.message_label = QLabel()
+        self.message_label.setTextFormat(Qt.TextFormat.PlainText)
         self.message_label.setObjectName("captionMessageText")
         self.message_label.setWordWrap(True)
         self.message_label.setTextInteractionFlags(
@@ -159,6 +161,8 @@ class CaptionChatView(QScrollArea):
         )
 
         self._display_mode = "both"
+        self._loading = False
+        self._scroll_revision = 0
         self._bubbles: list[CaptionMessageBubble] = []
         self._rows: list[QWidget] = []
         self._content = QWidget()
@@ -220,8 +224,8 @@ class CaptionChatView(QScrollArea):
         self._rows.append(row)
         self._bubbles.append(bubble)
 
-        if was_at_bottom:
-            QTimer.singleShot(0, self, self.scroll_to_bottom)
+        if was_at_bottom and not self._loading:
+            self._schedule_scroll_to_bottom()
         return bubble
 
     def add_event(self, text: str, timestamp: str = "") -> QLabel:
@@ -231,6 +235,7 @@ class CaptionChatView(QScrollArea):
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
         self._placeholder.hide()
         label = QLabel(f"{text}  ·  {timestamp}" if timestamp else text)
+        label.setTextFormat(Qt.TextFormat.PlainText)
         label.setObjectName("conversationEvent")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet(
@@ -239,9 +244,39 @@ class CaptionChatView(QScrollArea):
         )
         self._layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignHCenter)
         self._rows.append(label)
-        if was_at_bottom:
-            QTimer.singleShot(0, self, self.scroll_to_bottom)
+        if was_at_bottom and not self._loading:
+            self._schedule_scroll_to_bottom()
         return label
+
+    def _schedule_scroll_to_bottom(self) -> None:
+        revision = self._scroll_revision
+
+        def scroll() -> None:
+            if revision == self._scroll_revision:
+                self.scroll_to_bottom()
+
+        QTimer.singleShot(0, self, scroll)
+
+    def begin_reload(self) -> None:
+        """Avoid a deferred auto-scroll for every saved message being rebuilt."""
+        self._loading = True
+        self.clear_messages()
+
+    def finish_reload(self, scroll_position: int | None = None) -> None:
+        self._loading = False
+        revision = self._scroll_revision
+
+        def restore() -> None:
+            if revision != self._scroll_revision:
+                return
+            self._layout.activate()
+            self._content.adjustSize()
+            scrollbar = self.verticalScrollBar()
+            scrollbar.setValue(
+                scrollbar.maximum() if scroll_position is None else scroll_position
+            )
+
+        QTimer.singleShot(0, self, restore)
 
     def set_display_mode(self, mode: str) -> None:
         if mode not in {"both", "original", "translation"}:
@@ -251,8 +286,10 @@ class CaptionChatView(QScrollArea):
             bubble.set_display_mode(mode)
 
     def clear_messages(self) -> None:
+        self._scroll_revision += 1
         for row in self._rows:
             self._layout.removeWidget(row)
+            row.hide()
             row.deleteLater()
         self._rows.clear()
         self._bubbles.clear()

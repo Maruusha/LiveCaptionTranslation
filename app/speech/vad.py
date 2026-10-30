@@ -145,6 +145,7 @@ class VoiceActivityWorker:
         self._completed_segments = 0
         self._filtered_short_segments = 0
         self._next_sample = 0
+        self._error: Exception | None = None
 
     @property
     def is_running(self) -> bool:
@@ -175,6 +176,7 @@ class VoiceActivityWorker:
         if self.is_running:
             return
         self._stop_event.clear()
+        self._error = None
         self._thread = Thread(
             target=self._run,
             name="voice-activity-worker",
@@ -182,7 +184,7 @@ class VoiceActivityWorker:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 3.0) -> None:
+    def stop(self, timeout: float | None = 3.0) -> None:
         thread = self._thread
         if thread is None:
             return
@@ -191,6 +193,8 @@ class VoiceActivityWorker:
         if thread.is_alive():
             raise VoiceActivityError("Voice activity detection did not stop.")
         self._thread = None
+        if self._error is not None:
+            raise VoiceActivityError("Voice activity detection failed.") from self._error
 
     def _run(self) -> None:
         try:
@@ -241,8 +245,6 @@ class VoiceActivityWorker:
                         self._processed_windows += 1
                         self._inference_seconds += inference_seconds
                     total_samples += VAD_WINDOW_SAMPLES
-                    with self._stats_lock:
-                        self._next_sample = total_samples
                     if result and "start" in result:
                         speech_active = True
                         segment_start = run_start_sample + int(result["start"])
@@ -289,12 +291,13 @@ class VoiceActivityWorker:
                         segment_sample_count = remainder.size
                         segment_start = split_end
 
-            if speech_active:
-                if pending.size:
+            if pending.size:
+                if speech_active:
                     segment_parts.append(pending.copy())
-                    total_samples += pending.size
-                    with self._stats_lock:
-                        self._next_sample = total_samples
+                total_samples += pending.size
+            with self._stats_lock:
+                self._next_sample = total_samples
+            if speech_active:
                 with self._stats_lock:
                     self._speech_ends += 1
                 self._event_callback(SpeechEvent("speech_end", total_samples))
@@ -305,6 +308,7 @@ class VoiceActivityWorker:
                     forced_split=False,
                 )
         except Exception as error:
+            self._error = error
             self._warning_callback(f"Voice activity detection stopped: {error}")
 
     @staticmethod

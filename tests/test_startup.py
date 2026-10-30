@@ -1,6 +1,7 @@
 """Startup tests for the first PySide6 application shell."""
 
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -490,6 +491,20 @@ def test_microphone_controls_start_update_and_stop() -> None:
     window.close()
 
 
+def test_saved_computer_audio_starts_ready_even_without_a_microphone() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    settings.setValue("ui/audio_source", "computer_audio")
+    window = MainWindow(
+        device_provider=lambda: [], output_device_provider=output_fixture,
+        interface_settings=settings,
+    )
+    assert window.computer_audio_source_button.isChecked()
+    assert window.start_stop_button.isEnabled()
+    assert window.start_stop_button.text() == "Start computer audio"
+    window.close()
+
+
 def test_caption_completed_during_stop_is_shown_and_saved() -> None:
     create_application(["live-caption-translation-test"])
     caption_emitted = Event()
@@ -661,6 +676,7 @@ def test_speaker_detection_setting_reaches_capture_pipeline() -> None:
 
     window.stop_button.click()
     wait_until(lambda: monitors[0].stopped and window._stop_thread is None)
+    assert window.speaker_match_slider.isEnabled()
     window.close()
 
 
@@ -781,6 +797,46 @@ def test_capture_start_failure_enters_error_state() -> None:
     assert window._microphone_monitor is None
     assert window.statusBar().currentMessage() == "Audio capture could not start"
     assert window.device_status.text() == "Test capture could not start."
+    window.close()
+
+
+def test_failed_pause_history_write_drains_workers_before_releasing_session() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    monitors = []
+
+    def factory(*arguments):
+        monitor = FakeMicrophoneMonitor(*arguments)
+        monitors.append(monitor)
+        return monitor
+
+    window = MainWindow(device_provider=microphone_fixture, monitor_factory=factory,
+                        history_database=history)
+    window.start_stop_button.click()
+    session_id = window._active_history_session_id
+    with patch.object(history, "pause_session", side_effect=sqlite3.OperationalError("disk full")):
+        window.pause_resume_button.click()
+        wait_until(lambda: window.runtime_state is RuntimeState.ERROR
+                   and window._stop_thread is None)
+    assert monitors[0].stopped
+    assert history.get_session(session_id).status == "incomplete"
+    window.close()
+
+
+def test_live_caption_does_not_rescan_the_saved_history_list() -> None:
+    create_application(["live-caption-translation-test"])
+    window = MainWindow(device_provider=microphone_fixture,
+                        monitor_factory=lambda *args: FakeMicrophoneMonitor(*args))
+    window.start_stop_button.click()
+    with patch.object(window._history, "list_sessions", wraps=window._history.list_sessions) as query:
+        window.caption_received.emit(TranslationResult(
+            RecognitionResult(0, 16_000, "Hello", "en", 0.99, 0.2),
+            "Bonjour", "fr", 0.1,
+        ))
+        assert query.call_count == 0
+    assert len(window.caption_chat.messages) == 1
+    window.stop_button.click()
+    wait_until(lambda: window._stop_thread is None)
     window.close()
 
 
@@ -1158,7 +1214,7 @@ def test_slow_stop_shows_caption_progress_without_blocking_the_window() -> None:
             release_stop.wait(timeout=2.0)
             self.stopped = True
 
-        def cancel_pending_recognition(self) -> int:
+        def cancel_pending_captions(self) -> int:
             self.cancelled = True
             return 2
 

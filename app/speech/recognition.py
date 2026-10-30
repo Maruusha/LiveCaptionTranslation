@@ -105,6 +105,8 @@ class RecognitionWorker:
         self._failed_segments = 0
         self._processing_seconds = 0.0
         self._active_started_at: float | None = None
+        self._model_error: str | None = None
+        self._cancel_requested = False
 
     @property
     def is_running(self) -> bool:
@@ -132,6 +134,9 @@ class RecognitionWorker:
         if self.is_running:
             return
         self._stop_event.clear()
+        with self._stats_lock:
+            self._model_error = None
+            self._cancel_requested = False
         self._thread = Thread(
             target=self._run,
             name="speech-recognition-worker",
@@ -144,10 +149,28 @@ class RecognitionWorker:
         with self._result_lock:
             sequence = self._next_sequence
             self._next_sequence += 1
-        try:
-            self._queue.put_nowait((sequence, segment))
-            return True
-        except Full:
+        with self._stats_lock:
+            model_error = self._model_error
+            cancelled = self._cancel_requested
+            try:
+                if model_error is None and not cancelled:
+                    self._queue.put_nowait((sequence, segment))
+                    return True
+            except Full:
+                pass
+            self._failed_segments += 1
+        if cancelled:
+            self._complete_result(sequence, self._cancelled_result(segment))
+        elif model_error is not None:
+            self._complete_result(
+                sequence,
+                RecognitionResult(
+                    segment.start_sample, segment.end_sample,
+                    "[caption unavailable]", self._language, None, 0.0,
+                    error=model_error,
+                ),
+            )
+        else:
             self._warning_callback(
                 "Speech recognition is behind; one completed audio chunk was skipped."
             )
@@ -163,11 +186,9 @@ class RecognitionWorker:
                     skipped=True,
                 ),
             )
-            with self._stats_lock:
-                self._failed_segments += 1
-            return False
+        return False
 
-    def stop(self, timeout: float = 60.0) -> None:
+    def stop(self, timeout: float | None = 60.0) -> None:
         """Finish accepted chunks before stopping."""
         thread = self._thread
         if thread is None:
@@ -180,6 +201,8 @@ class RecognitionWorker:
 
     def cancel_pending(self) -> int:
         """Discard queued chunks while leaving an active transcription untouched."""
+        with self._stats_lock:
+            self._cancel_requested = True
         cancelled = 0
         while True:
             try:
@@ -189,28 +212,30 @@ class RecognitionWorker:
             cancelled += 1
             self._complete_result(
                 sequence,
-                RecognitionResult(
-                    start_sample=segment.start_sample,
-                    end_sample=segment.end_sample,
-                    text="[caption skipped: application closed before processing]",
-                    language=None,
-                    language_probability=None,
-                    processing_seconds=0.0,
-                    error="The caption was cancelled while the application was closing.",
-                    skipped=True,
-                ),
+                self._cancelled_result(segment),
             )
         if cancelled:
             with self._stats_lock:
                 self._failed_segments += cancelled
         return cancelled
 
+    @staticmethod
+    def _cancelled_result(segment: SpeechSegment) -> RecognitionResult:
+        return RecognitionResult(
+            segment.start_sample, segment.end_sample,
+            "[caption skipped: queued processing cancelled]", None, None, 0.0,
+            error="Queued caption processing was cancelled by the user.",
+            skipped=True,
+        )
+
     def _run(self) -> None:
         try:
             model = self._model_factory()
         except Exception as error:
+            with self._stats_lock:
+                self._model_error = "The local speech-recognition model could not load."
             self._warning_callback(f"Speech-recognition model could not load: {error}")
-            self._fail_waiting_segments("The local speech-recognition model could not load.")
+            self._fail_waiting_segments(self._model_error)
             return
 
         while True:

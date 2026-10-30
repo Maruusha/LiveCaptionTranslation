@@ -76,10 +76,12 @@ class CaptionOverlay(QWidget):
         self.panel.setObjectName("captionOverlayPanel")
 
         self.header_label = QLabel("Live captions · drag to move")
+        self.header_label.setTextFormat(Qt.TextFormat.PlainText)
         self.header_label.setObjectName("captionOverlayHeader")
         self.header_label.setStyleSheet("color: #aebac1;")
 
         self.caption_label = QLabel("Waiting for a live caption…")
+        self.caption_label.setTextFormat(Qt.TextFormat.PlainText)
         self.caption_label.setObjectName("captionOverlayText")
         self.caption_label.setWordWrap(True)
         self.caption_label.setTextInteractionFlags(

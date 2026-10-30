@@ -166,6 +166,18 @@ class SpeakerIdentificationWorker:
         self._model_load_seconds = 0.0
         self._processing_seconds = 0.0
         self._active_started_at: float | None = None
+        self._profile_update: tuple[
+            tuple[RememberedSpeakerProfile, ...], tuple[SessionSpeakerProfile, ...]
+        ] | None = None
+
+    def refresh_profiles(
+        self,
+        remembered_profiles: tuple[RememberedSpeakerProfile, ...],
+        session_profiles: tuple[SessionSpeakerProfile, ...],
+    ) -> None:
+        """Apply approved profile changes on the worker before its next chunk."""
+        with self._state_lock:
+            self._profile_update = (remembered_profiles, session_profiles)
 
     @property
     def is_running(self) -> bool:
@@ -228,7 +240,7 @@ class SpeakerIdentificationWorker:
             self._emit_unknown(segment, message)
             return False
 
-    def stop(self, timeout: float = 30.0) -> None:
+    def stop(self, timeout: float | None = 30.0) -> None:
         thread = self._thread
         if thread is None:
             return
@@ -279,7 +291,16 @@ class SpeakerIdentificationWorker:
             started = perf_counter()
             with self._state_lock:
                 self._active_started_at = started
+                profile_update = self._profile_update
+                self._profile_update = None
             try:
+                if profile_update is not None:
+                    self._profiles, self._initial_session_profiles = profile_update
+                    profiles = self._prepare_profiles(model.dimension)
+                    self._session_signatures.clear()
+                    self._session_person_ids.clear()
+                    self._session_names.clear()
+                    self._prepare_session_profiles(model.dimension)
                 if segment.samples.size < self._minimum_samples:
                     self._emit_unknown(segment)
                     continue

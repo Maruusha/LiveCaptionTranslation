@@ -1,7 +1,10 @@
 # Local speaker models
 
-Stage 9 uses CPU-only `sherpa-onnx 1.12.33`. Diart was rejected because its
-Python 3.8–3.10 and NumPy <2 requirements conflict with this project.
+Live speaker labels use CPU-only `sherpa-onnx 1.12.33` with TitaNet
+embeddings (one CPU thread). Each completed VAD chunk receives one label;
+this live path does not yet split speaker changes inside a chunk or detect
+overlap. The segmentation model below is used by the separate offline
+diarization diagnostic (two CPU threads).
 
 Ignored files under `models/speakers/`:
 
@@ -15,5 +18,5 @@ Ignored files under `models/speakers/`:
   - Public sherpa-onnx evaluation sample
   - SHA-256: `F1C877DC01595E28BE7147BF2FE38E5268147A868BF3FDB5C37B97F5940E21F3`
 
-Runtime uses INT8 segmentation and two CPU threads. Raw user audio is never
-written here.
+Raw user audio is never written here. Repeat the offline sample check with
+`.venv\Scripts\python.exe -m app.diagnostics.speaker_evaluation`.

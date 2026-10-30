@@ -1,4 +1,4 @@
-"""SQLite storage for caption sessions and future speaker profiles."""
+"""SQLite storage for caption sessions and approved speaker profiles."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from threading import RLock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "history.sqlite3"
-VALID_SESSION_STATUSES = {"live", "paused", "incomplete", "completed"}
 SCHEMA_VERSION = 3
 
 
@@ -260,6 +259,8 @@ class HistoryDatabase:
                     ON messages(session_id, id);
                 CREATE INDEX IF NOT EXISTS session_events_session_index
                     ON session_events(session_id, id);
+                CREATE INDEX IF NOT EXISTS session_signatures_person_index
+                    ON session_voice_signatures(session_person_id, id);
                 """
             )
 
@@ -433,8 +434,8 @@ class HistoryDatabase:
             return session_id
 
     def finish_session(self, session_id: int, status: str = "completed") -> None:
-        if status not in VALID_SESSION_STATUSES:
-            raise ValueError(f"Unknown session status: {status}")
+        if status not in {"completed", "incomplete"}:
+            raise ValueError(f"A finished session cannot have status: {status}")
         ended_at = local_timestamp()
         with self._lock, self._connection:
             self._connection.execute(
@@ -953,6 +954,16 @@ class HistoryDatabase:
                 """,
                 (normalized_name, person_id),
             )
+            self._connection.execute(
+                """
+                DELETE FROM person_voice_signatures
+                WHERE person_id = ? AND id NOT IN (
+                    SELECT id FROM person_voice_signatures WHERE person_id = ?
+                    ORDER BY quality_score DESC, id DESC LIMIT 5
+                )
+                """,
+                (person_id, person_id),
+            )
             return int(person_id)
 
     def list_person_profiles(self) -> list[PersonProfile]:
@@ -1362,9 +1373,7 @@ class HistoryDatabase:
     @staticmethod
     def _fts_prefix_query(search_text: str) -> str:
         tokens = re.findall(r"\w+", search_text.casefold(), flags=re.UNICODE)
-        return " AND ".join(
-            f'"{token.replace(chr(34), chr(34) * 2)}"*' for token in tokens
-        )
+        return " AND ".join(f'"{token}"*' for token in tokens)
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> HistorySession:

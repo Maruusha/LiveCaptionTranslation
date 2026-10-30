@@ -1,7 +1,8 @@
 import numpy as np
+import pytest
 
 from app.core.queues import BoundedAudioFrameQueue
-from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityWorker
+from app.speech.vad import SpeechEvent, SpeechSegment, VoiceActivityError, VoiceActivityWorker
 
 
 def test_vad_worker_emits_speech_boundaries() -> None:
@@ -170,3 +171,34 @@ def test_vad_worker_filters_a_very_short_non_speech_segment() -> None:
     assert segments == []
     assert worker.stats.completed_segments == 0
     assert worker.stats.filtered_short_segments == 1
+
+
+def test_vad_failure_is_reported_to_the_session_stopper() -> None:
+    def fail_to_load():
+        raise RuntimeError("Missing VAD model")
+
+    warnings = []
+    worker = VoiceActivityWorker(
+        BoundedAudioFrameQueue(), lambda _event: None, warnings.append,
+        detector_factory=fail_to_load,
+    )
+    worker.start()
+    with pytest.raises(VoiceActivityError, match="failed"):
+        worker.stop()
+    assert len(warnings) == 1
+
+
+def test_partial_silent_window_keeps_its_time_when_resuming() -> None:
+    source = BoundedAudioFrameQueue()
+    events = []
+    worker = VoiceActivityWorker(
+        source, events.append, lambda _warning: None,
+        detector_factory=lambda: lambda _samples: {"start": 0},
+    )
+    source.put(np.zeros(100, dtype=np.float32), sample_rate=16_000)
+    worker.start()
+    worker.stop()
+    source.put(np.ones(512, dtype=np.float32), sample_rate=16_000)
+    worker.start()
+    worker.stop()
+    assert [event.sample_index for event in events] == [100, 612]

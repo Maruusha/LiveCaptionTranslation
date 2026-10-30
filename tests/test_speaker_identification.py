@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from threading import Event
 
 import numpy as np
 
@@ -121,3 +122,29 @@ def test_worker_restores_session_labels_after_pause() -> None:
     assert results[0].session_speaker_index == 3
     assert results[1].label == "Person E"
     assert results[1].session_speaker_index == 4
+
+
+def test_profile_changes_while_paused_remove_cached_remembered_identity() -> None:
+    first_result = Event()
+    results = []
+    embedding = np.array([1.0, 0.0], dtype=np.float32)
+
+    def receive(result):
+        results.append(result)
+        first_result.set()
+
+    worker = SpeakerIdentificationWorker(
+        receive, lambda _warning: None,
+        remembered_profiles=(RememberedSpeakerProfile(7, "Alice", (embedding,)),),
+        model_factory=lambda: SimpleNamespace(dimension=2, compute=lambda _audio: embedding),
+    )
+    worker.start()
+    try:
+        worker.submit(segment(0))
+        assert first_result.wait(timeout=1.0)
+        worker.refresh_profiles((), (SessionSpeakerProfile(0, None, None, (embedding,)),))
+        worker.submit(segment(16_000))
+    finally:
+        worker.stop()
+    assert [result.label for result in results] == ["Alice", "Person A"]
+    assert results[1].remembered_person_id is None

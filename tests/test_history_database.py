@@ -120,6 +120,8 @@ def test_pause_and_resume_reject_duplicate_state_changes() -> None:
     database.pause_session(session_id)
     with pytest.raises(ValueError, match="not live"):
         database.pause_session(session_id)
+    with pytest.raises(ValueError, match="finished session"):
+        database.finish_session(session_id, status="live")
 
 
 def test_schema_contains_future_person_and_voice_tables() -> None:
