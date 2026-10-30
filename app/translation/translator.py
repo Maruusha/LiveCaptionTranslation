@@ -13,9 +13,10 @@ from typing import Protocol
 
 from app.speech.recognition import RecognitionResult
 from app.speakers.identification import SpeakerIdentification
+from app.core.paths import models_directory
 
 
-MODEL_ROOT = Path(__file__).resolve().parents[2] / "models" / "translation"
+MODEL_ROOT = models_directory() / "translation"
 SUPPORTED_LANGUAGES = {"en", "fr"}
 logger = logging.getLogger(__name__)
 

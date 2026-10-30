@@ -1,6 +1,6 @@
 # Local French ↔ English Live Captions
 
-Updated: 2026-10-30. Current branch: `feat/packaging`. Packaging has not started.
+Updated: 2026-10-30. Current branch: `feat/packaging`. Stage 11's first Windows folder build is ready for testing.
 
 ## Goal and rules
 
@@ -8,7 +8,7 @@ A Windows desktop app for local microphone/computer-audio captions, French ↔ E
 
 - Run offline after models are installed. Keep audio, text, and voice signatures local; do not save raw audio by default.
 - Save every final caption and visible skip/error to history; users can delete conversations afterward.
-- Work and verify in small stages. Finish major runtime validation before the WhatsApp-inspired UI redesign, then package the app.
+- Work and verify in small stages. Continue runtime validation alongside the initial packaging work; finish major runtime checks before the WhatsApp-inspired UI redesign and release.
 - Use project-local environments, packages, models, caches, and helpers. Use `.venv`; use local `.conda` only if needed. Do not install globally.
 - Keep one Whisper worker: multiple workers previously harmed game performance on this PC.
 - Make Git changes only when requested. Keep the current branch, main, and develop locally.
@@ -25,7 +25,7 @@ A Windows desktop app for local microphone/computer-audio captions, French ↔ E
 | Live speaker labels | sherpa-onnx TitaNet embeddings, one CPU thread |
 | Offline speaker diagnostic | sherpa-onnx segmentation + embeddings, two CPU threads |
 | History | SQLite, WAL, FTS5, schema version 3 |
-| Packaging | PyInstaller planned |
+| Packaging | PyInstaller 6.22.3 folder build; installer/setup pending |
 
 Direct dependencies are pinned in requirements.txt; test tools are in requirements-dev.txt. CTranslate2 is explicitly pinned. Speaker model sources/hashes are in app/speakers/MODELS.md.
 
@@ -40,7 +40,7 @@ logs/application.log   Rotating diagnostics
 vendor/ or tools/      Future bundled helpers
 ```
 
-These generated/local directories stay outside Git. UI settings use Qt's application configuration directory unless LIVE_CAPTION_SETTINGS_PATH overrides it; LIVE_CAPTION_HISTORY_PATH overrides history. Tests use in-memory stores.
+These generated/local directories, build/, and dist/ stay outside Git. Source runs keep data/logs in the project. Packaged runs use %LOCALAPPDATA%\LiveCaptionTranslation for data/logs/cache; program upgrades can replace the app folder without replacing history. UI settings keep Qt's existing application configuration location. LIVE_CAPTION_SETTINGS_PATH and LIVE_CAPTION_HISTORY_PATH override individual stores; --data-dir overrides the data/log/cache root. Tests use in-memory stores.
 
 GitHub Desktop Git on this PC: `C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe`.
 Locate the newest app-* copy after Desktop updates; never hardcode it in the application.
@@ -95,7 +95,7 @@ Microphone OR selected computer output
 
 Latest completed live run (2026-10-30): 67 chunks, 65 English→French captions/translations, one overload skip and one user skip; zero translation failures/audio-queue drops. Speaker results: 63 labelled, four Unknown, zero worker failures. Pause/resume and manual refresh continued processing in one session. Average CPU about 331%, final memory 372 MiB, process peak about 1.50 GiB. Counts show processing, not accuracy. Earlier FR→EN runs also completed; cold starts previously lost processed audio, and gaming was affected.
 
-Automated baseline: **118 passing tests** plus successful source compilation. Synthetic tests do not close the live checks below. No new long stability recording was performed during review.
+Automated baseline: **122 passing tests** plus successful source compilation. Synthetic tests do not close the live checks below. No new long stability recording was performed during review.
 
 Startup investigation (2026-10-30): Windows confirmed a native Python access violation just after Start computer audio. Eight subsequent short starts completed with captions, translations, speaker labels and clean shutdown; the original failure has not been reproduced. Removed temporary self-capturing chat timer callbacks in favour of one owned timer and enabled persistent native traces. Treat this as an open intermittent defect until further live testing confirms stability.
 
@@ -116,9 +116,18 @@ The updated build then captured 11 seconds of computer audio, completed two capt
 | 8 — History | Current milestone complete | Normal-use checks and packaged migration validation |
 | 9 — Session speakers | Live labels implemented | Ground-truth 2/3/4+ speakers, merges/splits, similar voices, short turns, overlap/mixed chunks |
 | 10 — Remembered people | Management implemented; initial reuse observed | Confirm known/unknown voices across sessions; manager actions, quality filtering, false accepts/rejects |
-| 11 — Packaging | Not started | Windows package, first-run downloader, hash/file verification, disk/progress UI, clean-PC/offline tests, upgrades/uninstall preserving history |
+| 11 — Packaging | First executable-folder slice built and checked | First-run downloader/setup, download disk/progress UI, clean-PC and packaged live audio tests, installer/upgrades/uninstall, signing/licence review |
 
-Finish runtime quality/device tests before the full UI redesign, then display/stability checks and packaging. Include quiet/noisy/music/silence inputs, short/overlapping speech, deliberate overload, queued Stop/Close, crash recovery, deletion/migration/backups, and large history where relevant.
+Finish runtime quality/device tests before the full UI redesign and release. Include quiet/noisy/music/silence inputs, short/overlapping speech, deliberate overload, queued Stop/Close, crash recovery, deletion/migration/backups, and large history where relevant.
+
+## Stage 11 — Current build
+
+- Executable: `dist/LiveCaptionTranslation/LiveCaptionTranslation.exe`. Keep the entire folder, including `_internal` and `models`; no ZIP/installer was produced. Current folder is about 1.43 GiB with runtime models. No personal history, logs, caches, or profiles are bundled.
+- Build tools are pinned in requirements-build.txt, installed in .venv, with cache in .cache/pyinstaller. Rebuild with `.venv\Scripts\python.exe scripts\build_windows.py --include-models`; `--stage-models` adds matching models to an existing build without rebuilding.
+- Models are external to the frozen code, beside the executable. `--models PATH` or LIVE_CAPTION_MODELS_PATH selects another folder. The generated manifest verifies sizes and SHA-256 fingerprints; build metadata records runtime versions. The application does not download models automatically.
+- The executable passed `--self-check --verify-models --load-models`, including native libraries, SQLite, VAD inference, Whisper inference, both translation directions, and speaker-model loading. It also passed the GUI open/close smoke test with in-memory history/settings.
+- Repeated packaged checks from a different working directory with Python/Conda paths removed also passed. This is not a substitute for a clean-PC test without Python installed. No packaged live audio/stability run has been performed yet; the intermittent Start crash remains open.
+- Diagnostic reports are in `.cache/package-isolated/`. See `packaging/README.md` for commands, storage, upgrade preservation, and remaining release work. Approximately 1.5 GiB remains free on this drive after the build; leave the large generated folders local and avoid a duplicate archive for now.
 
 ## Deferred work
 

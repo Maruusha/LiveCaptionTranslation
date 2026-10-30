@@ -21,3 +21,7 @@ logs/
 # Local conversation history
 data/
 
+# Generated Windows distributions and bundler work files
+build/
+dist/
+
