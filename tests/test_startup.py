@@ -52,6 +52,9 @@ class FakeMicrophoneMonitor:
         self.warning_callback = warning_callback
         self.started = False
         self.stopped = False
+        self.paused = False
+        self.start_calls = 0
+        self.pause_calls = 0
         self.speech_event_callback = speech_event_callback
         self.speech_segment_callback = speech_segment_callback
         self.caption_callback = caption_callback
@@ -98,6 +101,12 @@ class FakeMicrophoneMonitor:
 
     def start(self) -> None:
         self.started = True
+        self.paused = False
+        self.start_calls += 1
+
+    def pause(self) -> None:
+        self.paused = True
+        self.pause_calls += 1
 
     def stop(self) -> None:
         self.stopped = True
@@ -293,6 +302,75 @@ def test_main_interface_choices_persist_between_windows() -> None:
     assert restored.conversation_sidebar.isHidden()
     assert restored.sidebar_toggle_button.text() == "Show conversations"
     restored.close()
+
+
+def test_audio_source_devices_and_overlay_visibility_persist() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    microphones = [
+        AudioDevice(
+            index=12,
+            name="Built-in Microphone",
+            host_api="Windows WASAPI",
+            max_input_channels=1,
+            default_sample_rate=48_000.0,
+            is_default=True,
+        ),
+        AudioDevice(
+            index=17,
+            name="USB Microphone",
+            host_api="Windows WASAPI",
+            max_input_channels=1,
+            default_sample_rate=48_000.0,
+        ),
+    ]
+    outputs = [
+        OutputAudioDevice("speaker-1", "Built-in Speakers", True),
+        OutputAudioDevice("speaker-2", "USB Headphones"),
+    ]
+
+    window = MainWindow(
+        device_provider=lambda: microphones,
+        output_device_provider=lambda: outputs,
+        interface_settings=settings,
+    )
+    window.microphone_selector.setCurrentIndex(1)
+    window.computer_audio_source_button.setChecked(True)
+    window.output_selector.setCurrentIndex(1)
+    window.overlay_toggle_button.setChecked(True)
+    window.close()
+
+    restored = MainWindow(
+        device_provider=lambda: microphones,
+        output_device_provider=lambda: outputs,
+        interface_settings=settings,
+    )
+
+    assert restored.computer_audio_source_button.isChecked()
+    assert restored.microphone_selector.currentData().name == "USB Microphone"
+    assert restored.output_selector.currentData().id == "speaker-2"
+    assert restored.overlay_toggle_button.isChecked()
+    assert restored.caption_overlay.isVisible()
+    restored.close()
+
+
+def test_missing_saved_audio_device_falls_back_to_connected_default() -> None:
+    create_application(["live-caption-translation-test"])
+    settings = MemorySettings()
+    settings.setValue("ui/audio_source", "computer_audio")
+    settings.setValue("ui/output_device_id", "disconnected-speaker")
+    settings.setValue("ui/output_device_name", "Disconnected Speaker")
+
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        output_device_provider=output_fixture,
+        interface_settings=settings,
+    )
+
+    assert window.computer_audio_source_button.isChecked()
+    assert window.output_selector.currentData().id == "speaker-1"
+    assert window.start_stop_button.isEnabled()
+    window.close()
 
 
 def test_microphone_controls_start_update_and_stop() -> None:
@@ -623,7 +701,9 @@ def test_pause_resume_reuses_session_and_preserves_audio_offsets() -> None:
     window.pause_resume_button.click()
     wait_until(lambda: window.runtime_state is RuntimeState.PAUSED)
 
-    assert monitors[0].stopped
+    assert monitors[0].paused
+    assert not monitors[0].stopped
+    assert monitors[0].pause_calls == 1
     assert history.get_session(session_id).status == "paused"
     assert window._active_history_session_id == session_id
     assert window.pause_resume_button.text() == "Resume"
@@ -633,8 +713,9 @@ def test_pause_resume_reuses_session_and_preserves_audio_offsets() -> None:
 
     window.pause_resume_button.click()
 
-    assert len(monitors) == 2
-    assert monitors[1].started
+    assert len(monitors) == 1
+    assert monitors[0].started
+    assert monitors[0].start_calls == 2
     assert window.runtime_state is RuntimeState.LIVE
     assert history.get_session(session_id).status == "live"
     assert window._active_history_session_id == session_id
@@ -643,8 +724,8 @@ def test_pause_resume_reuses_session_and_preserves_audio_offsets() -> None:
     window.caption_received.emit(
         TranslationResult(
             recognition=RecognitionResult(
-                start_sample=0,
-                end_sample=16_000,
+                start_sample=51_200,
+                end_sample=67_200,
                 text="After resume",
                 language="en",
                 language_probability=0.99,
@@ -664,8 +745,8 @@ def test_pause_resume_reuses_session_and_preserves_audio_offsets() -> None:
     window.pause_resume_button.click()
     wait_until(lambda: window.runtime_state is RuntimeState.PAUSED)
     window.stop_button.click()
-
-    assert window.runtime_state is RuntimeState.IDLE
+    wait_until(lambda: window.runtime_state is RuntimeState.IDLE)
+    assert monitors[0].stopped
     assert history.get_session(session_id).status == "completed"
     assert len(history.list_sessions()) == 1
     events = history._connection.execute(

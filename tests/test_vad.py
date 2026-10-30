@@ -68,6 +68,39 @@ def test_vad_worker_closes_active_speech_when_capture_stops() -> None:
     assert worker.stats.speech_ends == 1
 
 
+def test_vad_worker_keeps_timestamps_continuous_after_restart() -> None:
+    source = BoundedAudioFrameQueue(max_seconds=2.0)
+    events: list[SpeechEvent] = []
+    detector_runs = iter(
+        (
+            iter(({"start": 0},)),
+            iter(({"start": 0}, {"end": 800})),
+        )
+    )
+
+    def detector_factory():
+        results = next(detector_runs)
+        return lambda _samples: next(results)
+
+    worker = VoiceActivityWorker(
+        source_queue=source,
+        event_callback=events.append,
+        warning_callback=lambda _warning: None,
+        detector_factory=detector_factory,
+        min_segment_seconds=0.0,
+    )
+    source.put(np.ones(512, dtype=np.float32), sample_rate=16_000)
+    worker.start()
+    worker.stop()
+
+    source.put(np.ones(1_024, dtype=np.float32), sample_rate=16_000)
+    worker.start()
+    worker.stop()
+
+    assert [event.sample_index for event in events] == [0, 512, 512, 1_312]
+    assert worker.stats.processed_windows == 3
+
+
 def test_vad_worker_builds_a_read_only_completed_speech_segment() -> None:
     source = BoundedAudioFrameQueue(max_seconds=2.0)
     source.put(np.arange(1_024, dtype=np.float32), sample_rate=16_000)

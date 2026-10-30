@@ -115,6 +115,52 @@ def test_monitor_falls_back_to_another_backend(monkeypatch) -> None:
     monitor.stop()
 
 
+def test_monitor_pause_releases_capture_but_keeps_session_resumable(
+    monkeypatch,
+) -> None:
+    created_streams = []
+
+    class FakeInputStream:
+        def __init__(self, **settings) -> None:
+            self.settings = settings
+            self.samplerate = 48_000.0
+            self.stopped = False
+            self.closed = False
+            created_streams.append(self)
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(microphone.sd, "InputStream", FakeInputStream)
+    monitor = microphone.MicrophoneLevelMonitor(
+        12,
+        lambda _level: None,
+        lambda _warning: None,
+    )
+
+    monitor.start()
+    monitor.pause()
+
+    assert not monitor.is_running
+    assert created_streams[0].stopped
+    assert created_streams[0].closed
+    assert monitor.performance_report is not None
+
+    monitor.start()
+    assert monitor.is_running
+    assert len(created_streams) == 2
+
+    monitor.stop()
+    assert created_streams[1].stopped
+    assert created_streams[1].closed
+
+
 def test_monitor_joins_recognition_and_speaker_results_by_timestamp() -> None:
     monitor = microphone.MicrophoneLevelMonitor(
         12,

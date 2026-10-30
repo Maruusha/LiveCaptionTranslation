@@ -37,6 +37,7 @@ Yesterday                     Person B · 14:33
 - The conversation sidebar can be hidden and resized.
 - A separate movable, resizable, always-on-top overlay shows the latest caption. Its font, colours, opacity, click-through mode, size, and position are saved.
 - Display modes are original, translation, or both, and apply to existing bubbles too.
+- Safe interface choices persist between app runs, including the audio source and connected device, language and caption modes, chunk and sensitivity controls, speaker settings, sidebar, overlay visibility/appearance, and window layout. Capture never starts automatically.
 
 All speakers stay left-aligned by default. Two-sided alternating bubbles do not scale to many speakers. A later microphone-only action may let the user mark one speaker as **You** and place only that speaker on the right. The app must never guess that the first voice is the user.
 
@@ -116,8 +117,8 @@ Speaker analysis does not wait for recognition. The two results are joined by au
 - If audio overflows, drop the oldest unprocessed live audio so the app can catch up.
 - If final recognition overloads, show `[caption skipped: processing too slow]`; never fail silently.
 - Optional provisional work is the first work discarded under load.
-- **Pause** stops new audio, finishes already accepted final work, records a pause event, and keeps the same session open.
-- **Resume** appends to that session. The current lower-memory design reloads processing models on resume.
+- **Pause** stops new audio and finalizes the current VAD chunk, records a pause event, and keeps the same session open. Already accepted captions continue processing in the background.
+- **Resume** is available as soon as capture is paused; it appends to the same session without waiting for the caption queue or reloading Whisper, translation, or speaker models.
 - **Stop** drains accepted final work before completing the session.
 - Stop and close remain responsive and show remaining work plus an estimated finish time. The user may skip queued captions; a model call already running finishes safely.
 - Capture queues hold at most five seconds. Speech chunks have a user-selected 5–60 second maximum, default 30 seconds. Silence may finish them earlier.
@@ -259,7 +260,7 @@ Remaining: browser video, local player, voice call, game, device switch/disconne
 
 ### Stage 6 — Session controls
 
-**Implemented; loaded live tests pending.** Pause/resume/stop use the explicit state machine, preserve one history session and continuous offsets, record events, and remain responsive while accepted captions finish. Application exit is now explicit: transient finishing dialogs cannot make Qt quit, and only an accepted main-window close requests process exit. Automated coverage includes repeated transitions, stop from paused, and Stop returning to a visible idle window. The game-load clean-stop case still needs improvement or a successful retest.
+**Implemented; loaded live tests pending.** Pause stops capture without waiting for queued captions, which continue processing while paused or after immediate Resume. The same pipeline stays alive so models and session-speaker clusters are reused. Pause/resume/stop preserve one history session and continuous offsets, record events, and remain responsive while accepted captions finish. Application exit is explicit: transient finishing dialogs cannot make Qt quit, and only an accepted main-window close requests process exit. Automated coverage includes repeated transitions, stop from paused, and Stop returning to a visible idle window. The game-load clean-stop case still needs improvement or a successful retest.
 
 ### Stage 7 — Chat interface and overlay
 
@@ -304,7 +305,7 @@ Planned: Windows package, first-run model downloader, file verification, disk-sp
 - High-DPI and multiple-monitor overlay behavior.
 - Offline operation, CPU-only operation, and later a supported GPU computer.
 
-Current automated baseline after explicit Stop-versus-Exit handling: 101 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
+Current automated baseline after persistent interface settings: 105 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
 
 ## Deferred and distant-future work
 

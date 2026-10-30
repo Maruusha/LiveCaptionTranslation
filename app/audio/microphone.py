@@ -237,12 +237,35 @@ class MicrophoneLevelMonitor:
 
     def stop(self) -> None:
         """Stop and release the microphone stream."""
+        stop_error = self._close_input_stream()
+        pipeline_error = self._stop_pipeline()
+        stop_error = stop_error or pipeline_error
+
+        self._log_capture_summary()
+
+        if stop_error is not None:
+            raise MicrophoneCaptureError(
+                "The microphone did not stop cleanly."
+            ) from stop_error
+
+    def pause(self) -> None:
+        """Pause capture while queued captions continue processing."""
+        stop_error = self._close_input_stream()
+        pipeline_error = self._pause_pipeline()
+        stop_error = stop_error or pipeline_error
+        if stop_error is not None:
+            raise MicrophoneCaptureError(
+                "The microphone did not pause cleanly."
+            ) from stop_error
+        logger.info("Microphone capture paused; caption workers remain active")
+
+    def _close_input_stream(self) -> Exception | None:
         stream = self._stream
         self._stream = None
         self.active_device_index = None
         self._active_sample_rate = None
         if stream is None:
-            return
+            return None
 
         stop_error: Exception | None = None
         try:
@@ -253,16 +276,7 @@ class MicrophoneLevelMonitor:
             stream.close()
         except Exception as error:
             stop_error = stop_error or error
-
-        pipeline_error = self._stop_pipeline()
-        stop_error = stop_error or pipeline_error
-
-        self._log_capture_summary()
-
-        if stop_error is not None:
-            raise MicrophoneCaptureError(
-                "The microphone did not stop cleanly."
-            ) from stop_error
+        return stop_error
 
     def cancel_pending_captions(self) -> int:
         """Discard queued recognition and translation jobs."""
@@ -298,8 +312,9 @@ class MicrophoneLevelMonitor:
         self.audio_buffer.put(mono_samples, sample_rate=sample_rate)
 
     def _start_pipeline(self) -> None:
-        self._performance_start = take_process_snapshot()
-        self.last_performance_report = None
+        if self._performance_start is None:
+            self._performance_start = take_process_snapshot()
+            self.last_performance_report = None
         if self.translation_worker is not None:
             self.translation_worker.start()
         if self.recognition_worker is not None:
@@ -309,6 +324,21 @@ class MicrophoneLevelMonitor:
         if self.voice_activity_worker is not None:
             self.voice_activity_worker.start()
         self.processing_worker.start()
+
+    def _pause_pipeline(self) -> Exception | None:
+        """Flush accepted audio but leave caption-model workers running."""
+        stop_error: Exception | None = None
+        try:
+            self.processing_worker.stop()
+        except AudioProcessingError as error:
+            stop_error = error
+
+        if self.voice_activity_worker is not None:
+            try:
+                self.voice_activity_worker.stop()
+            except VoiceActivityError as error:
+                stop_error = stop_error or error
+        return stop_error
 
     def _stop_pipeline(self) -> Exception | None:
         stop_error: Exception | None = None
