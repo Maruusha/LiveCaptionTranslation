@@ -78,7 +78,10 @@ def test_pending_recognition_can_be_cancelled_during_shutdown() -> None:
     assert worker.stats.queued_segments == 0
     assert worker.stats.failed_segments == 2
     assert all(result.skipped for result in results)
-    assert all("closed before processing" in result.text for result in results)
+    assert all("processing cancelled" in result.text for result in results)
+    assert not worker.submit(speech_segment(start=4_000))
+    assert worker.stats.queued_segments == 0
+    assert results[-1].skipped
 
 
 def test_recognition_worker_uses_a_manual_language() -> None:
@@ -103,5 +106,24 @@ def test_recognition_worker_uses_a_manual_language() -> None:
     worker.stop()
 
     assert results[0].language == "fr"
+
+
+def test_model_load_failure_also_rejects_later_chunks_without_stranding_them() -> None:
+    results = []
+
+    def fail_to_load():
+        raise RuntimeError("Missing local model")
+
+    worker = RecognitionWorker(results.append, lambda _warning: None,
+                               model_factory=fail_to_load)
+    worker.submit(speech_segment())
+    worker.start()
+    worker.stop()
+    assert not worker.submit(speech_segment(start=2_000))
+
+    assert len(results) == 2
+    assert all(result.error for result in results)
+    assert worker.stats.queued_segments == 0
+    assert worker.stats.failed_segments == 2
 
 

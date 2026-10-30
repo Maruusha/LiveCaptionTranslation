@@ -1,6 +1,7 @@
 """Tests for level-only microphone capture."""
 
 import numpy as np
+from dataclasses import replace
 
 from app.audio import microphone
 from app.speakers.identification import SpeakerIdentification
@@ -201,4 +202,14 @@ def test_monitor_joins_recognition_and_speaker_results_by_timestamp() -> None:
     monitor._handle_speaker_result(speaker)
 
     assert submitted == [(recognition, speaker)]
+
+    submitted.clear()
+    later_recognition = replace(recognition, start_sample=32_000, end_sample=48_000)
+    later_speaker = replace(speaker, start_sample=32_000, end_sample=48_000)
+    monitor._handle_recognition_result(recognition)
+    monitor._handle_recognition_result(later_recognition)
+    monitor._handle_speaker_result(later_speaker)
+    assert submitted == []
+    monitor._handle_speaker_result(speaker)
+    assert submitted == [(recognition, speaker), (later_recognition, later_speaker)]
 

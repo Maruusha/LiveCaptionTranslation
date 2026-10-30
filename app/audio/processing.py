@@ -48,6 +48,7 @@ class AudioProcessingWorker:
         self._input_seconds = 0.0
         self._output_frames = 0
         self._output_seconds = 0.0
+        self._error: Exception | None = None
 
     @property
     def is_running(self) -> bool:
@@ -58,6 +59,7 @@ class AudioProcessingWorker:
             return
 
         self._stop_event.clear()
+        self._error = None
         self._thread = Thread(
             target=self._run,
             name="audio-processing-worker",
@@ -65,7 +67,7 @@ class AudioProcessingWorker:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 3.0) -> None:
+    def stop(self, timeout: float | None = 3.0) -> None:
         """Drain already accepted input, flush resampling, and stop."""
         thread = self._thread
         if thread is None:
@@ -76,6 +78,8 @@ class AudioProcessingWorker:
         if thread.is_alive():
             raise AudioProcessingError("The audio processing worker did not stop.")
         self._thread = None
+        if self._error is not None:
+            raise AudioProcessingError("Audio processing failed.") from self._error
 
     @property
     def stats(self) -> AudioProcessingStats:
@@ -131,6 +135,7 @@ class AudioProcessingWorker:
                     last_capture_time,
                 )
         except Exception as error:
+            self._error = error
             self._warning_callback(f"Audio processing stopped: {error}")
 
     def _create_resampler(

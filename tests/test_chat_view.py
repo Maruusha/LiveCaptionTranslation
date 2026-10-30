@@ -110,3 +110,23 @@ def test_scroll_to_bottom_moves_to_newest_message() -> None:
     assert scrollbar.value() == scrollbar.maximum()
     chat.close()
 
+
+def test_history_reload_does_not_apply_stale_scroll_after_switching() -> None:
+    application = create_application(["live-caption-translation-test"])
+    chat = CaptionChatView()
+    chat.resize(360, 240)
+    chat.show()
+    chat.begin_reload()
+    for index in range(30):
+        chat.add_message(original_text=f"Long history {index}", source_language="en")
+    chat.finish_reload(scroll_position=500)
+    # A second conversation is selected before the old deferred layout runs.
+    chat.begin_reload()
+    chat.add_message(original_text="Other conversation", source_language="en")
+    chat.finish_reload(scroll_position=0)
+    application.processEvents()
+    application.processEvents()
+    assert len(chat.messages) == 1
+    assert chat.verticalScrollBar().value() == 0
+    chat.close()
+

@@ -1,323 +1,131 @@
 # Local French ↔ English Live Captions
 
-## Goal
+Updated: 2026-10-30. Current branch: `feat/packaging`. Packaging has not started.
 
-Build a Windows desktop application that runs locally, listens to a microphone or computer output, captions French and English speech, translates between them, identifies speakers when possible, and saves conversations for later reading.
+## Goal and rules
 
-Core rules:
+A Windows desktop app for local microphone/computer-audio captions, French ↔ English translation, optional speaker labels, and saved conversations.
 
-- Work offline after models are downloaded.
-- Keep audio, captions, translations, and voice signatures local.
-- Do not save raw audio by default.
-- Save every final caption to local history; the user may delete it afterward.
-- Build and verify one stage at a time.
-- Keep packages, environments, models, caches, and helper tools inside the project whenever possible.
+- Run offline after models are installed. Keep audio, text, and voice signatures local; do not save raw audio by default.
+- Save every final caption and visible skip/error to history; users can delete conversations afterward.
+- Work and verify in small stages. Finish major runtime validation before the WhatsApp-inspired UI redesign, then package the app.
+- Use project-local environments, packages, models, caches, and helpers. Use `.venv`; use local `.conda` only if needed. Do not install globally.
+- Keep one Whisper worker: multiple workers previously harmed game performance on this PC.
+- Make Git changes only when requested. Keep the current branch, main, and develop locally.
 
-## User experience
+## Stack and files
 
-The main window uses a familiar chat layout:
-
-```text
-Conversations                 Selected conversation
--------------------------     --------------------------------
-Live conversation             Person A · 14:32
-Today                         FR: Bonjour
-  French lesson               EN: Hello
-  Team meeting
-Yesterday                     Person B · 14:33
-  Game dialogue               EN: How are you?
-                              FR: Comment allez-vous ?
-```
-
-- Saved conversations appear on the left, newest first, with search, manual refresh, date groups, preview, and status. Manual refresh preserves the selected conversation and both reading/list scroll positions.
-- The selected live or saved conversation appears on the right.
-- Completed turns appear as message bubbles with time, speaker, original text, and translation.
-- New messages scroll into view only when the user is already near the bottom; **To bottom** jumps to the newest message.
-- **Clear screen** clears only the visible captions, never saved history.
-- The conversation sidebar can be hidden and resized.
-- A separate movable, resizable, always-on-top overlay shows the latest caption. Its font, colours, opacity, click-through mode, size, and position are saved.
-- Display modes are original, translation, or both, and apply to existing bubbles too.
-- Safe interface choices persist between app runs, including the audio source and connected device, language and caption modes, chunk and sensitivity controls, speaker settings, sidebar, overlay visibility/appearance, and window layout. Capture never starts automatically.
-
-All speakers stay left-aligned by default. Two-sided alternating bubbles do not scale to many speakers. A later microphone-only action may let the user mark one speaker as **You** and place only that speaker on the right. The app must never guess that the first voice is the user.
-
-## Technology and local storage
-
-| Part | Choice |
+| Component | Current choice |
 |---|---|
-| Interface | PySide6 |
-| Microphone | sounddevice |
-| Computer output | SoundCard with Windows WASAPI loopback |
-| Voice activity | Silero VAD |
-| Recognition | faster-whisper small, CPU INT8 |
-| Translation | Marian OPUS-MT through CTranslate2, CPU INT8 |
-| Speaker detection | sherpa-onnx with local segmentation and embedding models |
-| History | SQLite with WAL and FTS5 |
-| Packaging | PyInstaller, later |
+| UI | PySide6 widgets |
+| Microphone / computer output | sounddevice / SoundCard WASAPI loopback |
+| Conversion / speech detection | soxr to mono 16 kHz / package-bundled Silero ONNX VAD |
+| Captions | faster-whisper small, CPU INT8, four CPU threads, one worker |
+| Translation | Marian OPUS-MT FR→EN and EN→FR through CTranslate2 INT8 |
+| Live speaker labels | sherpa-onnx TitaNet embeddings, one CPU thread |
+| Offline speaker diagnostic | sherpa-onnx segmentation + embeddings, two CPU threads |
+| History | SQLite, WAL, FTS5, schema version 3 |
+| Packaging | PyInstaller planned |
 
-Project-local layout:
+Direct dependencies are pinned in requirements.txt; test tools are in requirements-dev.txt. CTranslate2 is explicitly pinned. Speaker model sources/hashes are in app/speakers/MODELS.md.
 
 ```text
-.venv/                 Python environment
-.cache/                Download and test caches
-models/speech/         Speech-recognition models
-models/translation/    Translation models
-models/speakers/       Speaker models and evaluation sample
-vendor/ or tools/      Future bundled native helpers
-data/history.sqlite3   Local conversation history
+.venv/                 Local Python environment
+.cache/                Package/download/test caches
+models/speech/         faster-whisper-small
+models/translation/    OPUS-MT CTranslate2 INT8, both directions
+models/speakers/       TitaNet, segmentation model, evaluation sample
+data/history.sqlite3   Conversations and speaker data
 logs/application.log   Rotating diagnostics
+vendor/ or tools/      Future bundled helpers
 ```
 
-Do not install packages globally. Use `.venv/`; only use a project-local `.conda/` if Conda becomes necessary. Large environments, models, caches, logs, data, and generated binaries stay out of Git.
+These generated/local directories stay outside Git. UI settings use Qt's application configuration directory unless LIVE_CAPTION_SETTINGS_PATH overrides it; LIVE_CAPTION_HISTORY_PATH overrides history. Tests use in-memory stores.
 
-The Git executable supplied by GitHub Desktop on this development computer was recorded as:
+GitHub Desktop Git on this PC: `C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe`.
+Locate the newest app-* copy after Desktop updates; never hardcode it in the application.
+
+Run: `.venv\Scripts\python.exe -m app.main`.
+Test: `.venv\Scripts\python.exe -m pytest`.
+
+## Processing and controls
 
 ```text
-C:\Users\duong\AppData\Local\GitHubDesktop\app-3.6.3\resources\app\git\cmd\git.exe
+Microphone OR selected computer output
+  → bounded native queue → mono 16 kHz → bounded processed queue
+  → Silero VAD → completed speech chunks
+      ├→ one Whisper worker ──────────┐
+      └→ optional speaker embedding ─┤
+                       ordered timestamp join
+                         → FR/EN language gate
+                         → translation → UI + SQLite
 ```
 
-GitHub Desktop may change the `app-*` directory after an update, so locate its newest copy if that path no longer exists. Do not build this machine-specific path into the application.
-
-## Audio and processing design
-
-Only one source is active at a time:
-
-- **Microphone:** any currently connected Windows input device.
-- **Computer audio:** the full selected speaker or headphone output through WASAPI loopback. This covers most browsers, media players, calls, and games. Protected media or unusual drivers may require a virtual audio cable. Per-application capture is deferred.
-
-Current caption path:
-
-```text
-Microphone or computer output
-  → bounded native-audio queue
-  → mono 16 kHz conversion
-  → bounded processed-audio queue
-  → Silero VAD and completed speech chunk
-  → one faster-whisper worker
-  → French/English language gate
-  → bounded Marian translation queue
-  → display and SQLite history
-```
-
-Optional speaker path, enabled by the user:
-
-```text
-Timestamped audio
-  ├→ VAD → Whisper ──────────────┐
-  └→ speaker analysis in parallel ├→ timestamp alignment → message
-                                  ┘
-```
-
-Speaker analysis does not wait for recognition. The two results are joined by audio timestamps before translation and saving. It is disabled by default because it adds CPU work.
-
-### Bounded queues and stopping
-
-- The audio callback must never wait for a model, database, or interface.
-- Every background queue has a fixed item or duration limit.
-- If audio overflows, drop the oldest unprocessed live audio so the app can catch up.
-- If final recognition overloads, show `[caption skipped: processing too slow]`; never fail silently.
-- Optional provisional work is the first work discarded under load.
-- **Pause** stops new audio and finalizes the current VAD chunk, records a pause event, and keeps the same session open. Already accepted captions continue processing in the background.
-- **Resume** is available as soon as capture is paused; it appends to the same session without waiting for the caption queue or reloading Whisper, translation, or speaker models.
-- **Stop** drains accepted final work before completing the session.
-- Stop and close remain responsive and show remaining work plus an estimated finish time. The progress view can be hidden while processing continues. The user may explicitly skip queued captions; a model call already running finishes safely.
-- Capture queues hold at most five seconds. Speech chunks have a user-selected 5–60 second maximum, default 30 seconds. Silence may finish them earlier.
-- A distant-future option may adapt the chunk limit to available RAM and model size.
-
-The explicit runtime states are `idle`, `starting`, `live`, `pausing`, `paused`, `resuming`, `stopping`, and `error`. SQLite session statuses are separate: `live`, `paused`, `incomplete`, and `completed`. On startup, sessions left `live` or `paused` by a crash become `incomplete`.
-
-## Language behavior
-
-The active modes are:
-
-1. **Automatic:** Whisper detects the language for each final phrase.
-2. **French:** treat input as French and translate to English.
-3. **English:** treat input as English and translate to French.
-
-Only normalized `fr` and `en` results enter translation. Other or unknown languages remain visible as original-only captions and count as unsupported, not failed. Manual modes help with short phrases, names, and mixed-language speech.
-
-Language-dependent components use language codes and separate recognition and translation interfaces so another pair does not require rebuilding audio, chat, history, or speaker code. French ↔ Vietnamese is explicitly distant future; do not add its models or interface yet.
-
-## Temporary and final captions
-
-The current implementation shows final VAD chunks only. A later slice may add rolling previews:
-
-- Open one temporary bubble at speech start.
-- Update that same bubble from periodic recognition snapshots.
-- Do not translate, save, search, or export temporary revisions.
-- At speech end, replace it with one final recognition, then translate and save it.
-- Use a stable message ID so preview and final text never create duplicate bubbles.
-- A later speaker result may update the final bubble’s label without changing its ID.
-- If final recognition fails, show a clear failure marker rather than invented text.
-
-This is automatic correction during recognition, not user editing. Manual caption editing is distant future.
-
-## Speakers
-
-Session labels are `Person A` through `Person Z`, then `Person AA`, `Person AB`, and onward. There is no application-level speaker cap; practical accuracy and capacity depend on audio and hardware.
-
-Recommended session rule:
-
-1. VAD provides clear speech.
-2. The speaker model creates a voice embedding.
-3. Compare it with several good signatures for current-session speakers.
-4. Reuse an existing label only for a strong match.
-5. Keep uncertain speech as `Unknown`.
-6. Create a new person only after enough clear speech supports a new voice.
-7. Do not update profiles from very short, noisy, musical, or overlapping audio.
-
-Use separate match and new-person thresholds to prevent rapid label switching. Labels and colours remain stable inside a session but reset next session by default.
-
-Overlapping voices are much harder because they are mixed. The first release should flag overlap and use `Unknown / overlapping` when assignment is uncertain. Perfect separation is not required. Local voice separation is deferred.
-
-### Remembered people
-
-Cross-session recognition is opt-in only:
-
-- Create a permanent person only after **Remember this person**.
-- A user may name, rename, merge, forget, disable, or delete that profile.
-- A session-only name does not create a permanent identity.
-- Keep several approved high-quality signatures, not raw audio.
-- A voice match is a best guess, never proof of identity.
-- **Forget voice** removes approved signatures and old identity links while preserving messages and original session labels.
-- Deleting a profile also preserves old conversation text and labels.
-
-## History database
-
-SQLite stores timestamps in UTC; the UI converts them to local time.
-
-| Table | Purpose |
-|---|---|
-| `persons` | Opt-in reusable profiles and user-defined names |
-| `person_voice_signatures` | Approved cross-session embeddings and model metadata |
-| `sessions` | Title, times, status, source, language mode, and model settings |
-| `session_events` | Pause, resume, device changes, and stop |
-| `session_persons` | Temporary label, colour, optional profile link, and `You` flag |
-| `session_voice_signatures` | Session-only embeddings for stable labels |
-| `messages` | Timing, speaker, language, caption, translation, warning, and overlap data |
-
-Rules:
-
-- Create the session when capture starts and save every final or warning caption immediately.
-- Never place raw audio in the database.
-- Search titles, original captions, and translations with FTS5.
-- A conversation delete cascades through its messages, events, session people, and session signatures.
-- An approved person signature survives conversation deletion; only its provenance link becomes null.
-- Delete-all preserves an active live or paused session.
-- Use schema versions, ordered migrations, transactions, indexes, foreign keys, and a pre-migration backup.
-- Run a lightweight integrity check and never silently replace or repair a damaged database.
-- The **Maintain** action checks integrity, optimizes, and vacuums only when healthy.
-
-## Diagnostics and performance
-
-The simple performance view shows duration, average process CPU, current memory, memory change, process peak, VAD timing, queue counts, failures, and translation totals. Graphs and detailed historical metrics are deferred.
-
-Diagnostic logging rules:
-
-- Write to the terminal and `logs/application.log`.
-- Rotate each file at 2 MiB.
-- Keep four files total: current plus `.1`, `.2`, and `.3` backups, about 8 MiB maximum.
-- Log startup, shutdown, device changes, queue drops, model warnings, and errors.
-- Never log raw audio, caption text, conversation text, voice signatures, or secrets.
-
-Keep one Whisper worker for now. A two-worker experiment harmed game performance on this computer and cannot be validated safely here. Revisit parallel workers and automatic scaling only on stronger hardware.
-
-Future manual presets may be **Fast**, **Balanced**, and **Accurate**. Automatic PC inspection and model selection by CPU, RAM, and GPU are distant-future work.
-
-## Development stages
-
-Each stage needs automated tests plus proportional live CPU, RAM, disk, latency, and behavior checks before it is closed.
-
-### Stage 0 — Local foundation
-
-Implemented: project-local environment, application shell, logging, and test setup. A formal idle baseline can be refreshed when packaging work begins.
-
-### Stage 1 — Microphone capture
-
-Implemented: device discovery, selection preservation, capture, mono conversion, level meter, bounded queues, disconnection handling, and performance summary.
-
-Remaining: a 30-minute live stability run without growing memory, freezing, or unexpected device loss.
-
-### Stage 2 — Voice activity detection
-
-**Complete for the basic milestone (2026-10-22).** Silero VAD runs locally with a sensitivity slider, 400 ms end silence, 100 ms padding, 200 ms minimum segment, and safe chunk splitting. A 429-second live run produced 43 starts, 43 ends, and 43 chunks with no audio-queue loss. VAD used about 3.53% of real time.
-
-Later tuning: compare 400 ms with about 700 ms end silence. Aim for useful 3–8 second turns without confusing this with the maximum chunk length.
-
-### Stage 3 — French and English recognition
-
-**Complete for the basic milestone (2026-10-22).** faster-whisper 1.2.1 uses the project-local multilingual small model, CPU INT8, four CPU threads, one worker, and an eight-item queue. The 429-second live run completed 41 of 43 jobs; two were visibly skipped during a dense burst. Recognition took about 5–12 seconds per caption on this computer. This completion rate is not transcription accuracy.
-
-### Stage 4 — French ↔ English translation
-
-**Implementation complete; live quality testing pending.** Project-local OPUS-MT English→French and French→English models run through CTranslate2 INT8. Model loading measured about 0.36–0.41 seconds and a small smoke translation about 0.04 seconds. Test accents, names, numbers, punctuation, longer speech, direction switching, automatic-language mistakes, offline use, and live resource cost.
-
-### Stage 5 — Computer-output capture
-
-**In progress.** WASAPI loopback uses the same caption pipeline as the microphone. Initial browser/game-style runs proved capture and device handling, but the game test averaged about 244% process CPU, ended near 689 MiB, peaked near 1.29 GiB, sometimes reduced the game to 15 FPS, and lost processed audio during slow model startup. One active recognition also exceeded the 60-second stop timeout, so that session correctly became incomplete.
-
-Remaining: browser video, local player, voice call, game, device switch/disconnect, French/English quality, long-run queues, repaired memory reporting, and clean stop/close tests.
-
-### Stage 6 — Session controls
-
-**Implemented; loaded live tests pending.** Pause stops capture without waiting for queued captions, which continue processing while paused or after immediate Resume. The same pipeline stays alive so models and session-speaker clusters are reused. Pause/resume/stop preserve one history session and continuous offsets, record events, and remain responsive while accepted captions finish. Application exit is explicit: transient finishing dialogs cannot make Qt quit, and only an accepted main-window close requests process exit. Automated coverage includes repeated transitions, stop from paused, and Stop returning to a visible idle window. The game-load clean-stop case still needs improvement or a successful retest.
-
-### Stage 7 — Chat interface and overlay
-
-**Implemented foundation; physical-display tests pending.** The chat, saved choice restoration, collapsible sidebar, overlay, styling controls, click-through, and layout regression checks are present.
-
-Remaining: high-DPI, multiple-monitor, windowed/borderless game, and full-pipeline responsiveness tests. Automatic speaker colours, `You`, and temporary-to-final bubble replacement belong to later slices.
-
-### Stage 8 — Local history and recovery
-
-**Complete (2026-10-25).** Schema version 3 provides immediate caption persistence, crash recovery, pause/resume events, sidebar/history reading, indexed search, rename, confirmed deletion, maintenance, migrations, backups, cascade rules, speaker-profile links, and large-history tests.
-
-### Stage 9 — Multiple speakers in one session
-
-**In progress; first live integration implemented.** sherpa-onnx 1.12.33 and project-local INT8 segmentation plus TitaNet embedding models are installed. The isolated wrapper provides unlimited labels, diarization, timestamp assignment, and conservative unknown/overlap results. The 16-second public two-speaker sample found two speakers and four turns in 0.488 seconds after a 0.231-second load, ending near 171 MiB.
-
-An optional, bounded speaker-embedding worker now runs beside Whisper, keeps up to five signatures per session speaker, joins results by sample timestamps, and saves session people/signatures. Pause/resume restores the existing clusters and Person indices. A saved **Voice match** setting maps levels 1–9 to similarity thresholds 0.49–0.81; the default balanced level is the original 0.65 threshold. Live statistics show model load, labelled, unknown, queued, failed, and total speaker-processing values. It remains disabled by default. Next: test combined CPU/RAM, delay, merges, splits, overlap, threshold behavior, and 2/3/4+ real speakers before treating live diarization as complete.
-
-### Stage 10 — Remembered people
-
-**Local management slice implemented.** When speaker detection is enabled, the user can right-click a labelled message and choose **Remember or rename speaker…**. Only that explicit action creates a permanent person and copies up to five session signatures. Later sessions load approved profiles and can show the saved name for a strong, unambiguous voice match. Short speech stays `Unknown`, and the feature is disabled by default.
-
-The **Remembered people** manager lists profile status, signature count, and linked-session count. It supports rename, recognition enable/disable, merge, **Forget voice**, and profile deletion. Forget and delete restore the original session Person labels while retaining conversation text. Merging keeps the strongest five distinct signatures and updates linked messages to the chosen name. Management is disabled during live capture so a running worker cannot immediately relink a profile the user just removed; it is available while idle or paused.
-
-Remaining: stronger quality filtering, an optional candidate-confirmation period before creating a new Person label, and real false-accept/false-reject testing with similar voices.
-
-### Stage 11 — Packaging and offline setup
-
-Planned: Windows package, first-run model downloader, file verification, disk-space/progress display, offline verification, upgrades, uninstall, and history preservation.
-
-## Test checklist
-
-- French and English microphone speech, accents, names, numbers, and punctuation.
-- Quiet/loud speech, short phrases, noise, music, and silence.
-- French/English speakers taking turns and overlapping.
-- More than two speakers with stable labels.
-- Browser, local-player, call, and game output.
-- Speaker/headphone changes and disconnections.
-- Repeated pause/resume; stop/close with queued work.
-- Deliberate overload and visible skipped-caption messages.
-- Crash recovery from live and paused sessions.
-- Migration, interrupted write, backup copy, deletion rules, and large history.
-- High-DPI and multiple-monitor overlay behavior.
-- Offline operation, CPU-only operation, and later a supported GPU computer.
-
-Current automated baseline after useful finishing-dialog actions: 109 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
-
-## Deferred and distant-future work
-
-- Separate overlapping voices locally.
-- Capture one chosen application instead of all computer output.
-- Manually correct speaker assignments, captions, and translations.
-- Export Markdown, plain text, SRT, and VTT.
-- Keyboard shortcuts and optional consent-based audio recording.
-- Settings import/export and user-managed database backup/restore.
-- Advanced model manager, updates, rollback, and portable builds.
-- Performance graphs and long-session metrics.
-- macOS and Linux support.
-- Terminology lists.
-- Automatic hardware inspection, model choice, chunk sizing, and Whisper worker scaling.
-- French ↔ Vietnamese after the French ↔ English application is stable. Reuse the existing pipeline and add only the `vi` models, language choices, font checks, and Vietnamese-specific tests at that time.
+- Only one source is active. Computer audio covers the selected speaker/headphone endpoint: browsers, players, calls, games. Protected media/unusual drivers may need a virtual cable. Per-app capture is future work.
+- Audio queues hold five seconds each; recognition, speaker, and translation queues hold eight jobs each. Overflow drops old unprocessed audio or creates a visible skipped-caption/translation warning.
+- Speech chunks: user maximum 5–60 seconds, default 30; silence can finish sooner. Silero defaults: threshold 0.5, 400 ms end silence, 100 ms padding, 200 ms minimum segment. Sensitivity adjusts the threshold.
+- Caption results preserve audio order through speaker joining and translation, including warnings/unsupported languages. Drain worker/UI handoff before closing a session.
+- Automatic mode detects each chunk's language. Manual French/English modes force the source. Translate only normalized fr/en; keep other languages original-only and count them as unsupported.
+- Pause stops capture and finalizes VAD audio. Caption queues keep processing. Resume reuses the session, models, and speaker clusters without waiting for caption queues. Cold VAD loading can still delay the initial pause boundary.
+- Stop drains work in the background. Show queue counts and an approximate time. **Hide progress** or X hides the dialog; **Skip remaining** cancels queued work while an active model call finishes safely.
+- Shutdown waits for actual pipeline completion instead of releasing the session after a fixed model timeout. Audio/VAD failures mark it incomplete. Stop keeps the app open; accepted main-window close requests exit.
+- Runtime states: idle, starting, live, pausing, paused, resuming, stopping, error. Database statuses: live, paused, incomplete, completed. Startup recovers interrupted live/paused sessions as incomplete.
+
+## UI and speaker behavior
+
+- Saved conversations on the left: newest first, search, date/preview/status, rename, delete/delete-all, maintenance, manual Refresh. Messages on the right show speaker, time, original, and translation.
+- Refresh preserves selection, search, and both scroll positions. Follow new messages only when already near the bottom; **To bottom** jumps to the latest. Clear screen affects visible captions only.
+- Persist source/device, language/display modes, chunk/sensitivity/voice-match controls, speaker detection, window/sidebar layout, and overlay appearance/visibility/geometry. Never start capture automatically; missing devices fall back to available ones.
+- Overlay: movable, resizable, always on top; configurable font, colours, opacity, click-through. DPI/multiple-monitor/game checks remain open.
+- Keep speakers left-aligned. Labels continue Person A…Z, AA, AB… without an application-level cap. A future explicit **You** action may right-align one speaker; never assume the first voice is the user.
+- Detection is optional, initially off, and restored if previously enabled. Compare each chunk with up to five signatures per session speaker and approved remembered profiles. Voice match 1–9 maps to similarity 0.49–0.81; default 5 = 0.65. Speech shorter than 0.8 seconds stays Unknown.
+- **Live limitation:** one embedding/label per chunk. Live mode does not reliably split speaker changes within a chunk or flag overlap. The separate offline diagnostic supports timeline analysis. Mixed-chunk handling, overlap flags, quality filtering, candidate confirmation, and false-match tuning remain unfinished.
+- Create a permanent person only through **Remember or rename speaker…**. Manager actions: rename, recognition enable/disable, merge, Forget voice, delete. Voice matching is a guess, never identity proof.
+- Management works idle or after paused caption work drains. Workers reload approved changes before the next chunk. Forget/delete keep conversation text and restore Person labels. Merge keeps up to five distinct signatures. Session signatures can refresh an approved profile; stronger quality filtering remains pending.
+- Current captions are final chunks only. Future previews must update one stable bubble, avoid saving/translating revisions, and replace it with final text. Manual editing is separate future work.
+
+## History, logging, and performance
+
+- Tables: sessions, session_events, messages, session_persons, session_voice_signatures, persons, person_voice_signatures. Store UTC; display local time. Pause/resume preserve continuous audio offsets.
+- FTS5 searches caption/translation text alongside title search. Closed-session deletion cascades through session data. Approved signatures survive conversation deletion with null provenance; delete-all preserves active sessions.
+- Use transactions, foreign keys, indexes, ordered migrations, pre-migration backups, and quick integrity checks. Never silently replace damaged history. Maintain checks/optimizes/vacuums healthy databases.
+- Log to terminal and logs/application.log: four files total (current + three backups), 2 MiB each, about 8 MiB total. Native crash tracing follows the current log across rotation. Include lifecycle, device changes, manual refresh, drops, warnings, timings. Never log raw audio, caption text, signatures, or secrets.
+- Simple stats cover wall duration, average process CPU, memory/change/process peak, VAD timing, queues, captions, translations, speakers. CPU above 100% reflects multiple cores; peak memory belongs to the entire process.
+- Review improvements: remove full saved-history scans per live caption; batch history rendering; limit meter updates to 20 Hz; remove old pause-dialog/offset/fallback code; clean up Qt test windows on the GUI thread after each test.
+
+Latest completed live run (2026-10-30): 67 chunks, 65 English→French captions/translations, one overload skip and one user skip; zero translation failures/audio-queue drops. Speaker results: 63 labelled, four Unknown, zero worker failures. Pause/resume and manual refresh continued processing in one session. Average CPU about 331%, final memory 372 MiB, process peak about 1.50 GiB. Counts show processing, not accuracy. Earlier FR→EN runs also completed; cold starts previously lost processed audio, and gaming was affected.
+
+Automated baseline: **118 passing tests** plus successful source compilation. Synthetic tests do not close the live checks below. No new long stability recording was performed during review.
+
+Startup investigation (2026-10-30): Windows confirmed a native Python access violation just after Start computer audio. Eight subsequent short starts completed with captions, translations, speaker labels and clean shutdown; the original failure has not been reproduced. Removed temporary self-capturing chat timer callbacks in favour of one owned timer and enabled persistent native traces. Treat this as an open intermittent defect until further live testing confirms stability.
+
+The updated build then captured 11 seconds of computer audio, completed two captions/translations/speaker results with zero failures or dropped audio, and stopped while leaving the app open.
+
+## Stages and remaining work
+
+| Stage | Status | Remaining |
+|---|---|---|
+| 0 — Foundation | Implemented | Refresh idle baseline for packaging |
+| 1 — Microphone | Implemented | 30-minute stability, memory, device-loss test |
+| 2 — VAD | Basic milestone complete | Optional 400 vs 700 ms silence tuning |
+| 3 — Recognition | Basic milestone complete | Quality/overload tuning on this CPU |
+| 4 — Translation | Both directions run | Human quality review: names, numbers, accents, long speech, direction switching; offline test |
+| 5 — Computer audio | Browser runs pass; intermittent Start crash open | Capture native failure trace/retest; player/call, device switch/disconnect, long run, cold-start loss, game CPU/FPS and clean Stop |
+| 6 — Controls | Recent Pause/Resume/Stop runs pass | Live retest after review; queued Close/Hide progress and loaded-game Stop |
+| 7 — Chat/overlay | Foundation implemented | Live refresh/settings restoration, DPI/multi-monitor/game/resizing; planned WhatsApp-style redesign |
+| 8 — History | Current milestone complete | Normal-use checks and packaged migration validation |
+| 9 — Session speakers | Live labels implemented | Ground-truth 2/3/4+ speakers, merges/splits, similar voices, short turns, overlap/mixed chunks |
+| 10 — Remembered people | Management implemented; initial reuse observed | Confirm known/unknown voices across sessions; manager actions, quality filtering, false accepts/rejects |
+| 11 — Packaging | Not started | Windows package, first-run downloader, hash/file verification, disk/progress UI, clean-PC/offline tests, upgrades/uninstall preserving history |
+
+Finish runtime quality/device tests before the full UI redesign, then display/stability checks and packaging. Include quiet/noisy/music/silence inputs, short/overlapping speech, deliberate overload, queued Stop/Close, crash recovery, deletion/migration/backups, and large history where relevant.
+
+## Deferred work
+
+- Local voice separation; per-app capture.
+- Caption/speaker/translation corrections; temporary previews; speaker colours; explicit You alignment.
+- Export text/Markdown/SRT/VTT, shortcuts, consent-based recording.
+- Settings import/export and user-managed history backup/restore.
+- Advanced model management/rollback, portable builds, graphs/history metrics, terminology lists, macOS/Linux.
+- Fast/Balanced/Accurate presets; automatic hardware/model choice, RAM-based chunk sizes, multiple Whisper workers/scaling on stronger hardware.
+- French ↔ Vietnamese only after FR↔EN is stable: reuse the pipeline and add vi models, language choices, font checks, language-specific tests later.

@@ -138,11 +138,15 @@ class TranslationWorker:
         self._warning_callback = warning_callback
         self._model_factory = model_factory
         self._queue: Queue[
-            tuple[RecognitionResult, SpeakerIdentification | None]
+            tuple[int, RecognitionResult, SpeakerIdentification | None]
         ] = Queue(maxsize=max_queued_captions)
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._stats_lock = Lock()
+        self._result_lock = Lock()
+        self._next_sequence = 0
+        self._next_result_sequence = 0
+        self._pending_results: dict[int, TranslationResult] = {}
         self._completed_captions = 0
         self._unsupported_captions = 0
         self._failed_captions = 0
@@ -188,8 +192,12 @@ class TranslationWorker:
         speaker: SpeakerIdentification | None = None,
     ) -> bool:
         """Queue a final caption, preserving captions that cannot be translated."""
+        with self._result_lock:
+            sequence = self._next_sequence
+            self._next_sequence += 1
         if recognition.skipped or recognition.error or not recognition.text.strip():
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 TranslationResult(recognition, None, None, 0.0, speaker=speaker)
             )
             return False
@@ -202,7 +210,8 @@ class TranslationWorker:
                 "Translation skipped for unsupported detected language: %s",
                 source_language or "unknown",
             )
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 TranslationResult(
                     recognition,
                     None,
@@ -215,14 +224,15 @@ class TranslationWorker:
             return False
 
         try:
-            self._queue.put_nowait((recognition, speaker))
+            self._queue.put_nowait((sequence, recognition, speaker))
             return True
         except Full:
             message = "Translation is behind; one caption was not translated."
             self._warning_callback(message)
             with self._stats_lock:
                 self._failed_captions += 1
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 TranslationResult(
                     recognition,
                     None,
@@ -235,7 +245,7 @@ class TranslationWorker:
             )
             return False
 
-    def stop(self, timeout: float = 60.0) -> None:
+    def stop(self, timeout: float | None = 60.0) -> None:
         """Finish accepted captions before stopping."""
         thread = self._thread
         if thread is None:
@@ -251,17 +261,18 @@ class TranslationWorker:
         cancelled = 0
         while True:
             try:
-                recognition, speaker = self._queue.get_nowait()
+                sequence, recognition, speaker = self._queue.get_nowait()
             except Empty:
                 break
             cancelled += 1
-            self._result_callback(
+            self._complete_result(
+                sequence,
                 TranslationResult(
                     recognition,
                     None,
                     None,
                     0.0,
-                    error="Translation was cancelled while the application was closing.",
+                    error="Queued translation was cancelled by the user.",
                     skipped=True,
                     speaker=speaker,
                 )
@@ -275,7 +286,7 @@ class TranslationWorker:
         models: dict[tuple[str, str], TextTranslationModel] = {}
         while True:
             try:
-                recognition, speaker = self._queue.get(timeout=0.05)
+                sequence, recognition, speaker = self._queue.get(timeout=0.05)
             except Empty:
                 if self._stop_event.is_set():
                     break
@@ -324,7 +335,16 @@ class TranslationWorker:
             finally:
                 with self._stats_lock:
                     self._active_started_at = None
-            self._result_callback(result)
+            self._complete_result(sequence, result)
+
+    def _complete_result(self, sequence: int, result: TranslationResult) -> None:
+        """Keep warnings and unsupported captions behind earlier translations."""
+        with self._result_lock:
+            self._pending_results[sequence] = result
+            while self._next_result_sequence in self._pending_results:
+                ready = self._pending_results.pop(self._next_result_sequence)
+                self._next_result_sequence += 1
+                self._result_callback(ready)
 
     @staticmethod
     def _normalize_language(language: str | None) -> str:

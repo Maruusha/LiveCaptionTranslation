@@ -1,6 +1,7 @@
 from app.speech.recognition import RecognitionResult
 from app.speakers.identification import SpeakerIdentification
 from app.translation.translator import TranslationResult, TranslationWorker
+from threading import Event
 
 
 def recognition(text: str, language: str | None) -> RecognitionResult:
@@ -91,8 +92,10 @@ def test_translation_queue_reports_overload_without_losing_original_text() -> No
     assert worker.submit(recognition("First", "en"))
     assert not worker.submit(recognition("Second", "en"))
 
-    assert results[0].recognition.text == "Second"
-    assert results[0].skipped
+    assert results == []
+    worker.cancel_pending()
+    assert [result.recognition.text for result in results] == ["First", "Second"]
+    assert results[1].skipped
     assert "behind" in warnings[0]
 
 
@@ -140,3 +143,28 @@ def test_translation_preserves_speaker_identification() -> None:
     worker.stop()
 
     assert results[0].speaker is speaker
+
+
+def test_unsupported_caption_cannot_overtake_an_active_translation() -> None:
+    entered = Event()
+    release = Event()
+    results = []
+
+    class SlowModel:
+        def translate(self, _text):
+            entered.set()
+            assert release.wait(timeout=2.0)
+            return "Bonjour"
+
+    worker = TranslationWorker(results.append, lambda _warning: None,
+                               model_factory=lambda _source, _target: SlowModel())
+    worker.start()
+    worker.submit(recognition("Hello", "en"))
+    try:
+        assert entered.wait(timeout=1.0)
+        worker.submit(recognition("Guten Tag", "de"))
+        assert results == []
+    finally:
+        release.set()
+        worker.stop()
+    assert [result.recognition.text for result in results] == ["Hello", "Guten Tag"]
