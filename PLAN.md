@@ -89,13 +89,17 @@ Microphone OR selected computer output
 - Tables: sessions, session_events, messages, session_persons, session_voice_signatures, persons, person_voice_signatures. Store UTC; display local time. Pause/resume preserve continuous audio offsets.
 - FTS5 searches caption/translation text alongside title search. Closed-session deletion cascades through session data. Approved signatures survive conversation deletion with null provenance; delete-all preserves active sessions.
 - Use transactions, foreign keys, indexes, ordered migrations, pre-migration backups, and quick integrity checks. Never silently replace damaged history. Maintain checks/optimizes/vacuums healthy databases.
-- Log to terminal and logs/application.log: four files total (current + three backups), 2 MiB each, about 8 MiB total. Include lifecycle, device changes, manual refresh, drops, warnings, timings. Never log raw audio, caption text, signatures, or secrets.
+- Log to terminal and logs/application.log: four files total (current + three backups), 2 MiB each, about 8 MiB total. Native crash tracing follows the current log across rotation. Include lifecycle, device changes, manual refresh, drops, warnings, timings. Never log raw audio, caption text, signatures, or secrets.
 - Simple stats cover wall duration, average process CPU, memory/change/process peak, VAD timing, queues, captions, translations, speakers. CPU above 100% reflects multiple cores; peak memory belongs to the entire process.
 - Review improvements: remove full saved-history scans per live caption; batch history rendering; limit meter updates to 20 Hz; remove old pause-dialog/offset/fallback code; clean up Qt test windows on the GUI thread after each test.
 
 Latest completed live run (2026-10-30): 67 chunks, 65 English→French captions/translations, one overload skip and one user skip; zero translation failures/audio-queue drops. Speaker results: 63 labelled, four Unknown, zero worker failures. Pause/resume and manual refresh continued processing in one session. Average CPU about 331%, final memory 372 MiB, process peak about 1.50 GiB. Counts show processing, not accuracy. Earlier FR→EN runs also completed; cold starts previously lost processed audio, and gaming was affected.
 
-Automated baseline after review: **117 passing tests** plus successful source compilation. Synthetic tests do not close the live checks below. No new long live recording was performed during this review.
+Automated baseline: **118 passing tests** plus successful source compilation. Synthetic tests do not close the live checks below. No new long stability recording was performed during review.
+
+Startup investigation (2026-10-30): Windows confirmed a native Python access violation just after Start computer audio. Eight subsequent short starts completed with captions, translations, speaker labels and clean shutdown; the original failure has not been reproduced. Removed temporary self-capturing chat timer callbacks in favour of one owned timer and enabled persistent native traces. Treat this as an open intermittent defect until further live testing confirms stability.
+
+The updated build then captured 11 seconds of computer audio, completed two captions/translations/speaker results with zero failures or dropped audio, and stopped while leaving the app open.
 
 ## Stages and remaining work
 
@@ -106,7 +110,7 @@ Automated baseline after review: **117 passing tests** plus successful source co
 | 2 — VAD | Basic milestone complete | Optional 400 vs 700 ms silence tuning |
 | 3 — Recognition | Basic milestone complete | Quality/overload tuning on this CPU |
 | 4 — Translation | Both directions run | Human quality review: names, numbers, accents, long speech, direction switching; offline test |
-| 5 — Computer audio | Browser runs pass | Local player/call, device switch/disconnect, long run, cold-start loss, game CPU/FPS and clean Stop |
+| 5 — Computer audio | Browser runs pass; intermittent Start crash open | Capture native failure trace/retest; player/call, device switch/disconnect, long run, cold-start loss, game CPU/FPS and clean Stop |
 | 6 — Controls | Recent Pause/Resume/Stop runs pass | Live retest after review; queued Close/Hide progress and loaded-game Stop |
 | 7 — Chat/overlay | Foundation implemented | Live refresh/settings restoration, DPI/multi-monitor/game/resizing; planned WhatsApp-style redesign |
 | 8 — History | Current milestone complete | Normal-use checks and packaged migration validation |

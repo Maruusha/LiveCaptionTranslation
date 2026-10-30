@@ -162,7 +162,11 @@ class CaptionChatView(QScrollArea):
 
         self._display_mode = "both"
         self._loading = False
-        self._scroll_revision = 0
+        self._scroll_target: int | None = None
+        self._reload_pending = False
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._apply_pending_scroll)
         self._bubbles: list[CaptionMessageBubble] = []
         self._rows: list[QWidget] = []
         self._content = QWidget()
@@ -249,13 +253,8 @@ class CaptionChatView(QScrollArea):
         return label
 
     def _schedule_scroll_to_bottom(self) -> None:
-        revision = self._scroll_revision
-
-        def scroll() -> None:
-            if revision == self._scroll_revision:
-                self.scroll_to_bottom()
-
-        QTimer.singleShot(0, self, scroll)
+        self._scroll_target = None
+        self._scroll_timer.start(0)
 
     def begin_reload(self) -> None:
         """Avoid a deferred auto-scroll for every saved message being rebuilt."""
@@ -264,19 +263,19 @@ class CaptionChatView(QScrollArea):
 
     def finish_reload(self, scroll_position: int | None = None) -> None:
         self._loading = False
-        revision = self._scroll_revision
+        self._reload_pending = True
+        self._scroll_target = scroll_position
+        self._scroll_timer.start(0)
 
-        def restore() -> None:
-            if revision != self._scroll_revision:
-                return
+    def _apply_pending_scroll(self) -> None:
+        if self._reload_pending:
+            self._reload_pending = False
             self._layout.activate()
             self._content.adjustSize()
-            scrollbar = self.verticalScrollBar()
-            scrollbar.setValue(
-                scrollbar.maximum() if scroll_position is None else scroll_position
-            )
-
-        QTimer.singleShot(0, self, restore)
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setValue(
+            scrollbar.maximum() if self._scroll_target is None else self._scroll_target
+        )
 
     def set_display_mode(self, mode: str) -> None:
         if mode not in {"both", "original", "translation"}:
@@ -286,7 +285,8 @@ class CaptionChatView(QScrollArea):
             bubble.set_display_mode(mode)
 
     def clear_messages(self) -> None:
-        self._scroll_revision += 1
+        self._scroll_timer.stop()
+        self._reload_pending = False
         for row in self._rows:
             self._layout.removeWidget(row)
             row.hide()
