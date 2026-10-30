@@ -60,6 +60,7 @@ def test_sidebar_search_and_history_actions_emit_selected_session() -> None:
     deleted: list[int] = []
     delete_all_requests: list[bool] = []
     maintenance_requests: list[bool] = []
+    refresh_requests: list[bool] = []
     sidebar.search_changed.connect(searches.append)
     sidebar.rename_requested.connect(renamed.append)
     sidebar.delete_requested.connect(deleted.append)
@@ -67,6 +68,7 @@ def test_sidebar_search_and_history_actions_emit_selected_session() -> None:
     sidebar.maintenance_requested.connect(
         lambda: maintenance_requests.append(True)
     )
+    sidebar.refresh_requested.connect(lambda: refresh_requests.append(True))
     sidebar.set_sessions([saved_session()], show_live=True)
 
     assert not sidebar.rename_button.isEnabled()
@@ -77,10 +79,12 @@ def test_sidebar_search_and_history_actions_emit_selected_session() -> None:
     sidebar.delete_button.click()
     sidebar.delete_all_button.click()
     sidebar.maintenance_button.click()
+    sidebar.refresh_button.click()
 
     assert searches == ["bonjour"]
     assert renamed == [7]
     assert deleted == [7]
     assert delete_all_requests == [True]
     assert maintenance_requests == [True]
+    assert refresh_requests == [True]
 

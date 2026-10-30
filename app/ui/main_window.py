@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollBar,
     QSlider,
     QSplitter,
     QVBoxLayout,
@@ -497,6 +498,9 @@ class MainWindow(QMainWindow):
         self.conversation_sidebar.maintenance_requested.connect(
             self._maintain_history_database
         )
+        self.conversation_sidebar.refresh_requested.connect(
+            self._refresh_conversations_by_user
+        )
 
         self.conversation_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.conversation_splitter.setObjectName("conversationSplitter")
@@ -723,6 +727,57 @@ class MainWindow(QMainWindow):
         selected_key = self.conversation_sidebar.selected_key()
         self._refresh_conversation_sidebar(selected_key)
         self._show_selected_conversation()
+
+    def _refresh_conversations_by_user(self) -> None:
+        """Reload the selected conversation and sidebar on request."""
+        selected_key = self.conversation_sidebar.selected_key()
+        conversation_scrollbar = self.caption_chat.verticalScrollBar()
+        conversation_position = conversation_scrollbar.value()
+        sidebar_position = (
+            self.conversation_sidebar.list_widget.verticalScrollBar().value()
+        )
+        self._restore_scrollbar_after_reload(
+            conversation_scrollbar,
+            conversation_position,
+        )
+        self._drain_queued_captions()
+        self._refresh_conversation_sidebar(selected_key)
+        self._show_selected_conversation()
+        QTimer.singleShot(
+            50,
+            self,
+            lambda: self.conversation_sidebar.list_widget.verticalScrollBar().setValue(
+                sidebar_position
+            ),
+        )
+        logger.info("Conversation history refreshed manually")
+
+    def _restore_scrollbar_after_reload(
+        self,
+        scrollbar: QScrollBar,
+        target_position: int,
+    ) -> None:
+        """Restore a scrollbar after an asynchronous Qt layout rebuild."""
+        restored = False
+
+        def finish() -> None:
+            nonlocal restored
+            if restored:
+                return
+            maximum = int(scrollbar.maximum())
+            if maximum <= 0 and target_position > 0:
+                return
+            scrollbar.setValue(min(target_position, maximum))
+            restored = True
+            try:
+                scrollbar.rangeChanged.disconnect(range_changed)
+            except (RuntimeError, TypeError):
+                pass
+
+        def range_changed(_minimum: int, _maximum: int) -> None:
+            finish()
+
+        scrollbar.rangeChanged.connect(range_changed)
 
     def _show_selected_conversation(self) -> None:
         selected_key = self.conversation_sidebar.selected_key()

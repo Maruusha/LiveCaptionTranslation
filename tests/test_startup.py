@@ -1342,6 +1342,74 @@ def test_history_search_rename_delete_and_delete_all_controls() -> None:
     window.close()
 
 
+def test_manual_conversation_refresh_preserves_selection_and_reloads_content() -> None:
+    create_application(["live-caption-translation-test"])
+    history = HistoryDatabase(":memory:")
+    session_id = history.create_session(
+        title="Original title",
+        audio_source="microphone",
+        language_mode="automatic",
+        preferred_source_language=None,
+        target_language=None,
+    )
+    for index in range(30):
+        history.add_message(
+            session_id=session_id,
+            speaker_label="Microphone",
+            start_offset_seconds=float(index),
+            end_offset_seconds=float(index + 1),
+            source_language="en",
+            language_confidence=0.9,
+            original_text=(f"Message {index} " + "long caption text " * 8),
+            target_language="fr",
+            translated_text="Texte traduit",
+        )
+    history.finish_session(session_id)
+    for index in range(12):
+        extra_id = history.create_session(
+            title=f"Extra conversation {index}",
+            audio_source="microphone",
+            language_mode="automatic",
+            preferred_source_language=None,
+            target_language=None,
+        )
+        history.finish_session(extra_id)
+    window = MainWindow(
+        device_provider=microphone_fixture,
+        history_database=history,
+    )
+    window.show()
+    window.conversation_sidebar.select_session(session_id)
+    wait_until(
+        lambda: window.caption_chat.verticalScrollBar().maximum() > 0
+        and window.conversation_sidebar.list_widget.verticalScrollBar().maximum() > 0
+    )
+    conversation_scrollbar = window.caption_chat.verticalScrollBar()
+    sidebar_scrollbar = window.conversation_sidebar.list_widget.verticalScrollBar()
+    conversation_position = conversation_scrollbar.maximum() // 2
+    sidebar_position = sidebar_scrollbar.maximum() // 2
+    conversation_scrollbar.setValue(conversation_position)
+    sidebar_scrollbar.setValue(sidebar_position)
+
+    history.rename_session(session_id, "Externally updated title")
+    window.conversation_sidebar.refresh_button.click()
+    wait_until(
+        lambda: conversation_scrollbar.value() == conversation_position
+        and sidebar_scrollbar.value() == sidebar_position
+    )
+
+    assert window.conversation_sidebar.selected_key() == session_id
+    assert conversation_scrollbar.value() == conversation_position
+    assert sidebar_scrollbar.value() == sidebar_position
+    assert "Externally updated title" in window.chat_group.title()
+    assert any(
+        "Externally updated title"
+        in window.conversation_sidebar.list_widget.item(row).text()
+        for row in range(window.conversation_sidebar.list_widget.count())
+    )
+    window.close()
+
+
 def test_reopened_history_shows_pause_and_resume_events() -> None:
     create_application(["live-caption-translation-test"])
     history = HistoryDatabase(":memory:")

@@ -29,7 +29,7 @@ Yesterday                     Person B · 14:33
                               FR: Comment allez-vous ?
 ```
 
-- Saved conversations appear on the left, newest first, with search, date groups, preview, and status.
+- Saved conversations appear on the left, newest first, with search, manual refresh, date groups, preview, and status. Manual refresh preserves the selected conversation and both reading/list scroll positions.
 - The selected live or saved conversation appears on the right.
 - Completed turns appear as message bubbles with time, speaker, original text, and translation.
 - New messages scroll into view only when the user is already near the bottom; **To bottom** jumps to the newest message.
@@ -120,7 +120,7 @@ Speaker analysis does not wait for recognition. The two results are joined by au
 - **Pause** stops new audio and finalizes the current VAD chunk, records a pause event, and keeps the same session open. Already accepted captions continue processing in the background.
 - **Resume** is available as soon as capture is paused; it appends to the same session without waiting for the caption queue or reloading Whisper, translation, or speaker models.
 - **Stop** drains accepted final work before completing the session.
-- Stop and close remain responsive and show remaining work plus an estimated finish time. The user may skip queued captions; a model call already running finishes safely.
+- Stop and close remain responsive and show remaining work plus an estimated finish time. The progress view can be hidden while processing continues. The user may explicitly skip queued captions; a model call already running finishes safely.
 - Capture queues hold at most five seconds. Speech chunks have a user-selected 5–60 second maximum, default 30 seconds. Silence may finish them earlier.
 - A distant-future option may adapt the chunk limit to available RAM and model size.
 
@@ -305,7 +305,7 @@ Planned: Windows package, first-run model downloader, file verification, disk-sp
 - High-DPI and multiple-monitor overlay behavior.
 - Offline operation, CPU-only operation, and later a supported GPU computer.
 
-Current automated baseline after persistent interface settings: 105 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
+Current automated baseline after useful finishing-dialog actions: 109 tests. Update this single number only after the full suite passes; do not keep old incremental test-count history.
 
 ## Deferred and distant-future work
 

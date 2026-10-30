@@ -33,6 +33,7 @@ class ConversationSidebar(QWidget):
     delete_requested = Signal(int)
     delete_all_requested = Signal()
     maintenance_requested = Signal()
+    refresh_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -47,6 +48,15 @@ class ConversationSidebar(QWidget):
         heading_font.setPointSize(14)
         heading_font.setBold(True)
         heading.setFont(heading_font)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setObjectName("refreshConversationsButton")
+        self.refresh_button.setToolTip("Reload saved conversations")
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        heading_layout = QHBoxLayout()
+        heading_layout.setContentsMargins(0, 0, 0, 0)
+        heading_layout.addWidget(heading)
+        heading_layout.addStretch()
+        heading_layout.addWidget(self.refresh_button)
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("conversationSearch")
@@ -114,7 +124,7 @@ class ConversationSidebar(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        layout.addWidget(heading)
+        layout.addLayout(heading_layout)
         layout.addWidget(self.search_edit)
         layout.addWidget(self.database_warning)
         layout.addWidget(self.list_widget, stretch=1)
