@@ -44,6 +44,22 @@ def test_chat_view_updates_existing_bubbles_for_display_mode() -> None:
     assert bubble.message_label.text() == "EN: Hello"
 
 
+def test_translation_mode_keeps_unsupported_language_original_visible() -> None:
+    create_application(["live-caption-translation-test"])
+    chat = CaptionChatView()
+    bubble = chat.add_message(
+        original_text="안녕하세요",
+        source_language="ko",
+        translated_text=None,
+        target_language=None,
+        timestamp="10:00",
+    )
+
+    chat.set_display_mode("translation")
+
+    assert bubble.message_label.text() == "KO: 안녕하세요"
+
+
 def test_clear_chat_removes_bubbles_and_restores_placeholder() -> None:
     create_application(["live-caption-translation-test"])
     chat = CaptionChatView()
@@ -57,6 +73,17 @@ def test_clear_chat_removes_bubbles_and_restores_placeholder() -> None:
 
     assert chat.messages == ()
     assert not chat._placeholder.isHidden()
+
+
+def test_chat_view_shows_saved_session_event_divider() -> None:
+    create_application(["live-caption-translation-test"])
+    chat = CaptionChatView()
+
+    event = chat.add_event("Paused", "10:05")
+
+    assert event.text() == "Paused  ·  10:05"
+    assert event.objectName() == "conversationEvent"
+    assert chat._placeholder.isHidden()
 
 
 def test_scroll_to_bottom_moves_to_newest_message() -> None:

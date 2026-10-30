@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from threading import Lock
+from threading import Condition
 from time import monotonic
 
 import numpy as np
@@ -46,7 +46,7 @@ class BoundedAudioFrameQueue:
         self._queued_seconds = 0.0
         self._dropped_frames = 0
         self._dropped_seconds = 0.0
-        self._lock = Lock()
+        self._condition = Condition()
 
     def put(
         self,
@@ -71,7 +71,7 @@ class BoundedAudioFrameQueue:
         )
 
         dropped_now = 0
-        with self._lock:
+        with self._condition:
             self._frames.append(frame)
             self._queued_seconds += frame.duration_seconds
 
@@ -84,27 +84,38 @@ class BoundedAudioFrameQueue:
                 self._dropped_frames += 1
                 self._dropped_seconds += dropped.duration_seconds
                 dropped_now += 1
+            self._condition.notify()
 
         return dropped_now
 
+    def get(self, timeout: float | None = None) -> AudioFrame | None:
+        """Wait briefly for and return the oldest frame, or None on timeout."""
+        with self._condition:
+            if not self._condition.wait_for(lambda: self._frames, timeout):
+                return None
+            return self._pop_frame()
+
     def get_nowait(self) -> AudioFrame | None:
         """Return the oldest frame, or None when the queue is empty."""
-        with self._lock:
+        with self._condition:
             if not self._frames:
                 return None
-            frame = self._frames.popleft()
-            self._queued_seconds -= frame.duration_seconds
-            return frame
+            return self._pop_frame()
+
+    def _pop_frame(self) -> AudioFrame:
+        frame = self._frames.popleft()
+        self._queued_seconds -= frame.duration_seconds
+        return frame
 
     def clear(self) -> None:
         """Discard queued frames while retaining cumulative drop statistics."""
-        with self._lock:
+        with self._condition:
             self._frames.clear()
             self._queued_seconds = 0.0
 
     @property
     def stats(self) -> AudioQueueStats:
-        with self._lock:
+        with self._condition:
             return AudioQueueStats(
                 queued_frames=len(self._frames),
                 queued_seconds=max(0.0, self._queued_seconds),

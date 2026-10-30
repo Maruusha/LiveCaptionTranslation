@@ -49,13 +49,13 @@ class FinishingCaptionsDialog(QDialog):
         self.detail.setWordWrap(True)
 
         buttons = QDialogButtonBox()
-        self.wait_button = QPushButton("Keep waiting")
-        self.wait_button.setObjectName("keepWaitingButton")
-        self.wait_button.setDefault(True)
+        self.hide_progress_button = QPushButton("Hide progress")
+        self.hide_progress_button.setObjectName("hideFinishingProgressButton")
+        self.hide_progress_button.setDefault(True)
         self.finish_now_button = QPushButton()
         self.finish_now_button.setObjectName("finishNowButton")
         buttons.addButton(
-            self.wait_button,
+            self.hide_progress_button,
             QDialogButtonBox.ButtonRole.AcceptRole,
         )
         buttons.addButton(
@@ -63,7 +63,7 @@ class FinishingCaptionsDialog(QDialog):
             QDialogButtonBox.ButtonRole.DestructiveRole,
         )
 
-        self.wait_button.clicked.connect(self._keep_waiting)
+        self.hide_progress_button.clicked.connect(self._hide_progress)
         self.finish_now_button.clicked.connect(self.finish_now_requested.emit)
 
         layout = QVBoxLayout()
@@ -149,12 +149,12 @@ class FinishingCaptionsDialog(QDialog):
         )
         self.finish_now_button.setEnabled(False)
 
-    def _keep_waiting(self) -> None:
-        self.wait_button.setText("Waiting…")
-        self.wait_button.setEnabled(False)
+    def _hide_progress(self) -> None:
+        """Hide this modal view while the owning window keeps processing."""
+        self.hide()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Treat the title-bar close button as the safe wait choice."""
-        self._keep_waiting()
+        """Closing the progress view never cancels queued captions."""
+        self._hide_progress()
         event.ignore()
 

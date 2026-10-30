@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app import APP_NAME, APP_VERSION
 from app.core.log_setup import configure_logging
@@ -30,6 +31,7 @@ def create_application(arguments: Sequence[str] | None = None) -> QApplication:
     global _application_instance
     existing_application = QApplication.instance()
     if existing_application is not None:
+        existing_application.setQuitOnLastWindowClosed(False)
         _application_instance = existing_application
         return existing_application
 
@@ -37,6 +39,9 @@ def create_application(arguments: Sequence[str] | None = None) -> QApplication:
     application.setApplicationName(APP_NAME)
     application.setApplicationVersion(APP_VERSION)
     application.setOrganizationName("LiveCaptionTranslation")
+    # Only an accepted MainWindow close may end the process. Transient dialogs
+    # closing during Stop must never make Qt quit the application.
+    application.setQuitOnLastWindowClosed(False)
     _application_instance = application
     return application
 
@@ -46,8 +51,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
     log_file = configure_logging()
     logger.info("Application starting; log file: %s", log_file)
     application = create_application(arguments)
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except sqlite3.DatabaseError as error:
+        logger.exception("History database could not be opened")
+        QMessageBox.critical(
+            None,
+            "History database could not be opened",
+            "The local history database is damaged or incompatible. It was "
+            "not replaced. Restore a known-good backup or move the original "
+            f"database aside before restarting.\n\n{error}",
+        )
+        return 1
     window.show()
+    window.application_exit_requested.connect(application.quit)
     exit_code = application.exec()
     logger.info("Application stopped with exit code %s", exit_code)
     return exit_code

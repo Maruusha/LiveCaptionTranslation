@@ -10,4 +10,5 @@ silero-vad==6.2.3
 faster-whisper==1.2.1
 av==16.0.1
 sentencepiece==0.2.2
+sherpa-onnx==1.12.33
 

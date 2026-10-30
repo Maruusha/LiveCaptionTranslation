@@ -1,4 +1,5 @@
 from app.speech.recognition import RecognitionResult
+from app.speakers.identification import SpeakerIdentification
 from app.translation.translator import TranslationResult, TranslationWorker
 
 
@@ -56,17 +57,25 @@ def test_translation_worker_translates_both_directions() -> None:
 
 def test_translation_worker_preserves_an_unsupported_language_caption() -> None:
     results: list[TranslationResult] = []
+    loaded_directions: list[tuple[str, str]] = []
+
+    def model_factory(source: str, target: str) -> None:
+        loaded_directions.append((source, target))
+
     worker = TranslationWorker(
         result_callback=results.append,
         warning_callback=lambda _warning: None,
-        model_factory=lambda _source, _target: None,
+        model_factory=model_factory,
     )
 
     assert not worker.submit(recognition("Guten Tag", "de"))
     assert results[0].recognition.text == "Guten Tag"
     assert results[0].translated_text is None
-    assert results[0].error is not None
-    assert worker.stats.failed_captions == 1
+    assert results[0].error is None
+    assert results[0].skipped
+    assert worker.stats.unsupported_captions == 1
+    assert worker.stats.failed_captions == 0
+    assert loaded_directions == []
 
 
 def test_translation_queue_reports_overload_without_losing_original_text() -> None:
@@ -103,3 +112,31 @@ def test_pending_translation_can_be_cancelled_during_shutdown() -> None:
     assert worker.stats.failed_captions == 2
     assert all(result.skipped for result in results)
     assert all(result.recognition.text in {"First", "Second"} for result in results)
+
+
+def test_translation_preserves_speaker_identification() -> None:
+    results: list[TranslationResult] = []
+    speaker = SpeakerIdentification(
+        start_sample=0,
+        end_sample=16_000,
+        label="Alice",
+        session_speaker_index=0,
+        remembered_person_id=7,
+        confidence=0.92,
+        embedding=None,
+    )
+
+    worker = TranslationWorker(
+        result_callback=results.append,
+        warning_callback=lambda _warning: None,
+        model_factory=lambda _source, _target: type(
+            "Model",
+            (),
+            {"translate": lambda self, _text: "Bonjour"},
+        )(),
+    )
+    worker.start()
+    worker.submit(recognition("Hello", "en"), speaker)
+    worker.stop()
+
+    assert results[0].speaker is speaker

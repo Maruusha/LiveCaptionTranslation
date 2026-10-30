@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
+from threading import Lock
 
 import numpy as np
 import sounddevice as sd
@@ -28,6 +29,14 @@ from app.speech.vad import (
     VoiceActivityError,
     VoiceActivityStats,
     VoiceActivityWorker,
+)
+from app.speakers.identification import (
+    RememberedSpeakerProfile,
+    SessionSpeakerProfile,
+    SpeakerIdentification,
+    SpeakerIdentificationError,
+    SpeakerIdentificationStats,
+    SpeakerIdentificationWorker,
 )
 from app.translation.translator import (
     TranslationError,
@@ -68,6 +77,9 @@ class MicrophoneLevelMonitor:
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
         speech_threshold: float = 0.5,
+        speaker_profiles: tuple[RememberedSpeakerProfile, ...] | None = None,
+        session_speaker_profiles: tuple[SessionSpeakerProfile, ...] = (),
+        speaker_match_threshold: float = 0.65,
         audio_buffer: BoundedAudioFrameQueue | None = None,
     ) -> None:
         self.device_indices = (
@@ -81,7 +93,6 @@ class MicrophoneLevelMonitor:
         self._level_callback = level_callback
         self._warning_callback = warning_callback
         self._speech_segment_callback = speech_segment_callback
-        self._caption_callback = caption_callback
         self.audio_buffer = audio_buffer or BoundedAudioFrameQueue(
             max_seconds=5.0,
             max_frames=2_048,
@@ -113,6 +124,24 @@ class MicrophoneLevelMonitor:
             if caption_callback is not None
             else None
         )
+        self.speaker_worker = (
+            SpeakerIdentificationWorker(
+                result_callback=self._handle_speaker_result,
+                warning_callback=self._warning_callback,
+                remembered_profiles=speaker_profiles,
+                session_profiles=session_speaker_profiles,
+                match_threshold=speaker_match_threshold,
+            )
+            if caption_callback is not None and speaker_profiles is not None
+            else None
+        )
+        self._speaker_join_lock = Lock()
+        self._pending_recognition_results: dict[
+            tuple[int, int], RecognitionResult
+        ] = {}
+        self._pending_speaker_results: dict[
+            tuple[int, int], SpeakerIdentification
+        ] = {}
         self.voice_activity_worker = (
             VoiceActivityWorker(
                 source_queue=self.processed_audio_buffer,
@@ -155,6 +184,11 @@ class MicrophoneLevelMonitor:
     @property
     def translation_stats(self) -> TranslationStats | None:
         worker = self.translation_worker
+        return worker.stats if worker is not None else None
+
+    @property
+    def speaker_identification_stats(self) -> SpeakerIdentificationStats | None:
+        worker = self.speaker_worker
         return worker.stats if worker is not None else None
 
     def start(self) -> None:
@@ -203,23 +237,7 @@ class MicrophoneLevelMonitor:
 
     def stop(self) -> None:
         """Stop and release the microphone stream."""
-        stream = self._stream
-        self._stream = None
-        self.active_device_index = None
-        self._active_sample_rate = None
-        if stream is None:
-            return
-
-        stop_error: Exception | None = None
-        try:
-            stream.stop()
-        except Exception as error:
-            stop_error = error
-        try:
-            stream.close()
-        except Exception as error:
-            stop_error = stop_error or error
-
+        stop_error = self._close_input_stream()
         pipeline_error = self._stop_pipeline()
         stop_error = stop_error or pipeline_error
 
@@ -230,11 +248,43 @@ class MicrophoneLevelMonitor:
                 "The microphone did not stop cleanly."
             ) from stop_error
 
+    def pause(self) -> None:
+        """Pause capture while queued captions continue processing."""
+        stop_error = self._close_input_stream()
+        pipeline_error = self._pause_pipeline()
+        stop_error = stop_error or pipeline_error
+        if stop_error is not None:
+            raise MicrophoneCaptureError(
+                "The microphone did not pause cleanly."
+            ) from stop_error
+        logger.info("Microphone capture paused; caption workers remain active")
+
+    def _close_input_stream(self) -> Exception | None:
+        stream = self._stream
+        self._stream = None
+        self.active_device_index = None
+        self._active_sample_rate = None
+        if stream is None:
+            return None
+
+        stop_error: Exception | None = None
+        try:
+            stream.stop()
+        except Exception as error:
+            stop_error = error
+        try:
+            stream.close()
+        except Exception as error:
+            stop_error = stop_error or error
+        return stop_error
+
     def cancel_pending_captions(self) -> int:
         """Discard queued recognition and translation jobs."""
         cancelled = 0
         if self.recognition_worker is not None:
             cancelled += self.recognition_worker.cancel_pending()
+        if self.speaker_worker is not None:
+            self.speaker_worker.cancel_pending()
         if self.translation_worker is not None:
             cancelled += self.translation_worker.cancel_pending()
         return cancelled
@@ -262,15 +312,33 @@ class MicrophoneLevelMonitor:
         self.audio_buffer.put(mono_samples, sample_rate=sample_rate)
 
     def _start_pipeline(self) -> None:
-        self._performance_start = take_process_snapshot()
-        self.last_performance_report = None
+        if self._performance_start is None:
+            self._performance_start = take_process_snapshot()
+            self.last_performance_report = None
         if self.translation_worker is not None:
             self.translation_worker.start()
         if self.recognition_worker is not None:
             self.recognition_worker.start()
+        if self.speaker_worker is not None:
+            self.speaker_worker.start()
         if self.voice_activity_worker is not None:
             self.voice_activity_worker.start()
         self.processing_worker.start()
+
+    def _pause_pipeline(self) -> Exception | None:
+        """Flush accepted audio but leave caption-model workers running."""
+        stop_error: Exception | None = None
+        try:
+            self.processing_worker.stop()
+        except AudioProcessingError as error:
+            stop_error = error
+
+        if self.voice_activity_worker is not None:
+            try:
+                self.voice_activity_worker.stop()
+            except VoiceActivityError as error:
+                stop_error = stop_error or error
+        return stop_error
 
     def _stop_pipeline(self) -> Exception | None:
         stop_error: Exception | None = None
@@ -291,6 +359,12 @@ class MicrophoneLevelMonitor:
             except RecognitionError as error:
                 stop_error = stop_error or error
 
+        if self.speaker_worker is not None:
+            try:
+                self.speaker_worker.stop()
+            except SpeakerIdentificationError as error:
+                stop_error = stop_error or error
+
         if self.translation_worker is not None:
             try:
                 self.translation_worker.stop()
@@ -301,16 +375,34 @@ class MicrophoneLevelMonitor:
     def _handle_speech_segment(self, segment: SpeechSegment) -> None:
         if self._speech_segment_callback is not None:
             self._speech_segment_callback(segment)
+        if self.speaker_worker is not None:
+            self.speaker_worker.submit(segment)
         if self.recognition_worker is not None:
             self.recognition_worker.submit(segment)
 
     def _handle_recognition_result(self, result: RecognitionResult) -> None:
-        if self.translation_worker is not None:
+        if self.translation_worker is None:
+            return
+        if self.speaker_worker is None:
             self.translation_worker.submit(result)
-        elif self._caption_callback is not None:
-            self._caption_callback(
-                TranslationResult(result, None, None, 0.0)
-            )
+            return
+        key = (result.start_sample, result.end_sample)
+        with self._speaker_join_lock:
+            speaker = self._pending_speaker_results.pop(key, None)
+            if speaker is None:
+                self._pending_recognition_results[key] = result
+                return
+        self.translation_worker.submit(result, speaker)
+
+    def _handle_speaker_result(self, result: SpeakerIdentification) -> None:
+        key = (result.start_sample, result.end_sample)
+        with self._speaker_join_lock:
+            recognition = self._pending_recognition_results.pop(key, None)
+            if recognition is None:
+                self._pending_speaker_results[key] = result
+                return
+        if self.translation_worker is not None:
+            self.translation_worker.submit(recognition, result)
 
     def _log_capture_summary(self, source_name: str = "Microphone") -> None:
         start = self._performance_start
@@ -372,12 +464,25 @@ class MicrophoneLevelMonitor:
         if translation_stats is not None:
             logger.info(
                 "Translation summary: queued=%d, active=%d, completed=%d, "
-                "failed=%d, processing time=%.3fs",
+                "unsupported=%d, failed=%d, processing time=%.3fs",
                 translation_stats.queued_captions,
                 translation_stats.active_captions,
                 translation_stats.completed_captions,
+                translation_stats.unsupported_captions,
                 translation_stats.failed_captions,
                 translation_stats.processing_seconds,
+            )
+        speaker_stats = self.speaker_identification_stats
+        if speaker_stats is not None:
+            logger.info(
+                "Speaker identification summary: model load=%.3fs, queued=%d, "
+                "completed=%d, unknown=%d, failed=%d, processing time=%.3fs",
+                speaker_stats.model_load_seconds,
+                speaker_stats.queued_segments,
+                speaker_stats.completed_segments,
+                speaker_stats.unknown_segments,
+                speaker_stats.failed_segments,
+                speaker_stats.processing_seconds,
             )
 
 

@@ -144,6 +144,7 @@ class VoiceActivityWorker:
         self._speech_ends = 0
         self._completed_segments = 0
         self._filtered_short_segments = 0
+        self._next_sample = 0
 
     @property
     def is_running(self) -> bool:
@@ -174,14 +175,6 @@ class VoiceActivityWorker:
         if self.is_running:
             return
         self._stop_event.clear()
-        with self._stats_lock:
-            self._model_load_seconds = 0.0
-            self._processed_windows = 0
-            self._inference_seconds = 0.0
-            self._speech_starts = 0
-            self._speech_ends = 0
-            self._completed_segments = 0
-            self._filtered_short_segments = 0
         self._thread = Thread(
             target=self._run,
             name="voice-activity-worker",
@@ -201,12 +194,14 @@ class VoiceActivityWorker:
 
     def _run(self) -> None:
         try:
+            with self._stats_lock:
+                run_start_sample = self._next_sample
             model_load_started = perf_counter()
             detector = self._detector_factory()
             with self._stats_lock:
-                self._model_load_seconds = perf_counter() - model_load_started
+                self._model_load_seconds += perf_counter() - model_load_started
             pending = np.empty(0, dtype=np.float32)
-            total_samples = 0
+            total_samples = run_start_sample
             speech_active = False
             history: deque[tuple[int, np.ndarray]] = deque(maxlen=64)
             segment_parts: list[np.ndarray] = []
@@ -214,11 +209,10 @@ class VoiceActivityWorker:
             segment_sample_count = 0
 
             while True:
-                frame = self.source_queue.get_nowait()
+                frame = self.source_queue.get(timeout=0.05)
                 if frame is None:
                     if self._stop_event.is_set():
                         break
-                    self._stop_event.wait(0.005)
                     continue
 
                 if frame.sample_rate != VAD_SAMPLE_RATE:
@@ -247,9 +241,11 @@ class VoiceActivityWorker:
                         self._processed_windows += 1
                         self._inference_seconds += inference_seconds
                     total_samples += VAD_WINDOW_SAMPLES
+                    with self._stats_lock:
+                        self._next_sample = total_samples
                     if result and "start" in result:
                         speech_active = True
-                        segment_start = int(result["start"])
+                        segment_start = run_start_sample + int(result["start"])
                         segment_parts = self._history_from(history, segment_start)
                         segment_sample_count = sum(
                             part.size for part in segment_parts
@@ -257,11 +253,11 @@ class VoiceActivityWorker:
                         with self._stats_lock:
                             self._speech_starts += 1
                         self._event_callback(
-                            SpeechEvent("speech_start", int(result["start"]))
+                            SpeechEvent("speech_start", segment_start)
                         )
                     elif result and "end" in result:
                         speech_active = False
-                        segment_end = int(result["end"])
+                        segment_end = run_start_sample + int(result["end"])
                         with self._stats_lock:
                             self._speech_ends += 1
                         self._event_callback(
@@ -297,6 +293,8 @@ class VoiceActivityWorker:
                 if pending.size:
                     segment_parts.append(pending.copy())
                     total_samples += pending.size
+                    with self._stats_lock:
+                        self._next_sample = total_samples
                 with self._stats_lock:
                     self._speech_ends += 1
                 self._event_callback(SpeechEvent("speech_end", total_samples))

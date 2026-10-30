@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,10 +12,12 @@ from time import perf_counter
 from typing import Protocol
 
 from app.speech.recognition import RecognitionResult
+from app.speakers.identification import SpeakerIdentification
 
 
 MODEL_ROOT = Path(__file__).resolve().parents[2] / "models" / "translation"
 SUPPORTED_LANGUAGES = {"en", "fr"}
+logger = logging.getLogger(__name__)
 
 
 class TranslationError(RuntimeError):
@@ -35,6 +38,7 @@ class TranslationResult:
     processing_seconds: float
     error: str | None = None
     skipped: bool = False
+    speaker: SpeakerIdentification | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,7 @@ class TranslationStats:
     active_captions: int
     active_elapsed_seconds: float
     completed_captions: int
+    unsupported_captions: int
     failed_captions: int
     processing_seconds: float
 
@@ -132,11 +137,14 @@ class TranslationWorker:
         self._result_callback = result_callback
         self._warning_callback = warning_callback
         self._model_factory = model_factory
-        self._queue: Queue[RecognitionResult] = Queue(maxsize=max_queued_captions)
+        self._queue: Queue[
+            tuple[RecognitionResult, SpeakerIdentification | None]
+        ] = Queue(maxsize=max_queued_captions)
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._stats_lock = Lock()
         self._completed_captions = 0
+        self._unsupported_captions = 0
         self._failed_captions = 0
         self._processing_seconds = 0.0
         self._active_started_at: float | None = None
@@ -158,6 +166,7 @@ class TranslationWorker:
                     else 0.0
                 ),
                 completed_captions=self._completed_captions,
+                unsupported_captions=self._unsupported_captions,
                 failed_captions=self._failed_captions,
                 processing_seconds=self._processing_seconds,
             )
@@ -173,32 +182,40 @@ class TranslationWorker:
         )
         self._thread.start()
 
-    def submit(self, recognition: RecognitionResult) -> bool:
+    def submit(
+        self,
+        recognition: RecognitionResult,
+        speaker: SpeakerIdentification | None = None,
+    ) -> bool:
         """Queue a final caption, preserving captions that cannot be translated."""
         if recognition.skipped or recognition.error or not recognition.text.strip():
             self._result_callback(
-                TranslationResult(recognition, None, None, 0.0)
+                TranslationResult(recognition, None, None, 0.0, speaker=speaker)
             )
             return False
 
         source_language = self._normalize_language(recognition.language)
         if source_language not in SUPPORTED_LANGUAGES:
-            message = "Translation is available only for French and English."
             with self._stats_lock:
-                self._failed_captions += 1
+                self._unsupported_captions += 1
+            logger.info(
+                "Translation skipped for unsupported detected language: %s",
+                source_language or "unknown",
+            )
             self._result_callback(
                 TranslationResult(
                     recognition,
                     None,
                     None,
                     0.0,
-                    error=message,
+                    skipped=True,
+                    speaker=speaker,
                 )
             )
             return False
 
         try:
-            self._queue.put_nowait(recognition)
+            self._queue.put_nowait((recognition, speaker))
             return True
         except Full:
             message = "Translation is behind; one caption was not translated."
@@ -213,6 +230,7 @@ class TranslationWorker:
                     0.0,
                     error=message,
                     skipped=True,
+                    speaker=speaker,
                 )
             )
             return False
@@ -233,7 +251,7 @@ class TranslationWorker:
         cancelled = 0
         while True:
             try:
-                recognition = self._queue.get_nowait()
+                recognition, speaker = self._queue.get_nowait()
             except Empty:
                 break
             cancelled += 1
@@ -245,6 +263,7 @@ class TranslationWorker:
                     0.0,
                     error="Translation was cancelled while the application was closing.",
                     skipped=True,
+                    speaker=speaker,
                 )
             )
         if cancelled:
@@ -256,7 +275,7 @@ class TranslationWorker:
         models: dict[tuple[str, str], TextTranslationModel] = {}
         while True:
             try:
-                recognition = self._queue.get(timeout=0.05)
+                recognition, speaker = self._queue.get(timeout=0.05)
             except Empty:
                 if self._stop_event.is_set():
                     break
@@ -282,6 +301,7 @@ class TranslationWorker:
                     translated_text,
                     target_language,
                     processing_seconds,
+                    speaker=speaker,
                 )
                 with self._stats_lock:
                     self._completed_captions += 1
@@ -296,6 +316,7 @@ class TranslationWorker:
                     target_language,
                     processing_seconds,
                     error=str(error),
+                    speaker=speaker,
                 )
                 with self._stats_lock:
                     self._failed_captions += 1

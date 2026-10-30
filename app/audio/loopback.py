@@ -10,6 +10,10 @@ from threading import Event, Thread
 import soundcard as sc
 
 from app.audio.microphone import MicrophoneCaptureError, MicrophoneLevelMonitor
+from app.speakers.identification import (
+    RememberedSpeakerProfile,
+    SessionSpeakerProfile,
+)
 from app.speech.vad import SpeechEvent, SpeechSegment
 from app.translation.translator import TranslationResult
 
@@ -83,6 +87,9 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
         recognition_language: str | None = None,
         max_segment_seconds: float = 30.0,
         speech_threshold: float = 0.5,
+        speaker_profiles: tuple[RememberedSpeakerProfile, ...] | None = None,
+        session_speaker_profiles: tuple[SessionSpeakerProfile, ...] = (),
+        speaker_match_threshold: float = 0.65,
     ) -> None:
         super().__init__(
             0,
@@ -94,6 +101,9 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
             recognition_language,
             max_segment_seconds,
             speech_threshold,
+            speaker_profiles=speaker_profiles,
+            session_speaker_profiles=session_speaker_profiles,
+            speaker_match_threshold=speaker_match_threshold,
         )
         self.output_device = output_device
         self._capture_stop = Event()
@@ -151,11 +161,34 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
         )
 
     def stop(self) -> None:
+        stop_error = self._close_capture_thread()
+        pipeline_error = self._stop_pipeline()
+        stop_error = stop_error or pipeline_error
+        self._log_capture_summary("Computer audio")
+        if stop_error is not None:
+            raise MicrophoneCaptureError(
+                "Computer audio capture did not stop cleanly."
+            ) from stop_error
+
+    def pause(self) -> None:
+        """Pause loopback capture while queued captions keep processing."""
+        stop_error = self._close_capture_thread()
+        pipeline_error = self._pause_pipeline()
+        stop_error = stop_error or pipeline_error
+        if stop_error is not None:
+            raise MicrophoneCaptureError(
+                "Computer audio capture did not pause cleanly."
+            ) from stop_error
+        logger.info(
+            "Computer audio capture paused; caption workers remain active"
+        )
+
+    def _close_capture_thread(self) -> Exception | None:
         thread = self._capture_thread
         self._capture_thread = None
         self._active_sample_rate = None
         if thread is None:
-            return
+            return None
 
         self._capture_stop.set()
         self._pipeline_ready.set()
@@ -165,14 +198,7 @@ class LoopbackCaptureMonitor(MicrophoneLevelMonitor):
             stop_error = RuntimeError("WASAPI loopback capture did not stop.")
         elif self._capture_error is not None:
             stop_error = self._capture_error
-
-        pipeline_error = self._stop_pipeline()
-        stop_error = stop_error or pipeline_error
-        self._log_capture_summary("Computer audio")
-        if stop_error is not None:
-            raise MicrophoneCaptureError(
-                "Computer audio capture did not stop cleanly."
-            ) from stop_error
+        return stop_error
 
     def _capture_loop(self) -> None:
         ready = False

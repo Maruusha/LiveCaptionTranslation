@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+from functools import cache
 import sys
 from time import monotonic, process_time
 
@@ -51,9 +52,11 @@ class _ProcessMemoryCounters(ctypes.Structure):
     ]
 
 
-def _windows_memory_usage() -> tuple[int | None, int | None]:
+@cache
+def _windows_memory_api():
+    """Configure the Windows process-memory calls once per application run."""
     if sys.platform != "win32":
-        return None, None
+        return None
 
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -66,12 +69,20 @@ def _windows_memory_usage() -> tuple[int | None, int | None]:
         )
         get_process_memory_info.restype = wintypes.BOOL
     except (AttributeError, OSError):
+        return None
+    return kernel32.GetCurrentProcess, get_process_memory_info
+
+
+def _windows_memory_usage() -> tuple[int | None, int | None]:
+    memory_api = _windows_memory_api()
+    if memory_api is None:
         return None, None
+    get_current_process, get_process_memory_info = memory_api
 
     counters = _ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(counters)
     succeeded = get_process_memory_info(
-        kernel32.GetCurrentProcess(),
+        get_current_process(),
         ctypes.byref(counters),
         counters.cb,
     )
