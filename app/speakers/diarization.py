@@ -9,9 +9,10 @@ from typing import Protocol
 
 import numpy as np
 
+from app.core.paths import models_directory
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SPEAKER_MODEL_ROOT = PROJECT_ROOT / "models" / "speakers"
+
+SPEAKER_MODEL_ROOT = models_directory() / "speakers"
 DEFAULT_SEGMENTATION_MODEL = (
     SPEAKER_MODEL_ROOT
     / "sherpa-onnx-pyannote-segmentation-3-0"

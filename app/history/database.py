@@ -10,9 +10,10 @@ import re
 import sqlite3
 from threading import RLock
 
+from app.core.paths import writable_directory
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "history.sqlite3"
+
+DEFAULT_DATABASE_PATH = writable_directory() / "data" / "history.sqlite3"
 SCHEMA_VERSION = 3
 
 

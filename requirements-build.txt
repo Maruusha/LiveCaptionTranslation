@@ -1,0 +1,3 @@
+# Install with the project-local .venv. Runtime requirements are separate.
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

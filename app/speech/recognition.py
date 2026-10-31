@@ -4,21 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from time import perf_counter
 from typing import Protocol
 
 from app.speech.vad import SpeechSegment
+from app.core.paths import models_directory
 
 
-MODEL_DIRECTORY = (
-    Path(__file__).resolve().parents[2]
-    / "models"
-    / "speech"
-    / "faster-whisper-small"
-)
+MODEL_DIRECTORY = models_directory() / "speech" / "faster-whisper-small"
 
 
 class RecognitionError(RuntimeError):
