@@ -15,3 +15,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Local rotating application logs
+logs/
+
+# Local conversation history
+data/
+
+# Documentation 
+docs/
